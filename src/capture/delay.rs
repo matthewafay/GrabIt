@@ -176,7 +176,8 @@ mod imp {
                 let mut lf = LOGFONTW::default();
                 lf.lfHeight = -88;
                 lf.lfWeight = FW_BOLD.0 as i32;
-                let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+                let face_str = format!("{}\0", crate::platform::fonts::FACE_NAME);
+                let face: Vec<u16> = face_str.encode_utf16().collect();
                 for (i, c) in face.iter().enumerate() {
                     if i < lf.lfFaceName.len() { lf.lfFaceName[i] = *c; }
                 }

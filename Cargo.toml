@@ -24,6 +24,8 @@ opt-level = 1
 
 [build-dependencies]
 embed-resource = "2.5"
+ico = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dependencies]
 anyhow = "1"
@@ -47,6 +49,7 @@ winreg = "0.52"
 
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.29"
+ab_glyph = "0.2"
 # Direct winit dep (same version eframe 0.29 pulls) — needed to call
 # EventLoopBuilderExtWindows::with_any_thread when we run eframe on a
 # worker thread rather than main.

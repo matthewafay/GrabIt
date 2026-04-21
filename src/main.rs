@@ -19,6 +19,7 @@ fn main() -> Result<()> {
 
     info!("GrabIt v{} starting", env!("CARGO_PKG_VERSION"));
     platform::dpi::init_process_awareness();
+    platform::fonts::register_with_gdi();
 
     let _instance_guard = match app::single_instance::acquire() {
         Ok(g) => g,

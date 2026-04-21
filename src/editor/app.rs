@@ -21,6 +21,14 @@ use uuid::Uuid;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Arrow,
+    Text,
+}
+
+/// Text annotation in the middle of being typed. Once committed (Enter or
+/// click-outside) it becomes an `AnnotationNode::Text`; Escape discards it.
+struct PendingText {
+    position: [f32; 2],
+    buffer: String,
 }
 
 pub struct EditorApp {
@@ -35,11 +43,15 @@ pub struct EditorApp {
     tool: Tool,
     /// Arrow in progress: (start, current) in image-pixel coordinates.
     pending: Option<([f32; 2], [f32; 2])>,
+    /// Text annotation currently being typed.
+    pending_text: Option<PendingText>,
 
     /// Currently selected draw color (sRGB RGBA).
     color: egui::Color32,
-    /// Stroke thickness in image pixels.
+    /// Arrow stroke thickness in image pixels.
     thickness: f32,
+    /// Text size in image pixels.
+    text_size: f32,
 
     /// Snapshot stack for undo. M3 uses coarse snapshots; M5 can replace
     /// this with the command-pattern undo described in the plan.
@@ -69,8 +81,10 @@ impl EditorApp {
             copy_to_clipboard,
             tool: Tool::Arrow,
             pending: None,
+            pending_text: None,
             color: egui::Color32::from_rgb(220, 40, 40),
             thickness: 6.0,
+            text_size: 28.0,
             undo: Vec::new(),
             texture: None,
             base_rgba: None,
@@ -131,6 +145,27 @@ impl EditorApp {
         self.document.annotations.clear();
     }
 
+    fn commit_pending_text(&mut self) {
+        if let Some(pt) = self.pending_text.take() {
+            let trimmed = pt.buffer.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            self.push_undo();
+            self.document.annotations.push(AnnotationNode::Text {
+                id: Uuid::new_v4(),
+                position: pt.position,
+                text: trimmed.to_string(),
+                color: color_to_rgba(self.color),
+                size_px: self.text_size,
+            });
+        }
+    }
+
+    fn cancel_pending_text(&mut self) {
+        self.pending_text = None;
+    }
+
     fn save(&mut self) -> Result<()> {
         let base = self
             .base_rgba
@@ -162,14 +197,28 @@ impl EditorApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tool, Tool::Arrow, "Arrow");
+            if ui
+                .selectable_value(&mut self.tool, Tool::Arrow, "Arrow")
+                .clicked()
+            {
+                self.cancel_pending_text();
+            }
+            ui.selectable_value(&mut self.tool, Tool::Text, "Text");
             ui.separator();
 
             ui.label("Color");
             ui.color_edit_button_srgba(&mut self.color);
 
-            ui.label("Thickness");
-            ui.add(egui::Slider::new(&mut self.thickness, 1.0..=40.0));
+            match self.tool {
+                Tool::Arrow => {
+                    ui.label("Thickness");
+                    ui.add(egui::Slider::new(&mut self.thickness, 1.0..=40.0));
+                }
+                Tool::Text => {
+                    ui.label("Text size");
+                    ui.add(egui::Slider::new(&mut self.text_size, 8.0..=128.0));
+                }
+            }
 
             ui.separator();
 
@@ -279,9 +328,22 @@ impl EditorApp {
                     }
                 }
             }
+            Tool::Text => {
+                if response.clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        // Commit anything the user was already typing before
+                        // starting a new text at the clicked point.
+                        self.commit_pending_text();
+                        self.pending_text = Some(PendingText {
+                            position: to_image(pos),
+                            buffer: String::new(),
+                        });
+                    }
+                }
+            }
         }
 
-        // Draw existing arrows.
+        // Draw existing annotations.
         for node in &self.document.annotations {
             match node {
                 AnnotationNode::Arrow { start, end, color, thickness, .. } => {
@@ -293,6 +355,18 @@ impl EditorApp {
                             color[0], color[1], color[2], color[3],
                         ),
                         thickness * scale,
+                    );
+                }
+                AnnotationNode::Text { position, text, color, size_px, .. } => {
+                    let canvas_size = size_px * scale;
+                    painter.text(
+                        to_canvas(*position),
+                        egui::Align2::LEFT_TOP,
+                        text,
+                        egui::FontId::monospace(canvas_size),
+                        egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        ),
                     );
                 }
             }
@@ -307,6 +381,44 @@ impl EditorApp {
                 self.color,
                 self.thickness * scale,
             );
+        }
+
+        // Floating editor for in-progress text. We show this AFTER painting
+        // the canvas so it overlays the base image.
+        if self.pending_text.is_some() {
+            let canvas_size = self.text_size * scale;
+            let anchor = {
+                let pt = self.pending_text.as_ref().unwrap();
+                to_canvas(pt.position)
+            };
+            let text_color = self.color;
+
+            let ctx = ui.ctx().clone();
+            let area_resp = egui::Area::new(egui::Id::new("grabit-pending-text"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(anchor)
+                .show(&ctx, |ui| {
+                    let pt = self.pending_text.as_mut().unwrap();
+                    let edit = egui::TextEdit::singleline(&mut pt.buffer)
+                        .font(egui::FontId::monospace(canvas_size.max(12.0)))
+                        .text_color(text_color)
+                        .desired_width(280.0)
+                        .hint_text("Type then Enter\u{2026}");
+                    let response = ui.add(edit);
+                    response.request_focus();
+                    response
+                });
+
+            // Commit on Enter (TextEdit::singleline loses focus on Enter),
+            // cancel on Escape.
+            let commit_enter = area_resp.inner.lost_focus()
+                && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            if escape {
+                self.cancel_pending_text();
+            } else if commit_enter {
+                self.commit_pending_text();
+            }
         }
     }
 }

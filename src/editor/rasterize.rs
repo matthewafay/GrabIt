@@ -1,12 +1,24 @@
 //! Bake annotations into a base RGBA image for PNG export.
 //!
-//! We draw arrows ourselves with a small convex-polygon scanline rasterizer
-//! plus alpha compositing. Good enough for clean on-screen arrows without
-//! pulling in a full 2D graphics dep at M3. For M4 effects (blur, torn
-//! edges) we'll bring in `imageproc` per the plan.
+//! Arrows are drawn with a small convex-polygon scanline rasterizer; text is
+//! drawn through `ab_glyph` using a system font (Segoe UI first, then Arial,
+//! then Tahoma). We keep the dependency surface minimal by reusing ab_glyph,
+//! which egui already pulls in.
 
 use crate::editor::document::AnnotationNode;
+use crate::platform::fonts::JETBRAINS_MONO_REGULAR;
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{Rgba, RgbaImage};
+use std::sync::OnceLock;
+
+static FONT: OnceLock<FontArc> = OnceLock::new();
+
+fn font() -> &'static FontArc {
+    FONT.get_or_init(|| {
+        FontArc::try_from_slice(JETBRAINS_MONO_REGULAR)
+            .expect("embedded JetBrains Mono TTF must parse")
+    })
+}
 
 /// Apply every annotation in `annotations` to a copy of `base` and return it.
 pub fn flatten(base: &RgbaImage, annotations: &[AnnotationNode]) -> RgbaImage {
@@ -15,6 +27,9 @@ pub fn flatten(base: &RgbaImage, annotations: &[AnnotationNode]) -> RgbaImage {
         match node {
             AnnotationNode::Arrow { start, end, color, thickness, .. } => {
                 draw_arrow(&mut out, *start, *end, *color, *thickness);
+            }
+            AnnotationNode::Text { position, text, color, size_px, .. } => {
+                draw_text(&mut out, font(), *position, text, *size_px, *color);
             }
         }
     }
@@ -118,6 +133,72 @@ fn fill_convex_polygon(canvas: &mut RgbaImage, points: &[[f32; 2]], color: [u8; 
         for x in x0..=x1 {
             blend_pixel(canvas, x as u32, y as u32, color);
         }
+    }
+}
+
+/// Rasterize `text` into `canvas` starting at image-pixel `position`
+/// (top-left of the first line's cap-height). `\n` starts a new line.
+pub fn draw_text(
+    canvas: &mut RgbaImage,
+    font: &FontArc,
+    position: [f32; 2],
+    text: &str,
+    size_px: f32,
+    color: [u8; 4],
+) {
+    let scale = PxScale::from(size_px.max(6.0));
+    let scaled = font.as_scaled(scale);
+    let line_height = scaled.height() + scaled.line_gap();
+    let ascent = scaled.ascent();
+
+    let origin_x = position[0];
+    let mut cursor_y = position[1] + ascent;
+    let mut cursor_x = origin_x;
+    let mut prev_glyph: Option<ab_glyph::GlyphId> = None;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            cursor_x = origin_x;
+            cursor_y += line_height;
+            prev_glyph = None;
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+
+        let glyph_id = font.glyph_id(ch);
+        if let Some(prev) = prev_glyph {
+            cursor_x += scaled.kern(prev, glyph_id);
+        }
+
+        let glyph =
+            glyph_id.with_scale_and_position(scale, ab_glyph::point(cursor_x, cursor_y));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                if coverage <= 0.0 {
+                    return;
+                }
+                let x = bounds.min.x as i32 + gx as i32;
+                let y = bounds.min.y as i32 + gy as i32;
+                if x < 0 || y < 0 {
+                    return;
+                }
+                let (cw, ch) = canvas.dimensions();
+                if (x as u32) >= cw || (y as u32) >= ch {
+                    return;
+                }
+                // Multiply the stored color's alpha by glyph coverage for
+                // smooth edges.
+                let a =
+                    ((color[3] as f32) * coverage.clamp(0.0, 1.0)).round() as u8;
+                blend_pixel(canvas, x as u32, y as u32, [color[0], color[1], color[2], a]);
+            });
+        }
+
+        cursor_x += scaled.h_advance(glyph_id);
+        prev_glyph = Some(glyph_id);
     }
 }
 

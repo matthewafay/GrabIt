@@ -2,6 +2,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Generated at build time from grabit.png — don't track the binary.
+assets/icons/grabit.ico
+
 # Build artifacts
 *.pdb
 *.exp

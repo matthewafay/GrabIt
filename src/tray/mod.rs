@@ -89,7 +89,7 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_tooltip("GrabIt")
-            .with_icon(fallback_icon())
+            .with_icon(load_app_icon())
             .with_menu(Box::new(menu))
             .build()
             .context("build tray icon")?;
@@ -98,13 +98,27 @@ impl Tray {
     }
 }
 
-/// 16x16 solid-teal placeholder icon so the tray is visible before a real
-/// .ico is supplied. Documented in `assets/icons/README.md`.
+/// Decode the embedded PNG logo into a tray-icon `Icon`. Falls back to a
+/// solid-color stub if decoding fails (which shouldn't happen — the PNG is
+/// baked into the binary via `include_bytes!`).
+fn load_app_icon() -> Icon {
+    const PNG: &[u8] = include_bytes!("../../assets/icons/grabit.png");
+    match image::load_from_memory(PNG) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            Icon::from_rgba(rgba.into_raw(), w, h).unwrap_or_else(|_| fallback_icon())
+        }
+        Err(_) => fallback_icon(),
+    }
+}
+
+/// Solid-teal 16x16 stub, used only if the embedded logo fails to decode.
 fn fallback_icon() -> Icon {
     const SIZE: u32 = 16;
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[0x14, 0xb8, 0xa6, 0xff]); // teal
+        rgba.extend_from_slice(&[0x14, 0xb8, 0xa6, 0xff]);
     }
     Icon::from_rgba(rgba, SIZE, SIZE).expect("valid placeholder icon")
 }

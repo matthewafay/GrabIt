@@ -61,6 +61,16 @@ pub enum AnnotationNode {
         /// Stroke thickness in image pixels.
         thickness: f32,
     },
+    Text {
+        id: Uuid,
+        /// Top-left anchor in image-pixel coordinates.
+        position: [f32; 2],
+        text: String,
+        /// sRGB color in RGBA order.
+        color: [u8; 4],
+        /// Font size in image pixels (cap height + descender roughly = size_px).
+        size_px: f32,
+    },
 }
 
 /// Build a fresh `Document` from a `CaptureResult`. Annotations start empty.
