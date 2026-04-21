@@ -24,13 +24,18 @@ pub enum RegionResult {
     Cancelled,
 }
 
+/// Run the region-selector overlay. When `allow_windows` is `false`, window
+/// hover highlight is disabled and short clicks do nothing — only a
+/// click-drag-release produces a result. This is the mode used by the
+/// "Capture & annotate" flow so the interaction is a single consistent
+/// gesture.
 #[cfg(windows)]
-pub fn select() -> Result<RegionResult> {
-    imp::run()
+pub fn select(allow_windows: bool) -> Result<RegionResult> {
+    imp::run(allow_windows)
 }
 
 #[cfg(not(windows))]
-pub fn select() -> Result<RegionResult> {
+pub fn select(_allow_windows: bool) -> Result<RegionResult> {
     Err(anyhow!("region selector is Windows-only"))
 }
 
@@ -81,13 +86,14 @@ mod imp {
         hover_window: Option<isize>,
         result: Option<RegionResult>,
         overlay_hwnd: HWND,
+        allow_windows: bool,
     }
 
     thread_local! {
         static STATE: RefCell<Option<State>> = RefCell::new(None);
     }
 
-    pub fn run() -> Result<RegionResult> {
+    pub fn run(allow_windows: bool) -> Result<RegionResult> {
         unsafe {
             let hinstance: HINSTANCE = GetModuleHandleW(PCWSTR::null())
                 .map_err(|e| anyhow!("GetModuleHandle: {e}"))?
@@ -154,6 +160,7 @@ mod imp {
                     hover_window: None,
                     result: None,
                     overlay_hwnd: hwnd,
+                    allow_windows,
                 });
             });
 
@@ -192,11 +199,15 @@ mod imp {
                 with_state(|s| {
                     s.current = POINT { x, y };
                     if !s.dragging {
-                        s.hover_window = window_under_virtual_point(
-                            s.virtual_rect.x + x,
-                            s.virtual_rect.y + y,
-                            s.overlay_hwnd,
-                        );
+                        s.hover_window = if s.allow_windows {
+                            window_under_virtual_point(
+                                s.virtual_rect.x + x,
+                                s.virtual_rect.y + y,
+                                s.overlay_hwnd,
+                            )
+                        } else {
+                            None
+                        };
                     }
                 });
                 let _ = InvalidateRect(hwnd, None, false);
@@ -232,13 +243,17 @@ mod imp {
                             width,
                             height,
                         }))
-                    } else if let Some(h) = s.hover_window {
-                        Some(RegionResult::Window(h))
+                    } else if s.allow_windows {
+                        s.hover_window.map(RegionResult::Window)
                     } else {
                         None
                     };
                     s.dragging = false;
-                    (res, true)
+                    // Region-only mode keeps the overlay up after a bare
+                    // click so the user can retry their drag. Full mode
+                    // always closes on mouse up (legacy behaviour).
+                    let close = res.is_some() || s.allow_windows;
+                    (res, close)
                 });
                 if let Some(res) = result_to_set {
                     with_state(|s| s.result = Some(res));

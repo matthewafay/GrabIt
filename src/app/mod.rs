@@ -63,7 +63,7 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
             run_capture(
                 state,
                 CaptureRequest {
-                    target: CaptureTarget::Interactive,
+                    target: CaptureTarget::Interactive { allow_windows: true },
                     delay_ms: 0,
                     include_cursor: state.settings.include_cursor,
                 },
@@ -72,7 +72,9 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
         Command::CaptureAndAnnotate => {
             info!("dispatch: CaptureAndAnnotate");
             let req = CaptureRequest {
-                target: CaptureTarget::Interactive,
+                // Annotate flow: drag-release is the only gesture — no
+                // window-hover-click-to-capture ambiguity.
+                target: CaptureTarget::Interactive { allow_windows: false },
                 delay_ms: 0,
                 include_cursor: state.settings.include_cursor,
             };

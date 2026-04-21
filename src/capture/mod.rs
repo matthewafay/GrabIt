@@ -27,8 +27,10 @@ pub enum CaptureTarget {
     /// Specific window by HWND.
     Window(isize),
     /// Run the interactive selector overlay, then capture whatever the
-    /// user chose (region or window). Cancelling yields `Ok(None)`.
-    Interactive,
+    /// user chose. `allow_windows = false` restricts the overlay to region
+    /// drag-select only — short clicks stay in the overlay instead of
+    /// capturing the window under the cursor. Cancelling yields `Ok(None)`.
+    Interactive { allow_windows: bool },
     // Object { ui_element: ElementRef } — M6
     // Multi { rects: Vec<Rect> } — M6
 }
@@ -86,7 +88,7 @@ pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
     // Resolve Interactive before the delay/countdown so the overlay's
     // closing does not flash into the output.
     let resolved_target = match req.target.clone() {
-        CaptureTarget::Interactive => match region::select()? {
+        CaptureTarget::Interactive { allow_windows } => match region::select(allow_windows)? {
             region::RegionResult::Region(r) => CaptureTarget::Region(r),
             region::RegionResult::Window(h) => CaptureTarget::Window(h),
             region::RegionResult::Cancelled => return Ok(None),
@@ -115,7 +117,7 @@ pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
             .context("GDI region capture")?,
         CaptureTarget::Window(hwnd) => window_pick::capture_window(hwnd)
             .context("window capture")?,
-        CaptureTarget::Interactive => unreachable!("already resolved above"),
+        CaptureTarget::Interactive { .. } => unreachable!("already resolved above"),
     };
 
     let metadata = CaptureMetadata {

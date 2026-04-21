@@ -24,11 +24,17 @@ enum Tool {
     Text,
 }
 
-/// Text annotation in the middle of being typed. Once committed (Enter or
-/// click-outside) it becomes an `AnnotationNode::Text`; Escape discards it.
+/// Text annotation in the middle of being typed.
+///
+/// - `editing_id = None` → typing a brand-new text that lands in the
+///   document on commit.
+/// - `editing_id = Some(id)` → re-editing an existing annotation with that
+///   `id`; commit replaces it, commit with empty buffer deletes it, Escape
+///   leaves the original untouched.
 struct PendingText {
     position: [f32; 2],
     buffer: String,
+    editing_id: Option<Uuid>,
 }
 
 pub struct EditorApp {
@@ -146,12 +152,27 @@ impl EditorApp {
     }
 
     fn commit_pending_text(&mut self) {
-        if let Some(pt) = self.pending_text.take() {
-            let trimmed = pt.buffer.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            self.push_undo();
+        let Some(pt) = self.pending_text.take() else { return };
+        let trimmed = pt.buffer.trim();
+        let editing = pt.editing_id;
+
+        // No-op: starting a new empty text.
+        if editing.is_none() && trimmed.is_empty() {
+            return;
+        }
+
+        self.push_undo();
+
+        // Editing path: remove the original annotation (equivalent to delete
+        // if the buffer is empty).
+        if let Some(id) = editing {
+            self.document.annotations.retain(|n| match n {
+                AnnotationNode::Text { id: nid, .. } => *nid != id,
+                _ => true,
+            });
+        }
+
+        if !trimmed.is_empty() {
             self.document.annotations.push(AnnotationNode::Text {
                 id: Uuid::new_v4(),
                 position: pt.position,
@@ -163,7 +184,25 @@ impl EditorApp {
     }
 
     fn cancel_pending_text(&mut self) {
+        // If we were editing an existing annotation, it's still in the doc
+        // (we hide it during edit via editing_id, we don't remove it), so
+        // cancelling just drops the in-flight buffer.
         self.pending_text = None;
+    }
+
+    /// Flatten annotations and copy the result to the Windows clipboard,
+    /// without writing to disk. Shown as an explicit button so users can
+    /// share annotated captures without creating PNG files.
+    fn copy_to_clipboard_only(&mut self) -> Result<()> {
+        let base = self
+            .base_rgba
+            .as_ref()
+            .context("base image not decoded")?
+            .clone();
+        let flat = rasterize::flatten(&base, &self.document.annotations);
+        copy_rgba_to_clipboard(&flat).context("copy to clipboard")?;
+        self.status = "Copied to clipboard".to_string();
+        Ok(())
     }
 
     fn save(&mut self) -> Result<()> {
@@ -201,7 +240,9 @@ impl EditorApp {
                 .selectable_value(&mut self.tool, Tool::Arrow, "Arrow")
                 .clicked()
             {
-                self.cancel_pending_text();
+                // Switching away from the Text tool: persist any in-progress
+                // text so the user doesn't lose their typing.
+                self.commit_pending_text();
             }
             ui.selectable_value(&mut self.tool, Tool::Text, "Text");
             ui.separator();
@@ -239,6 +280,12 @@ impl EditorApp {
             }
 
             ui.separator();
+
+            if ui.button("Copy to clipboard").clicked() {
+                if let Err(e) = self.copy_to_clipboard_only() {
+                    self.status = format!("Copy failed: {e}");
+                }
+            }
 
             let save_label = if self.dirty || !self.saved_once {
                 "Save (Ctrl+S)"
@@ -295,6 +342,27 @@ impl EditorApp {
             egui::pos2(rect.min.x + p[0] * scale, rect.min.y + p[1] * scale)
         };
 
+        // Pre-compute hit-test rects for existing Text annotations — skip
+        // the one being edited (it's displayed via the floating editor).
+        // We use egui's own font layout so rects match the on-screen glyph
+        // metrics of what we'll paint below.
+        let editing_id = self.pending_text.as_ref().and_then(|pt| pt.editing_id);
+        let mut text_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        for (i, node) in self.document.annotations.iter().enumerate() {
+            if let AnnotationNode::Text { position, text, size_px, id, .. } = node {
+                if Some(*id) == editing_id {
+                    continue;
+                }
+                let canvas_size = (size_px * scale).max(1.0);
+                let font_id = egui::FontId::monospace(canvas_size);
+                let galley = ui.ctx().fonts(|f| {
+                    f.layout_no_wrap(text.clone(), font_id, egui::Color32::WHITE)
+                });
+                let r = egui::Rect::from_min_size(to_canvas(*position), galley.size());
+                text_rects.push((i, r));
+            }
+        }
+
         // Handle input.
         match self.tool {
             Tool::Arrow => {
@@ -330,20 +398,52 @@ impl EditorApp {
             }
             Tool::Text => {
                 if response.clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        // Commit anything the user was already typing before
-                        // starting a new text at the clicked point.
+                    if let Some(click_pos) = response.interact_pointer_pos() {
+                        // Is there a placed text under the click? Iterate in
+                        // reverse so newer (on-top) annotations win.
+                        let hit = text_rects
+                            .iter()
+                            .rev()
+                            .find(|(_, r)| r.contains(click_pos))
+                            .map(|(idx, _)| *idx);
+
+                        // Commit any in-progress text before starting a new
+                        // one or editing another.
                         self.commit_pending_text();
-                        self.pending_text = Some(PendingText {
-                            position: to_image(pos),
-                            buffer: String::new(),
-                        });
+
+                        if let Some(idx) = hit {
+                            if let AnnotationNode::Text {
+                                id,
+                                position,
+                                text,
+                                color,
+                                size_px,
+                            } = self.document.annotations[idx].clone()
+                            {
+                                self.color = egui::Color32::from_rgba_unmultiplied(
+                                    color[0], color[1], color[2], color[3],
+                                );
+                                self.text_size = size_px;
+                                self.pending_text = Some(PendingText {
+                                    position,
+                                    buffer: text,
+                                    editing_id: Some(id),
+                                });
+                            }
+                        } else {
+                            self.pending_text = Some(PendingText {
+                                position: to_image(click_pos),
+                                buffer: String::new(),
+                                editing_id: None,
+                            });
+                        }
                     }
                 }
             }
         }
 
-        // Draw existing annotations.
+        // Draw existing annotations. The text currently being edited is
+        // hidden here; the floating editor renders it at the same position.
         for node in &self.document.annotations {
             match node {
                 AnnotationNode::Arrow { start, end, color, thickness, .. } => {
@@ -357,7 +457,10 @@ impl EditorApp {
                         thickness * scale,
                     );
                 }
-                AnnotationNode::Text { position, text, color, size_px, .. } => {
+                AnnotationNode::Text { id, position, text, color, size_px } => {
+                    if Some(*id) == editing_id {
+                        continue;
+                    }
                     let canvas_size = size_px * scale;
                     painter.text(
                         to_canvas(*position),

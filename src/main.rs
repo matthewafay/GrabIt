@@ -108,8 +108,12 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
     let _tray = tray::Tray::install(cmd_tx.clone(), &state.settings)
         .context("install system tray")?;
 
-    let _hotkeys = hotkeys::Registrar::install(cmd_tx.clone(), &state.settings.hotkey)
-        .context("register global hotkey")?;
+    let hotkey_bindings = [
+        (state.settings.hotkey.clone(), app::Command::CaptureFullscreen),
+        (state.settings.annotate_hotkey.clone(), app::Command::CaptureAndAnnotate),
+    ];
+    let _hotkeys = hotkeys::Registrar::install(cmd_tx.clone(), &hotkey_bindings)
+        .context("register global hotkeys")?;
 
     let tray_rx = tray_icon::menu::MenuEvent::receiver().clone();
     let tray_icon_rx = tray_icon::TrayIconEvent::receiver().clone();
