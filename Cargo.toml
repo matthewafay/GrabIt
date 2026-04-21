@@ -1,0 +1,84 @@
+[package]
+name = "grabit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "Lightweight Windows screenshot and annotation tool"
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "grabit"
+path = "src/main.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = "z"
+incremental = false
+
+[profile.dev]
+opt-level = 1
+
+[build-dependencies]
+embed-resource = "2.5"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rmp-serde = "1.3"
+rfd = "0.15"
+dirs = "5"
+uuid = { version = "1", features = ["v4", "serde"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+tray-icon = "0.19"
+global-hotkey = "0.6"
+winreg = "0.52"
+
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.29"
+# Direct winit dep (same version eframe 0.29 pulls) — needed to call
+# EventLoopBuilderExtWindows::with_any_thread when we run eframe on a
+# worker thread rather than main.
+winit = "0.30"
+# imageproc is in the plan for M4 (blur) — not needed yet; deferring to keep
+# the dep graph and build time tight for M2/M3.
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Dwm",
+    "Win32_Storage_Xps",
+    "Win32_System_LibraryLoader",
+]
+
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.58"
+
+# Editor deps (M2+) are added incrementally.
+# eframe / egui / egui-wgpu / imageproc / fast_image_resize pinned in plan file;
+# introduced when their milestone lands so M0 keeps a minimal dep graph.

@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build artifacts
+*.pdb
+*.exp
+*.lib
+
+# OS noise
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.iml
