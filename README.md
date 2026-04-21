@@ -17,15 +17,40 @@ the system tray, launches with Windows.
 - **Delayed** — tray → *Capture with delay* → 3 / 5 / 10s. A countdown
   window appears, then closes before the capture fires so it never lands in
   the output.
+- **Annotate** — `Ctrl+Z` hotkey or tray → *Capture & annotate…*.
+  Drag-release a rectangle, then the editor opens on that region.
 
-**Annotate** — tray → *Capture & annotate…*
+**Annotate (editor)**
 
 - **Arrow** tool: click-drag to place. Color picker + thickness slider.
-- **Text** tool: click to place a single-line text annotation. Enter commits,
-  Escape cancels. Color picker + text-size slider. Uses JetBrains Mono.
-- **Undo** (Ctrl+Z) and **Clear**.
-- **Save** (Ctrl+S) writes a PNG with annotations baked in, a `.grabit`
-  sidecar that preserves the editable scene graph, and updates the clipboard.
+- **Text** tool: click empty space to place a single-line text annotation,
+  or click an existing text to re-edit it. Enter commits, Escape cancels,
+  committing with an empty buffer deletes a re-edited text. Uses JetBrains
+  Mono at the selected size.
+- **Undo** (Ctrl+Z inside the editor) and **Clear**.
+- **Copy to clipboard** — flatten annotations and copy the image without
+  touching disk.
+- **Save** (Ctrl+S) — write an annotated PNG, a `.grabit` sidecar that
+  preserves the editable scene graph, and (by default) also update the
+  clipboard.
+
+## Hotkeys
+
+Global hotkeys (work anywhere on Windows):
+
+| Default | Action |
+|---|---|
+| `PrintScreen` | Capture fullscreen |
+| `Ctrl+Z` | Capture & annotate |
+
+Both are configurable in `%APPDATA%\GrabIt\settings.toml` under the
+`hotkey` and `annotate_hotkey` keys. Examples: `Ctrl+Shift+X`, `Alt+PrtSc`,
+`Win+S`.
+
+> **Heads-up:** global hotkeys win over focused apps, so while
+> `annotate_hotkey` is set to `Ctrl+Z` it intercepts Ctrl+Z everywhere —
+> including the editor's own Undo. If you want Undo back, change the
+> binding in `settings.toml`.
 
 ## Build
 
@@ -87,8 +112,8 @@ loop stays alive for concurrent captures.
 |---|---|---|
 | M0 | ✅ | Scaffold, tray, hotkey, GDI fullscreen capture, PNG + clipboard, Document schema |
 | M1 | ✅ | Per-monitor DPI, region/window overlay, PrintWindow window capture, countdown |
-| M2 | 🔶 | eframe/egui editor skeleton (pan/zoom + crop/resize/rotate deferred) |
-| M3 | 🔶 | Arrow + Text tools (callouts/shapes/step/stamps/cursor-edit pending) |
+| M2 | 🔶 | eframe/egui editor skeleton with Save + Copy buttons (pan/zoom + crop/resize/rotate deferred) |
+| M3 | 🔶 | Arrow + Text tools with click-to-re-edit (callouts/shapes/step/stamps/cursor-edit pending) |
 | M4 | ⏳ | Blur, cut-out, borders, magnify, capture-info |
 | M5 | ⏳ | Presets, per-preset hotkeys, quick styles |
 | M6 | ⏳ | Menu / object (UIAutomation) capture, multi-region composites |

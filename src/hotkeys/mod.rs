@@ -22,17 +22,35 @@ pub struct Registrar {
 static DISPATCH: Mutex<Vec<(u32, Command)>> = Mutex::new(Vec::new());
 
 impl Registrar {
-    pub fn install(_cmd_tx: Sender<Command>, binding: &HotkeyBinding) -> Result<Self> {
+    /// Register every `(binding, command)` pair with the OS. Bindings that
+    /// fail to register (unsupported key, or another app already owns the
+    /// combo) are logged and skipped — other bindings still register.
+    pub fn install(
+        _cmd_tx: Sender<Command>,
+        bindings: &[(HotkeyBinding, Command)],
+    ) -> Result<Self> {
         let manager = GlobalHotKeyManager::new().context("create hotkey manager")?;
+        let mut mapping: Vec<(u32, Command)> = Vec::new();
 
-        let hotkey = binding.as_hotkey().context("parse capture hotkey")?;
-        manager.register(hotkey).context("register capture hotkey")?;
-        let id = hotkey.id();
-        info!("registered capture hotkey: {}", binding.raw);
+        for (binding, cmd) in bindings {
+            match binding.as_hotkey() {
+                Ok(hotkey) => match manager.register(hotkey) {
+                    Ok(()) => {
+                        info!("registered hotkey {} \u{2192} {cmd:?}", binding.raw);
+                        mapping.push((hotkey.id(), cmd.clone()));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "could not register hotkey {}: {e} (another app or invalid combo); skipping",
+                            binding.raw
+                        );
+                    }
+                },
+                Err(e) => warn!("invalid hotkey {}: {e}; skipping", binding.raw),
+            }
+        }
 
-        let mapping = vec![(id, Command::CaptureFullscreen)];
         *DISPATCH.lock() = mapping.clone();
-
         Ok(Self { manager, registered: mapping })
     }
 }

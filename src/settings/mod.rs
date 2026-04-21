@@ -11,9 +11,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Main capture hotkey. Applied to `CaptureFullscreen` in M0; M5 adds
-    /// per-preset bindings.
+    /// Global hotkey for `CaptureFullscreen`. Default: PrintScreen.
     pub hotkey: HotkeyBinding,
+    /// Global hotkey for `CaptureAndAnnotate`. Default: Ctrl+Z.
+    ///
+    /// Heads-up: global hotkeys win over focused apps, so while this is set
+    /// to Ctrl+Z, that keystroke won't reach other apps (including the
+    /// editor's own Undo). Change this in `settings.toml` if you need Ctrl+Z
+    /// back — something like `Ctrl+Shift+Z` or `Win+S` is a safer default in
+    /// practice.
+    pub annotate_hotkey: HotkeyBinding,
     /// Persisted state of the "Launch at startup" tray checkbox.
     pub launch_at_startup: bool,
     /// Include the cursor in captures (as a separate layer).
@@ -26,6 +33,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: HotkeyBinding::default(),
+            annotate_hotkey: HotkeyBinding { raw: "Ctrl+Z".to_string() },
             launch_at_startup: true,
             include_cursor: true,
             copy_to_clipboard: true,
