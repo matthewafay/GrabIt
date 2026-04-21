@@ -2,10 +2,10 @@
 
 1 24 "manifest.xml"
 
-// Tray/window icon — supply a real .ico at assets/icons/grabit.ico and
-// uncomment this line. Commented out for M0 so the build doesn't fail
-// before an icon has been designed.
-// IDI_TRAY ICON "icons\\grabit.ico"
+// Icon embedded for File Explorer / taskbar / Alt-Tab. The .ico is
+// regenerated on every build from assets/icons/grabit.png by build.rs,
+// so this file is always current with the source PNG.
+1 ICON "icons\\grabit.ico"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     0,1,0,0

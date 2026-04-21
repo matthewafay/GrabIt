@@ -1,11 +1,12 @@
 # Icons
 
-Place the tray/window icon at `grabit.ico` (multi-resolution ICO,
-containing at minimum 16x16, 32x32, 48x48, 256x256).
+`grabit.png` is the canonical source of truth for the app logo. To change
+the logo, replace this file.
 
-Once placed, uncomment the `IDI_TRAY` line in `../grabit.rc` to embed it
-as a Win32 resource, and wire `Icon::from_resource(...)` in the tray
-module.
+`grabit.ico` is generated automatically by `build.rs` from `grabit.png`
+at build time (16/24/32/48/64/128/256 pixel sizes), so it's kept out of
+source control. It's embedded into the `.exe` as a Win32 resource via
+`../grabit.rc` so File Explorer, the taskbar, and Alt-Tab show the logo.
 
-Until a real icon is supplied, `src/tray/mod.rs` falls back to a generated
-solid-color RGBA stub so the tray still displays during development.
+Runtime code (`src/tray/mod.rs`, `src/editor/mod.rs`) decodes `grabit.png`
+directly via `include_bytes!` for tray and editor-window icons.

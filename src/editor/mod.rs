@@ -7,6 +7,19 @@ pub mod app;
 pub mod document;
 pub mod rasterize;
 
+/// Decode the embedded logo PNG for use as an eframe window icon.
+/// Returns `None` if decoding fails — eframe then falls back to its default.
+fn load_app_icon_data() -> Option<egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../../assets/icons/grabit.png");
+    let img = image::load_from_memory(PNG).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 use crate::app::paths::AppPaths;
 use crate::capture::CaptureResult;
 use anyhow::{Context, Result};
@@ -56,10 +69,18 @@ fn run_editor(
     let init_w = (w as f32).min(1600.0);
     let init_h = (h as f32).min(1000.0);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let viewport = {
+        let mut vb = egui::ViewportBuilder::default()
             .with_title("GrabIt editor")
-            .with_inner_size([init_w + 16.0, init_h + 80.0]),
+            .with_inner_size([init_w + 16.0, init_h + 80.0]);
+        if let Some(icon) = load_app_icon_data() {
+            vb = vb.with_icon(std::sync::Arc::new(icon));
+        }
+        vb
+    };
+
+    let options = eframe::NativeOptions {
+        viewport,
         // winit rejects non-main-thread event loops by default; we spawn the
         // editor on a worker thread so the main-thread tray loop stays live.
         // `with_any_thread(true)` is the supported escape hatch on Windows.
@@ -80,7 +101,8 @@ fn run_editor(
     eframe::run_native(
         "GrabIt editor",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            install_jetbrains_mono(&cc.egui_ctx);
             Ok(Box::new(app::EditorApp::new(
                 document,
                 png_path,
@@ -91,4 +113,29 @@ fn run_editor(
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
+}
+
+/// Register JetBrains Mono as the first-choice face for both of egui's
+/// built-in font families. egui keeps its default fallbacks (Ubuntu-Light,
+/// Noto Emoji, etc.) behind ours so missing glyphs still render.
+fn install_jetbrains_mono(ctx: &egui::Context) {
+    use crate::platform::fonts::{JETBRAINS_MONO_BOLD, JETBRAINS_MONO_REGULAR};
+
+    let mut fonts = egui::FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "jetbrains-mono".to_owned(),
+        egui::FontData::from_static(JETBRAINS_MONO_REGULAR),
+    );
+    fonts.font_data.insert(
+        "jetbrains-mono-bold".to_owned(),
+        egui::FontData::from_static(JETBRAINS_MONO_BOLD),
+    );
+
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let chain = fonts.families.entry(family).or_default();
+        chain.insert(0, "jetbrains-mono".to_owned());
+    }
+
+    ctx.set_fonts(fonts);
 }

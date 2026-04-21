@@ -3,4 +3,5 @@
 //! `capture::window_pick` don't each reimplement the same primitives.
 
 pub mod dpi;
+pub mod fonts;
 pub mod monitors;
