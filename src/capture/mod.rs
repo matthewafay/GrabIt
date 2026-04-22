@@ -1,6 +1,9 @@
 pub mod cursor;
 pub mod delay;
+pub mod exact_dims;
 pub mod gdi;
+pub mod multi_region;
+pub mod object_pick;
 pub mod region;
 pub mod wgc;
 pub mod window_pick;
@@ -31,8 +34,21 @@ pub enum CaptureTarget {
     /// drag-select only — short clicks stay in the overlay instead of
     /// capturing the window under the cursor. Cancelling yields `Ok(None)`.
     Interactive { allow_windows: bool },
-    // Object { ui_element: ElementRef } — M6
-    // Multi { rects: Vec<Rect> } — M6
+    /// Capture a region of exactly `width` x `height` physical pixels;
+    /// the user picks where to place it via the `exact_dims` overlay.
+    /// Cancelling yields `Ok(None)`.
+    ExactDims { width: u32, height: u32 },
+    /// Hover over a UI element (button, menu item, list row) via the
+    /// UIA picker and capture its bounding rect. Cancelling yields
+    /// `Ok(None)`. Resolved to a `Region` internally before capture;
+    /// the picker also installs a `SetWinEventHook` so menus stay
+    /// pinned while hovered.
+    Object,
+    /// Draw multiple non-contiguous rectangles; on commit each is
+    /// captured individually and composed into one image with gutters.
+    /// Cancelling yields `Ok(None)`. Cursor layer does not apply —
+    /// `CaptureResult::cursor` is always `None` for this mode.
+    MultiRegion,
 }
 
 /// A completed capture. Cursor lives on its own RGBA layer so feature #2
@@ -65,7 +81,7 @@ pub struct CaptureMetadata {
     pub capture_rect: Rect,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -85,13 +101,28 @@ pub struct MonitorInfo {
 /// backend, attaches a cursor layer if requested, and returns the result.
 /// Returns `Ok(None)` if the user cancelled the interactive selector.
 pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
-    // Resolve Interactive before the delay/countdown so the overlay's
-    // closing does not flash into the output.
+    // MultiRegion is its own flow: the picker returns a batch of rects, we
+    // capture each, and compose into a single image. Handled up-front so
+    // the rest of this function can stay linear.
+    if matches!(req.target, CaptureTarget::MultiRegion) {
+        return perform_multi_region(&req);
+    }
+
+    // Resolve Interactive / ExactDims / Object before the delay/countdown
+    // so the overlay's closing does not flash into the output.
     let resolved_target = match req.target.clone() {
         CaptureTarget::Interactive { allow_windows } => match region::select(allow_windows)? {
             region::RegionResult::Region(r) => CaptureTarget::Region(r),
             region::RegionResult::Window(h) => CaptureTarget::Window(h),
             region::RegionResult::Cancelled => return Ok(None),
+        },
+        CaptureTarget::ExactDims { width, height } => match exact_dims::pick(width, height)? {
+            exact_dims::ExactDimsResult::Region(r) => CaptureTarget::Region(r),
+            exact_dims::ExactDimsResult::Cancelled => return Ok(None),
+        },
+        CaptureTarget::Object => match object_pick::pick()? {
+            object_pick::ObjectPickResult::Region(r) => CaptureTarget::Region(r),
+            object_pick::ObjectPickResult::Cancelled => return Ok(None),
         },
         t => t,
     };
@@ -117,7 +148,12 @@ pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
             .context("GDI region capture")?,
         CaptureTarget::Window(hwnd) => window_pick::capture_window(hwnd)
             .context("window capture")?,
-        CaptureTarget::Interactive { .. } => unreachable!("already resolved above"),
+        CaptureTarget::Interactive { .. }
+        | CaptureTarget::ExactDims { .. }
+        | CaptureTarget::Object
+        | CaptureTarget::MultiRegion => {
+            unreachable!("already resolved above")
+        }
     };
 
     let metadata = CaptureMetadata {
@@ -146,6 +182,54 @@ pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
     });
 
     Ok(Some(CaptureResult { base, cursor, metadata }))
+}
+
+/// Multi-region flow: run the picker, capture each rect, and composite
+/// into one image. Cursor layer is intentionally dropped — it's not a
+/// meaningful concept for a multi-region composite. Cancelling at the
+/// picker stage yields `Ok(None)`.
+fn perform_multi_region(req: &CaptureRequest) -> Result<Option<CaptureResult>> {
+    let rects = match multi_region::pick()? {
+        multi_region::MultiRegionResult::Rects(r) => r,
+        multi_region::MultiRegionResult::Cancelled => return Ok(None),
+    };
+    if rects.is_empty() {
+        return Ok(None);
+    }
+
+    if req.delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(req.delay_ms as u64));
+    }
+
+    let mut captures: Vec<(Rect, RgbaImage)> = Vec::with_capacity(rects.len());
+    for r in &rects {
+        let (img, rect) = gdi::capture_region(*r).context("GDI multi-region sub-capture")?;
+        captures.push((rect, img));
+    }
+
+    // Default gutter + background are hard-coded here; a settings path
+    // can feed them later without changing the compose_multi_region API.
+    let gutter = multi_region::DEFAULT_GUTTER_PX;
+    let bg = multi_region::DEFAULT_BACKGROUND;
+    let base = multi_region::compose_multi_region(&captures, gutter, bg);
+    let base_w = base.width();
+    let base_h = base.height();
+
+    let metadata = CaptureMetadata {
+        captured_at: Utc::now(),
+        foreground_title: platform::foreground_window_title(),
+        foreground_process: platform::foreground_process_name(),
+        os_version: platform::os_version_string(),
+        monitors: platform::enumerate_monitors(),
+        capture_rect: Rect { x: 0, y: 0, width: base_w, height: base_h },
+    };
+
+    log::info!(
+        "multi-region capture: {} rects composed into {}x{}",
+        rects.len(), base_w, base_h
+    );
+
+    Ok(Some(CaptureResult { base, cursor: None, metadata }))
 }
 
 mod platform {

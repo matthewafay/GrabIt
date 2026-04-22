@@ -42,6 +42,9 @@ dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# M4: imageproc's gaussian_blur for non-destructive blur regions. Used at
+# flatten-time; no runtime deps added (pure Rust).
+imageproc = { version = "0.25", default-features = false }
 
 tray-icon = "0.19"
 global-hotkey = "0.6"
@@ -77,6 +80,10 @@ features = [
     "Win32_Graphics_Dwm",
     "Win32_Storage_Xps",
     "Win32_System_LibraryLoader",
+    # M6: UI Automation for object/menu capture (IUIAutomation COM) +
+    # SetWinEventHook plumbing for menu-follow. Both live under
+    # Win32_UI_Accessibility.
+    "Win32_UI_Accessibility",
 ]
 
 [target.'cfg(windows)'.dependencies.windows-core]

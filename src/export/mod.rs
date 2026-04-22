@@ -17,20 +17,25 @@ use std::path::PathBuf;
 /// layer structure. Returns the PNG path.
 pub fn save_png(result: &CaptureResult, paths: &AppPaths) -> Result<PathBuf> {
     let png_path = paths.default_capture_filename("png");
+    save_png_to(result, &png_path)?;
+    Ok(png_path)
+}
+
+/// Same as `save_png`, but writes to an explicit path chosen by the caller
+/// (e.g. a preset's rendered filename template). Writes the `.grabit`
+/// sidecar alongside best-effort.
+pub fn save_png_to(result: &CaptureResult, png_path: &std::path::Path) -> Result<PathBuf> {
     let composite = flatten(result);
     composite
-        .save_with_format(&png_path, image::ImageFormat::Png)
+        .save_with_format(png_path, image::ImageFormat::Png)
         .with_context(|| format!("write PNG {}", png_path.display()))?;
     debug!("wrote PNG: {}", png_path.display());
 
-    // `.grabit` companion — best-effort. A failure here should not fail the
-    // user-visible capture.
     let grabit_path = png_path.with_extension("grabit");
     if let Err(e) = crate::editor::document::save_from_capture(result, &grabit_path) {
         debug!("skipped .grabit sidecar: {e}");
     }
-
-    Ok(png_path)
+    Ok(png_path.to_path_buf())
 }
 
 /// Copy the (flattened) capture to the Windows clipboard as CF_DIB.

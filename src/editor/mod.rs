@@ -4,8 +4,10 @@
 //! more annotation tools on top of the same `AnnotationNode` scene graph.
 
 pub mod app;
+pub mod commands;
 pub mod document;
 pub mod rasterize;
+pub mod tools;
 
 /// Decode the embedded logo PNG for use as an eframe window icon.
 /// Returns `None` if decoding fails — eframe then falls back to its default.
@@ -23,13 +25,13 @@ fn load_app_icon_data() -> Option<egui::IconData> {
 use crate::app::paths::AppPaths;
 use crate::capture::CaptureResult;
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::info;
 use std::path::PathBuf;
-use std::thread;
 
-/// Spawn an editor window on a dedicated worker thread, pre-loaded with the
-/// given capture. Returns immediately; the thread stays alive until the user
-/// closes the editor window.
+/// Persist the capture to disk and spawn a fresh `grabit.exe --editor …`
+/// subprocess pre-loaded with it. Subprocess isolation is required because
+/// winit 0.30 rejects recreating its event loop inside a single process, so
+/// we can't simply spawn a new editor thread per capture.
 pub fn open_from_capture(
     result: CaptureResult,
     paths: &AppPaths,
@@ -38,30 +40,32 @@ pub fn open_from_capture(
     let document =
         document::from_capture(&result).context("build document from capture")?;
 
-    // One timestamped filename reused for PNG + `.grabit` sidecar.
     let png_path: PathBuf = paths.default_capture_filename("png");
     let grabit_path = png_path.with_extension("grabit");
+    document::save(&document, &grabit_path)
+        .with_context(|| format!("write sidecar {}", grabit_path.display()))?;
 
-    thread::Builder::new()
-        .name("grabit-editor".to_string())
-        .spawn(move || {
-            let png_display = png_path.display().to_string();
-            info!("editor thread start → {png_display}");
-            if let Err(e) = run_editor(document, png_path, grabit_path, copy_to_clipboard) {
-                warn!("editor exited with error: {e:?}");
-            }
-            info!("editor thread end");
-        })
-        .context("spawn editor thread")?;
+    let exe = std::env::current_exe().context("resolve current exe")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--editor").arg(&grabit_path);
+    cmd.arg("--png-out").arg(&png_path);
+    if copy_to_clipboard {
+        cmd.arg("--clipboard");
+    }
+    cmd.spawn().context("spawn editor subprocess")?;
 
+    info!("editor subprocess spawned → {}", grabit_path.display());
     Ok(())
 }
 
-fn run_editor(
+/// Blocking editor entry used by the `--editor` subprocess. Runs eframe on
+/// the current (main) thread and returns when the window closes.
+pub fn run_blocking(
     document: document::Document,
     png_path: PathBuf,
     grabit_path: PathBuf,
     copy_to_clipboard: bool,
+    paths: AppPaths,
 ) -> Result<()> {
     let w = document.base_width.max(320);
     let h = document.base_height.max(240);
@@ -108,6 +112,7 @@ fn run_editor(
                 png_path,
                 grabit_path,
                 copy_to_clipboard,
+                paths,
             )))
         }),
     )

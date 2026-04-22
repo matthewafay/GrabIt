@@ -2,13 +2,24 @@
 //!
 //! A `Document` is what gets serialized to a `.grabit` file. It carries the
 //! base image, an optional cursor layer (for feature #2), an ordered list of
-//! annotations (empty at M0 — M3 introduces the `AnnotationNode` variants),
-//! and the capture metadata from `capture::CaptureMetadata`.
+//! annotations, and the capture metadata from `capture::CaptureMetadata`.
 //!
 //! Format on disk: MessagePack via `rmp-serde`. MessagePack is chosen over
 //! JSON because the base-image blob is binary; TOML is ruled out for the
 //! same reason. Opening `.grabit` in a text editor will show binary soup,
 //! which is expected.
+//!
+//! Schema versions:
+//! - v1 (M0–M2 + initial M3): only `Arrow` and `Text` annotation variants.
+//! - v2 (M3 complete): adds `Callout`, `Shape`, `Step`, `Stamp`, `Magnify`.
+//!   Because the enum is serialized with an internal `"kind"` tag via serde,
+//!   v1 files still deserialize cleanly as long as readers know the old
+//!   variant tags — which they do, since the two original variants are
+//!   unchanged. v1 files simply have `schema_version = 1` and no new
+//!   variants. We do not rewrite v1 files on load.
+//! - v3 (M4): adds `Blur` and `CaptureInfo` annotation variants plus two
+//!   top-level document fields (`edge_effect`, `border`). New fields are
+//!   tagged `#[serde(default)]` so v1/v2 files still deserialize cleanly.
 
 use crate::capture::{CaptureMetadata, CaptureResult};
 use anyhow::{Context, Result};
@@ -18,8 +29,13 @@ use std::path::Path;
 use uuid::Uuid;
 
 /// Serialization version. Bump when the schema changes in a way that breaks
-/// older readers; M0 starts at 1.
-pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
+/// older readers. M3 introduced five new `AnnotationNode` variants; because
+/// rmp-serde's internally-tagged enums gracefully accept the older (smaller)
+/// variant set, v1 files still load. M4 adds two more annotation variants
+/// plus two top-level fields (`edge_effect`, `border`) — writers stamp v3,
+/// readers accept {1, 2, 3}. The new fields are `#[serde(default)]` so v1/v2
+/// documents still deserialize cleanly.
+pub const DOCUMENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -34,6 +50,16 @@ pub struct Document {
     pub cursor: Option<SerializedCursor>,
     pub annotations: Vec<AnnotationNode>,
     pub metadata: CaptureMetadata,
+
+    /// M4: torn-edge effect applied at flatten-time on one side of the image.
+    /// `None` (default) means "no effect" — v1/v2 docs load with this unset.
+    #[serde(default)]
+    pub edge_effect: Option<EdgeEffect>,
+
+    /// M4: image border (solid band + optional drop shadow) applied at
+    /// flatten-time. `None` (default) means no border. v1/v2 docs default.
+    #[serde(default)]
+    pub border: Option<Border>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,9 +72,148 @@ pub struct SerializedCursor {
     pub y: i32,
 }
 
-/// Annotation scene-graph node. New variants are added as each annotation
-/// tool lands. All coordinates are in image-pixel space (relative to the
-/// top-left of `base_png`), not editor-canvas space — tools convert.
+/// Rect kind for the `Shape` annotation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeKind {
+    Rect,
+    Ellipse,
+}
+
+/// Which fields to include in a capture-info stamp.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldKind {
+    Timestamp,
+    WindowTitle,
+    ProcessName,
+    OsVersion,
+    MonitorInfo,
+}
+
+impl FieldKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FieldKind::Timestamp => "Timestamp",
+            FieldKind::WindowTitle => "Window title",
+            FieldKind::ProcessName => "Process name",
+            FieldKind::OsVersion => "OS version",
+            FieldKind::MonitorInfo => "Monitor info",
+        }
+    }
+}
+
+/// Anchor for a capture-info stamp on the base image.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureInfoPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl CaptureInfoPosition {
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureInfoPosition::TopLeft => "Top left",
+            CaptureInfoPosition::TopRight => "Top right",
+            CaptureInfoPosition::BottomLeft => "Bottom left",
+            CaptureInfoPosition::BottomRight => "Bottom right",
+        }
+    }
+}
+
+/// Style bundle for the capture-info banner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CaptureInfoStyle {
+    /// Box fill (RGBA).
+    pub fill: [u8; 4],
+    /// Text color (RGBA).
+    pub text_color: [u8; 4],
+    /// Font size in image pixels.
+    pub text_size: f32,
+    /// Inner padding on all sides (image pixels).
+    pub padding: f32,
+}
+
+impl Default for CaptureInfoStyle {
+    fn default() -> Self {
+        Self {
+            fill: [20, 20, 20, 200],
+            text_color: [240, 240, 240, 255],
+            text_size: 14.0,
+            padding: 8.0,
+        }
+    }
+}
+
+/// Which edge of the base image gets a torn-paper cutout.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Torn-edge effect applied at flatten-time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct EdgeEffect {
+    pub edge: Edge,
+    /// Depth (in image pixels) the jagged teeth extend INTO the image from
+    /// the selected edge.
+    pub depth: f32,
+    /// Tooth period in image pixels — distance between peaks.
+    pub teeth: f32,
+}
+
+impl Default for EdgeEffect {
+    fn default() -> Self {
+        Self { edge: Edge::Bottom, depth: 14.0, teeth: 18.0 }
+    }
+}
+
+/// Image border + optional drop shadow applied at flatten-time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Border {
+    pub color: [u8; 4],
+    pub width: f32,
+    /// If non-zero, render a drop-shadow of this radius/offset outside the
+    /// border. Shadow is drawn as a soft RGBA box.
+    pub shadow_radius: f32,
+    pub shadow_offset: [f32; 2],
+    pub shadow_color: [u8; 4],
+}
+
+impl Default for Border {
+    fn default() -> Self {
+        Self {
+            color: [30, 30, 30, 255],
+            width: 6.0,
+            shadow_radius: 0.0,
+            shadow_offset: [0.0, 0.0],
+            shadow_color: [0, 0, 0, 128],
+        }
+    }
+}
+
+/// Which built-in stamp (or a user-supplied PNG blob).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StampSource {
+    /// References a stamp shipped in the binary. Name must match one of the
+    /// identifiers returned by `tools::stamp::builtin_names`.
+    Builtin { name: String },
+    /// Inlined PNG bytes — for user-imported stamps (M5) or stamps from
+    /// round-tripped `.grabit` files whose original builtin is missing.
+    Inline { png: Vec<u8> },
+}
+
+/// Annotation scene-graph node. Variants are added as each annotation tool
+/// lands. All coordinates are in image-pixel space (relative to the top-left
+/// of `base_png`), not editor-canvas space — tools convert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnnotationNode {
@@ -71,6 +236,109 @@ pub enum AnnotationNode {
         /// Font size in image pixels (cap height + descender roughly = size_px).
         size_px: f32,
     },
+    /// Speech-balloon with a tail. The balloon is an axis-aligned rounded
+    /// rectangle; the tail is a triangular pointer whose tip is at `tail`.
+    Callout {
+        id: Uuid,
+        /// Balloon body in image-pixel coords: `[min_x, min_y, max_x, max_y]`.
+        rect: [f32; 4],
+        /// Tail tip (moves independently of the balloon).
+        tail: [f32; 2],
+        text: String,
+        /// Fill (RGBA) for the balloon body.
+        fill: [u8; 4],
+        /// Stroke color.
+        stroke: [u8; 4],
+        /// Stroke thickness in image pixels.
+        stroke_width: f32,
+        /// Text color.
+        text_color: [u8; 4],
+        /// Text size in image pixels.
+        text_size: f32,
+    },
+    /// Rectangle or ellipse with an outline and optional fill.
+    Shape {
+        id: Uuid,
+        shape: ShapeKind,
+        /// `[min_x, min_y, max_x, max_y]` in image-pixel coords.
+        rect: [f32; 4],
+        stroke: [u8; 4],
+        stroke_width: f32,
+        /// Fill color; an alpha of 0 means "no fill" (just outline).
+        fill: [u8; 4],
+    },
+    /// Auto-numbered step marker — a filled circle with a centered digit.
+    Step {
+        id: Uuid,
+        /// Center of the circle in image-pixel coords.
+        center: [f32; 2],
+        /// Radius in image pixels.
+        radius: f32,
+        /// The integer displayed in the circle (1-based, auto-assigned on
+        /// creation; user can edit later).
+        number: u32,
+        fill: [u8; 4],
+        text_color: [u8; 4],
+    },
+    /// PNG sticker. Rendered with aspect-preserving fit into `rect`.
+    Stamp {
+        id: Uuid,
+        source: StampSource,
+        /// `[min_x, min_y, max_x, max_y]` — the bounding box into which the
+        /// stamp is drawn with alpha blending.
+        rect: [f32; 4],
+    },
+    /// Loupe / magnifier: copies the pixels in `source_rect` and draws them
+    /// scaled into `target_rect`, with an optional border.
+    Magnify {
+        id: Uuid,
+        /// Source region sampled from the base image.
+        source_rect: [f32; 4],
+        /// Destination rect the magnified pixels are drawn into.
+        target_rect: [f32; 4],
+        /// Border stroke around the target rect.
+        border: [u8; 4],
+        border_width: f32,
+        /// If true, the target rect is clipped to an ellipse.
+        circular: bool,
+    },
+    /// Non-destructive gaussian blur over a region of the base image.
+    /// The `.grabit` stores only the rect + radius; at flatten/export time
+    /// the pixels of `base` inside `rect` are gaussian-blurred and blitted
+    /// onto the output. Preview draws a cheap stippled overlay to hint.
+    Blur {
+        id: Uuid,
+        /// `[min_x, min_y, max_x, max_y]` in image-pixel coords.
+        rect: [f32; 4],
+        /// Gaussian sigma in image pixels. 8–20 is typical.
+        radius_px: f32,
+    },
+    /// Capture-info banner. Reads live `CaptureMetadata` at flatten-time.
+    /// The node only stores which fields the user wants and where the block
+    /// goes — the actual string content is materialised from the document's
+    /// metadata during rasterize::flatten.
+    CaptureInfo {
+        id: Uuid,
+        position: CaptureInfoPosition,
+        fields: Vec<FieldKind>,
+        style: CaptureInfoStyle,
+    },
+}
+
+impl AnnotationNode {
+    pub fn id(&self) -> Uuid {
+        match self {
+            AnnotationNode::Arrow { id, .. } => *id,
+            AnnotationNode::Text { id, .. } => *id,
+            AnnotationNode::Callout { id, .. } => *id,
+            AnnotationNode::Shape { id, .. } => *id,
+            AnnotationNode::Step { id, .. } => *id,
+            AnnotationNode::Stamp { id, .. } => *id,
+            AnnotationNode::Magnify { id, .. } => *id,
+            AnnotationNode::Blur { id, .. } => *id,
+            AnnotationNode::CaptureInfo { id, .. } => *id,
+        }
+    }
 }
 
 /// Build a fresh `Document` from a `CaptureResult`. Annotations start empty.
@@ -96,6 +364,8 @@ pub fn from_capture(result: &CaptureResult) -> Result<Document> {
         cursor,
         annotations: Vec::new(),
         metadata: result.metadata.clone(),
+        edge_effect: None,
+        border: None,
     })
 }
 
@@ -128,4 +398,328 @@ fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
         .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8)
         .context("PNG encode")?;
     Ok(buf)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Tests
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::Rect;
+    use chrono::TimeZone;
+
+    fn stub_metadata() -> CaptureMetadata {
+        CaptureMetadata {
+            captured_at: chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            foreground_title: None,
+            foreground_process: None,
+            os_version: "test".into(),
+            monitors: vec![],
+            capture_rect: Rect { x: 0, y: 0, width: 4, height: 4 },
+        }
+    }
+
+    fn stub_doc() -> Document {
+        // 2x2 transparent base PNG so the doc is valid without a real capture.
+        let img = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 0]));
+        let base_png = encode_png(&img).unwrap();
+        Document {
+            schema_version: DOCUMENT_SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            base_png,
+            base_width: 2,
+            base_height: 2,
+            cursor: None,
+            annotations: Vec::new(),
+            metadata: stub_metadata(),
+            edge_effect: None,
+            border: None,
+        }
+    }
+
+    fn round_trip(doc: &Document) -> Document {
+        let bytes = rmp_serde::to_vec_named(doc).expect("serialize");
+        rmp_serde::from_slice(&bytes).expect("deserialize")
+    }
+
+    #[test]
+    fn round_trip_arrow() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Arrow {
+            id: Uuid::new_v4(),
+            start: [1.0, 2.0],
+            end: [3.0, 4.0],
+            color: [10, 20, 30, 40],
+            thickness: 2.5,
+        });
+        let back = round_trip(&doc);
+        assert_eq!(back.annotations.len(), 1);
+        assert!(matches!(back.annotations[0], AnnotationNode::Arrow { .. }));
+    }
+
+    #[test]
+    fn round_trip_text() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Text {
+            id: Uuid::new_v4(),
+            position: [5.0, 6.0],
+            text: "hello".into(),
+            color: [1, 2, 3, 4],
+            size_px: 18.0,
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Text { text, .. } = &back.annotations[0] {
+            assert_eq!(text, "hello");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_callout() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Callout {
+            id: Uuid::new_v4(),
+            rect: [10.0, 10.0, 60.0, 40.0],
+            tail: [5.0, 50.0],
+            text: "note".into(),
+            fill: [255, 255, 220, 230],
+            stroke: [0, 0, 0, 255],
+            stroke_width: 2.0,
+            text_color: [0, 0, 0, 255],
+            text_size: 16.0,
+        });
+        let back = round_trip(&doc);
+        assert!(matches!(back.annotations[0], AnnotationNode::Callout { .. }));
+    }
+
+    #[test]
+    fn round_trip_shape() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Shape {
+            id: Uuid::new_v4(),
+            shape: ShapeKind::Ellipse,
+            rect: [0.0, 0.0, 100.0, 50.0],
+            stroke: [200, 0, 0, 255],
+            stroke_width: 3.0,
+            fill: [0, 0, 0, 0],
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Shape { shape, .. } = &back.annotations[0] {
+            assert_eq!(*shape, ShapeKind::Ellipse);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_step() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Step {
+            id: Uuid::new_v4(),
+            center: [40.0, 40.0],
+            radius: 20.0,
+            number: 3,
+            fill: [220, 40, 40, 255],
+            text_color: [255, 255, 255, 255],
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Step { number, .. } = &back.annotations[0] {
+            assert_eq!(*number, 3);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_stamp_builtin() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Stamp {
+            id: Uuid::new_v4(),
+            source: StampSource::Builtin { name: "check".into() },
+            rect: [0.0, 0.0, 64.0, 64.0],
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Stamp {
+            source: StampSource::Builtin { name }, ..
+        } = &back.annotations[0]
+        {
+            assert_eq!(name, "check");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_stamp_inline() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Stamp {
+            id: Uuid::new_v4(),
+            source: StampSource::Inline { png: vec![0x89, b'P', b'N', b'G'] },
+            rect: [0.0, 0.0, 64.0, 64.0],
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Stamp {
+            source: StampSource::Inline { png }, ..
+        } = &back.annotations[0]
+        {
+            assert_eq!(png.len(), 4);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_magnify() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Magnify {
+            id: Uuid::new_v4(),
+            source_rect: [10.0, 10.0, 30.0, 30.0],
+            target_rect: [100.0, 100.0, 200.0, 200.0],
+            border: [255, 255, 255, 255],
+            border_width: 3.0,
+            circular: true,
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Magnify { circular, .. } = &back.annotations[0] {
+            assert!(*circular);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    /// v1 documents (Arrow/Text only, schema_version = 1) must still load.
+    /// We manufacture a v1-shaped document by serialising with a rewritten
+    /// schema_version and asserting reload succeeds.
+    #[test]
+    fn v1_documents_still_load() {
+        let mut doc = stub_doc();
+        doc.schema_version = 1;
+        doc.annotations.push(AnnotationNode::Arrow {
+            id: Uuid::new_v4(),
+            start: [0.0, 0.0],
+            end: [10.0, 10.0],
+            color: [255, 0, 0, 255],
+            thickness: 4.0,
+        });
+        let back = round_trip(&doc);
+        assert_eq!(back.schema_version, 1);
+        assert_eq!(back.annotations.len(), 1);
+    }
+
+    #[test]
+    fn round_trip_blur() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Blur {
+            id: Uuid::new_v4(),
+            rect: [0.0, 0.0, 32.0, 32.0],
+            radius_px: 12.0,
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::Blur { radius_px, .. } = &back.annotations[0] {
+            assert!((*radius_px - 12.0).abs() < f32::EPSILON);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_capture_info() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::CaptureInfo {
+            id: Uuid::new_v4(),
+            position: CaptureInfoPosition::BottomRight,
+            fields: vec![
+                FieldKind::Timestamp,
+                FieldKind::WindowTitle,
+                FieldKind::OsVersion,
+            ],
+            style: CaptureInfoStyle::default(),
+        });
+        let back = round_trip(&doc);
+        if let AnnotationNode::CaptureInfo { position, fields, .. } = &back.annotations[0] {
+            assert_eq!(*position, CaptureInfoPosition::BottomRight);
+            assert_eq!(fields.len(), 3);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn round_trip_edge_effect() {
+        let mut doc = stub_doc();
+        doc.edge_effect = Some(EdgeEffect {
+            edge: Edge::Right,
+            depth: 20.0,
+            teeth: 24.0,
+        });
+        let back = round_trip(&doc);
+        let e = back.edge_effect.expect("edge_effect round-trip");
+        assert_eq!(e.edge, Edge::Right);
+        assert!((e.depth - 20.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn round_trip_border() {
+        let mut doc = stub_doc();
+        doc.border = Some(Border {
+            color: [200, 100, 50, 255],
+            width: 8.0,
+            shadow_radius: 6.0,
+            shadow_offset: [2.0, 3.0],
+            shadow_color: [0, 0, 0, 150],
+        });
+        let back = round_trip(&doc);
+        let b = back.border.expect("border round-trip");
+        assert_eq!(b.color, [200, 100, 50, 255]);
+        assert!((b.width - 8.0).abs() < f32::EPSILON);
+        assert!((b.shadow_radius - 6.0).abs() < f32::EPSILON);
+    }
+
+    /// v2 documents (M3, no top-level `edge_effect` / `border` fields) must
+    /// still deserialize cleanly into the v3 struct with the new fields
+    /// defaulting to `None`. We fake a v2 document by serializing a minimal
+    /// version of the on-wire shape with the old field set.
+    #[test]
+    fn v2_documents_still_load_with_defaults() {
+        // Serialize a shape that OMITS the new fields entirely — we achieve
+        // this by constructing a minimal companion struct, serializing it
+        // with rmp-serde, and then deserializing it as the real Document.
+        #[derive(Serialize)]
+        struct DocV2 {
+            schema_version: u32,
+            id: Uuid,
+            base_png: Vec<u8>,
+            base_width: u32,
+            base_height: u32,
+            cursor: Option<SerializedCursor>,
+            annotations: Vec<AnnotationNode>,
+            metadata: CaptureMetadata,
+        }
+
+        let base = stub_doc();
+        let v2 = DocV2 {
+            schema_version: 2,
+            id: base.id,
+            base_png: base.base_png.clone(),
+            base_width: base.base_width,
+            base_height: base.base_height,
+            cursor: None,
+            annotations: vec![AnnotationNode::Arrow {
+                id: Uuid::new_v4(),
+                start: [0.0, 0.0],
+                end: [4.0, 4.0],
+                color: [255, 0, 0, 255],
+                thickness: 2.0,
+            }],
+            metadata: base.metadata.clone(),
+        };
+        let bytes = rmp_serde::to_vec_named(&v2).unwrap();
+        let loaded: Document = rmp_serde::from_slice(&bytes).expect("v2 loads as v3");
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.annotations.len(), 1);
+        assert!(loaded.edge_effect.is_none());
+        assert!(loaded.border.is_none());
+    }
 }

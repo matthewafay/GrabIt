@@ -2,7 +2,9 @@ pub mod paths;
 pub mod single_instance;
 
 use crate::capture::{CaptureRequest, CaptureTarget};
+use crate::presets::{Preset, PresetStore, PresetTargetKind};
 use crate::settings::Settings;
+use crate::styles::StyleStore;
 use anyhow::Result;
 use log::{info, warn};
 use paths::AppPaths;
@@ -11,11 +13,23 @@ use paths::AppPaths;
 pub struct AppState {
     pub paths: AppPaths,
     pub settings: Settings,
+    /// Loaded preset collection. Re-reads from disk on `RefreshHotkeys`.
+    pub presets: PresetStore,
+    /// Quick annotation styles. The editor reloads its own copy on open,
+    /// so this is mainly here to keep first-run initialisation symmetric
+    /// with presets (and to validate the styles file at startup).
+    #[allow(dead_code)]
+    pub styles: StyleStore,
 }
 
 impl AppState {
-    pub fn new(paths: AppPaths, settings: Settings) -> Self {
-        Self { paths, settings }
+    pub fn new(
+        paths: AppPaths,
+        settings: Settings,
+        presets: PresetStore,
+        styles: StyleStore,
+    ) -> Self {
+        Self { paths, settings, presets, styles }
     }
 }
 
@@ -34,6 +48,22 @@ pub enum Command {
     /// Interactive capture → opens the editor with the result ready to
     /// annotate.
     CaptureAndAnnotate,
+    /// Capture a region of exactly `width` x `height` physical pixels; the
+    /// user positions it via the exact-dims overlay.
+    CaptureExactDims { width: u32, height: u32 },
+    /// Run the UI-Automation object / menu picker and capture whatever
+    /// element the user highlights.
+    CaptureObject,
+    /// Run the multi-region picker; compose the collected rectangles
+    /// into a single output image.
+    CaptureMultiRegion,
+    /// Fire the preset with the given display name. Resolved against the
+    /// live `PresetStore`; missing names are logged and ignored so stale
+    /// tray entries can't crash the app.
+    CapturePreset(String),
+    /// Reload presets from disk and re-register their hotkeys. Triggered
+    /// from the editor's presets panel after an edit.
+    RefreshHotkeys,
     /// Open the output folder in Explorer.
     OpenOutputFolder,
     /// Toggle "Launch at startup" — flips the HKCU Run entry and persists
@@ -89,6 +119,61 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
                 info!("annotate flow cancelled at capture stage");
             }
         }
+        Command::CaptureExactDims { width, height } => {
+            info!("dispatch: CaptureExactDims {width}x{height}");
+            run_capture(
+                state,
+                CaptureRequest {
+                    target: CaptureTarget::ExactDims { width, height },
+                    delay_ms: 0,
+                    include_cursor: state.settings.include_cursor,
+                },
+            )?;
+        }
+        Command::CaptureObject => {
+            info!("dispatch: CaptureObject");
+            run_capture(
+                state,
+                CaptureRequest {
+                    target: CaptureTarget::Object,
+                    delay_ms: 0,
+                    include_cursor: state.settings.include_cursor,
+                },
+            )?;
+        }
+        Command::CaptureMultiRegion => {
+            info!("dispatch: CaptureMultiRegion");
+            run_capture(
+                state,
+                CaptureRequest {
+                    target: CaptureTarget::MultiRegion,
+                    delay_ms: 0,
+                    // Cursor layer is meaningless for a composite of
+                    // non-contiguous rects — force off regardless of
+                    // the global setting.
+                    include_cursor: false,
+                },
+            )?;
+        }
+        Command::CapturePreset(name) => {
+            info!("dispatch: CapturePreset {name:?}");
+            // Resolve against the loaded store; if the preset was deleted
+            // while the hotkey was still registered (unlikely — refresh
+            // unregisters first — but possible during a hot edit) we log
+            // and drop the command instead of erroring.
+            let Some(preset) = state.presets.find(&name).cloned() else {
+                warn!("preset {name:?} not found; command dropped");
+                return Ok(());
+            };
+            run_preset_capture(state, &preset)?;
+        }
+        Command::RefreshHotkeys => {
+            info!("dispatch: RefreshHotkeys (from settings UI)");
+            state.presets = PresetStore::load(&state.paths);
+            // Actual rebinding is handled by the event loop — it owns the
+            // Registrar. The loop checks for this command and calls
+            // `refresh_hotkeys` with the new preset list.
+        }
         Command::CaptureWithDelay { delay_ms } => {
             info!("dispatch: CaptureWithDelay {delay_ms}ms");
             // Show a countdown overlay during the delay so the user knows
@@ -141,6 +226,110 @@ fn run_capture(state: &AppState, req: CaptureRequest) -> Result<()> {
     }
     info!("capture saved to {}", out_path.display());
     Ok(())
+}
+
+/// Preset-driven capture path. Builds a `CaptureRequest` from a `Preset`,
+/// respects the preset's filename template / subfolder, and branches on
+/// the preset's post-capture action.
+fn run_preset_capture(state: &AppState, preset: &Preset) -> Result<()> {
+    // Countdown + delay before resolving Interactive, matching the regular
+    // delay path. The overlay closes before the shot fires.
+    if preset.delay_ms > 0 {
+        if let Err(e) = crate::capture::delay::countdown(preset.delay_ms) {
+            warn!("preset countdown failed: {e}");
+        }
+    }
+
+    let target = match preset.target {
+        PresetTargetKind::Fullscreen => CaptureTarget::Fullscreen,
+        PresetTargetKind::Region => CaptureTarget::Interactive { allow_windows: false },
+        PresetTargetKind::Window => CaptureTarget::Interactive { allow_windows: true },
+        PresetTargetKind::ExactDims => {
+            // Presets with exact-dims must carry a non-zero size. If the
+            // user saved one with 0x0, fall back to a reasonable default
+            // and warn — preferable to silently running a zero capture.
+            let w = if preset.width == 0 { 1920 } else { preset.width };
+            let h = if preset.height == 0 { 1080 } else { preset.height };
+            if preset.width == 0 || preset.height == 0 {
+                warn!(
+                    "preset {:?} exact-dims W/H is zero; using {w}x{h}",
+                    preset.name
+                );
+            }
+            CaptureTarget::ExactDims { width: w, height: h }
+        }
+        PresetTargetKind::Object => CaptureTarget::Object,
+        PresetTargetKind::MultiRegion => CaptureTarget::MultiRegion,
+    };
+
+    // Multi-region composites have no cursor layer, regardless of what
+    // the preset says.
+    let include_cursor = match preset.target {
+        PresetTargetKind::MultiRegion => false,
+        _ => preset.include_cursor,
+    };
+    let req = CaptureRequest {
+        target,
+        delay_ms: 0, // already ticked via countdown above
+        include_cursor,
+    };
+
+    let Some(result) = crate::capture::perform(req)? else {
+        info!("preset capture cancelled");
+        return Ok(());
+    };
+
+    use crate::presets::PostAction;
+    match preset.post_action {
+        PostAction::CopyOnly => {
+            if let Err(e) = crate::export::copy_to_clipboard(&result) {
+                warn!("preset clipboard copy failed: {e}");
+            } else {
+                info!("preset {:?}: copied to clipboard (no disk save)", preset.name);
+            }
+        }
+        PostAction::SaveOnly => {
+            let out_path = save_with_preset(preset, &result, &state.paths)?;
+            if state.settings.copy_to_clipboard {
+                if let Err(e) = crate::export::copy_to_clipboard(&result) {
+                    warn!("clipboard copy failed: {e}");
+                }
+            }
+            info!("preset {:?}: saved to {}", preset.name, out_path.display());
+        }
+        PostAction::Editor => {
+            // Save alongside opening the editor so the PNG on disk exists
+            // immediately — same as `CaptureAndAnnotate` today.
+            if let Err(e) = save_with_preset(preset, &result, &state.paths) {
+                warn!("preset PNG save (before editor) failed: {e}");
+            }
+            crate::editor::open_from_capture(
+                result,
+                &state.paths,
+                state.settings.copy_to_clipboard,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Save a preset capture honouring its filename template + subfolder. The
+/// `.grabit` sidecar is written next to the PNG so the capture can be
+/// reopened in the editor even for `SaveOnly` presets.
+fn save_with_preset(
+    preset: &Preset,
+    result: &crate::capture::CaptureResult,
+    paths: &AppPaths,
+) -> Result<std::path::PathBuf> {
+    let window = result.metadata.foreground_title.as_deref();
+    let png_path = preset.resolve_png_path(paths, window, chrono::Local::now());
+    if let Some(parent) = png_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("create preset output dir {}: {e}", parent.display());
+        }
+    }
+    crate::export::save_png_to(result, &png_path)?;
+    Ok(png_path)
 }
 
 fn open_in_explorer(path: &std::path::Path) {
