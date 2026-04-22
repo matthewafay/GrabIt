@@ -2,6 +2,8 @@
 //! `%APPDATA%\GrabIt\settings.toml`. Presets (feature #3) live alongside in
 //! `presets/*.toml` and get their own module when M5 lands.
 
+pub mod ui;
+
 use crate::app::paths::AppPaths;
 use crate::hotkeys::bindings::HotkeyBinding;
 use anyhow::{Context, Result};
@@ -13,13 +15,11 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// Global hotkey for `CaptureFullscreen`. Default: PrintScreen.
     pub hotkey: HotkeyBinding,
-    /// Global hotkey for `CaptureAndAnnotate`. Default: Ctrl+Z.
+    /// Global hotkey for `CaptureAndAnnotate`. Default: Ctrl+X.
     ///
     /// Heads-up: global hotkeys win over focused apps, so while this is set
-    /// to Ctrl+Z, that keystroke won't reach other apps (including the
-    /// editor's own Undo). Change this in `settings.toml` if you need Ctrl+Z
-    /// back — something like `Ctrl+Shift+Z` or `Win+S` is a safer default in
-    /// practice.
+    /// to Ctrl+X, that keystroke won't reach other apps (including their
+    /// own Cut shortcut). Change it in Settings or edit `settings.toml`.
     pub annotate_hotkey: HotkeyBinding,
     /// Persisted state of the "Launch at startup" tray checkbox.
     pub launch_at_startup: bool,
@@ -27,16 +27,20 @@ pub struct Settings {
     pub include_cursor: bool,
     /// Copy every capture to the Windows clipboard on completion.
     pub copy_to_clipboard: bool,
+    /// Override the capture output directory. `None` = default
+    /// `%USERPROFILE%\Pictures\GrabIt`.
+    pub output_dir: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: HotkeyBinding::default(),
-            annotate_hotkey: HotkeyBinding { raw: "Ctrl+Z".to_string() },
+            annotate_hotkey: HotkeyBinding { raw: "Ctrl+X".to_string() },
             launch_at_startup: true,
             include_cursor: true,
             copy_to_clipboard: true,
+            output_dir: None,
         }
     }
 }

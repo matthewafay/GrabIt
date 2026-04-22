@@ -31,7 +31,6 @@ pub struct TrayMenuIds {
     pub capture_interactive: tray_icon::menu::MenuId,
     pub capture_annotate: tray_icon::menu::MenuId,
     pub capture_object: tray_icon::menu::MenuId,
-    pub capture_multi_region: tray_icon::menu::MenuId,
     pub capture_delay_3: tray_icon::menu::MenuId,
     pub capture_delay_5: tray_icon::menu::MenuId,
     pub capture_delay_10: tray_icon::menu::MenuId,
@@ -76,11 +75,9 @@ impl Tray {
         let capture = MenuItem::new("Capture fullscreen", true, None);
         let capture_interactive = MenuItem::new("Capture region / window\u{2026}", true, None);
         let capture_annotate = MenuItem::new("Capture \u{0026} annotate\u{2026}", true, None);
-        // M6: UIA element picker and multi-region composer live in the
-        // main capture section (per the plan), not the Presets submenu.
+        // M6: UIA element picker lives in the main capture section (per the
+        // plan), not the Presets submenu.
         let capture_object = MenuItem::new("Capture object\u{2026}", true, None);
-        let capture_multi_region =
-            MenuItem::new("Capture multi-region\u{2026}", true, None);
 
         let delay_submenu = Submenu::new("Capture with delay", true);
         let capture_delay_3 = MenuItem::new("3 seconds", true, None);
@@ -126,8 +123,6 @@ impl Tray {
         menu.append(&capture_interactive).context("append interactive item")?;
         menu.append(&capture_annotate).context("append annotate item")?;
         menu.append(&capture_object).context("append object item")?;
-        menu.append(&capture_multi_region)
-            .context("append multi-region item")?;
         menu.append(&delay_submenu).context("append delay submenu")?;
         menu.append(&exact_submenu).context("append exact submenu")?;
         menu.append(&presets_submenu).context("append presets submenu")?;
@@ -146,7 +141,6 @@ impl Tray {
             capture_interactive: capture_interactive.id().clone(),
             capture_annotate: capture_annotate.id().clone(),
             capture_object: capture_object.id().clone(),
-            capture_multi_region: capture_multi_region.id().clone(),
             capture_delay_3: capture_delay_3.id().clone(),
             capture_delay_5: capture_delay_5.id().clone(),
             capture_delay_10: capture_delay_10.id().clone(),
@@ -267,8 +261,6 @@ pub fn on_menu_event(ev: MenuEvent, cmd_tx: &Sender<Command>) {
         Some(Command::CaptureAndAnnotate)
     } else if ev.id == ids.capture_object {
         Some(Command::CaptureObject)
-    } else if ev.id == ids.capture_multi_region {
-        Some(Command::CaptureMultiRegion)
     } else if ev.id == ids.capture_delay_3 {
         Some(Command::CaptureWithDelay { delay_ms: 3_000 })
     } else if ev.id == ids.capture_delay_5 {

@@ -5,133 +5,201 @@
 A lightweight Windows screenshot + annotation tool. Single `.exe`, lives in
 the system tray, launches with Windows.
 
-## What it does today
+## Capture
 
-**Capture**
-
-- **Fullscreen** — `PrintScreen` hotkey or tray → *Capture fullscreen*.
-  Saves PNG to `%USERPROFILE%\Pictures\GrabIt\` and copies to clipboard.
+- **Fullscreen** — `PrintScreen` or tray → *Capture fullscreen*. Saves PNG
+  to the output folder and copies to clipboard.
 - **Region / window** — tray → *Capture region / window…*. Drag a rectangle
   in the overlay, or hover a window (green outline) and click to grab it.
-  Multi-monitor and mixed-DPI aware. Cursor is captured as a separate layer.
+  Multi-monitor and mixed-DPI aware.
+- **Annotate** — `Ctrl+X` or tray → *Capture & annotate…*. Drag-release a
+  rectangle, then the editor opens with it.
+- **Object / menu** — tray → *Capture object…*. A UIA picker highlights the
+  UI element under the cursor (button, menu item, list row); F3 commits,
+  Esc cancels. Menus stay pinned via a `SetWinEventHook` while you hover.
+- **Exact size** — tray → *Capture exact size…* → pick a preset
+  (1920×1080, 1600×900, 1280×720, 1024×768, 800×600, 640×480, 500×500). An
+  overlay lets you position the fixed-size rectangle.
 - **Delayed** — tray → *Capture with delay* → 3 / 5 / 10s. A countdown
-  window appears, then closes before the capture fires so it never lands in
-  the output.
-- **Annotate** — `Ctrl+Z` hotkey or tray → *Capture & annotate…*.
-  Drag-release a rectangle, then the editor opens on that region.
+  appears and closes before the capture fires.
+- **Presets** — tray → *Presets*. User-defined capture profiles bundling
+  target, delay, cursor, post-action, filename template. Each can bind its
+  own global hotkey.
 
-**Annotate (editor)**
+Every capture saves both a PNG and a `.grabit` sidecar (the editable scene
+graph) next to it.
 
-- **Arrow** tool: click-drag to place. Color picker + thickness slider.
-- **Text** tool: click empty space to place a single-line text annotation,
-  or click an existing text to re-edit it. Enter commits, Escape cancels,
-  committing with an empty buffer deletes a re-edited text. Uses JetBrains
-  Mono at the selected size.
-- **Undo** (Ctrl+Z inside the editor) and **Clear**.
-- **Copy to clipboard** — flatten annotations and copy the image without
-  touching disk.
-- **Save** (Ctrl+S) — write an annotated PNG, a `.grabit` sidecar that
-  preserves the editable scene graph, and (by default) also update the
-  clipboard.
+## Editor
 
-## Hotkeys
+Tools:
 
-Global hotkeys (work anywhere on Windows):
+- **Select** — click any annotation to select, drag body to move, drag
+  any edge or corner handle to resize (edges work along their full length,
+  not just the midpoint). Drag different annotations without deselecting
+  first. Delete removes. Ctrl+Z / Ctrl+Y for undo/redo.
+- **Arrow** — drag tail-to-tip; shaft is draggable anywhere along its
+  length for move, endpoints for retargeting.
+- **Text** — drag a rectangle to define the text box, type inside. Enter
+  adds a newline, text word-wraps at the right edge, Esc or clicking
+  outside commits. Click an existing text rect to re-edit.
+  - **Frosted** — gaussian-blur the pixels behind the text box (same
+    effect as the Blur tool), so text stays legible over any background.
+  - **Shadow** — soft offset drop shadow behind the text box for a
+    floating-card look. Pairs well with Frosted.
+  - **Align** — Left / Center / Right horizontal alignment inside the box.
+  - **Lists** — toggle off / bullet (`•`) / numbered (`1.`) list style;
+    wrapped continuation lines hanging-indent to the text column in the
+    exported PNG.
+  - JetBrains Mono at the chosen size.
+- **Callout** — drag a rect; produces a speech-balloon with a movable tail.
+- **Rect / Ellipse** — drag a shape with stroke + optional translucent fill.
+- **Step** — click to place numbered markers; auto-increment per document.
+- **Magnify** — drag over the region you want zoomed; a 3× loupe callout
+  appears next to it. Circular toggle. Live preview shows the real zoom.
+- **Blur** — drag a region. Non-destructive in `.grabit`, destructive on
+  PNG export. Live preview shows the real gaussian.
+- **Capture-info stamp** — pin a banner with timestamp / window title /
+  process / OS version / monitor info. Real metadata, live preview.
 
-| Default | Action |
-|---|---|
-| `PrintScreen` | Capture fullscreen |
-| `Ctrl+Z` | Capture & annotate |
+Document-level effects (right inspector panel):
 
-Both are configurable in `%APPDATA%\GrabIt\settings.toml` under the
-`hotkey` and `annotate_hotkey` keys. Examples: `Ctrl+Shift+X`, `Alt+PrtSc`,
-`Win+S`.
+- **Torn edge** — jagged cut on any of the four edges. Live preview.
+- **Border + drop shadow** — solid frame with optional soft shadow. Live
+  preview.
+- **Resize** — aspect-locked width/height inputs; Reset to base size.
+- **Rotate** — 90° CW / CCW buttons; Shift+R shortcut.
 
-> **Heads-up:** global hotkeys win over focused apps, so while
-> `annotate_hotkey` is set to `Ctrl+Z` it intercepts Ctrl+Z everywhere —
-> including the editor's own Undo. If you want Undo back, change the
-> binding in `settings.toml`.
+Undo/redo via command pattern (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y), bounded at
+200 entries. Ctrl+S saves. Closing with unsaved edits prompts
+Save / Discard / Cancel.
 
-## Build
+Quick styles (inspector → Styles tab): save the active tool's settings
+as a named style and reapply later. Styles persist at
+`%APPDATA%\GrabIt\styles.toml`.
 
-Requires Rust 1.78+ (tested on 1.95) and Visual Studio Build Tools with the
-"Desktop development with C++" workload (for the MSVC linker + `rc.exe`).
+## Settings
 
-```sh
+Tray → *Settings…* opens a GUI window with:
+
+- Fullscreen hotkey chord (default `PrintScreen`)
+- Annotate hotkey chord (default `Ctrl+X`)
+- Launch at startup
+- Include cursor in captures
+- Copy every capture to clipboard
+- Output folder (default `%USERPROFILE%\Pictures\GrabIt`, with Browse / Reset)
+
+Save writes `%APPDATA%\GrabIt\settings.toml` and signals the tray to
+re-register hotkeys and re-sync autostart without restart. Chord parsing
+accepts `Ctrl+Shift+Z`, `Alt+PrtSc`, `Win+S`, etc.
+
+> Global hotkeys win over focused apps — while the annotate hotkey is
+> `Ctrl+X` it intercepts Cut everywhere. Pick something unique (e.g.
+> `Ctrl+Shift+X`) if that bothers you.
+
+## Setup
+
+### Rust toolchain
+
+Install Rust via [`rustup`](https://rustup.rs/). On Windows open PowerShell
+and run:
+
+```powershell
+# Installer prompt — accept the defaults (it picks the MSVC toolchain).
+winget install Rustlang.Rustup
+# or download + run: https://win.rustup.rs/x86_64
+```
+
+Then add the stable toolchain and make sure it targets MSVC:
+
+```powershell
+rustup install stable
+rustup default stable-x86_64-pc-windows-msvc
+```
+
+Verify: `cargo --version` should print `cargo 1.78` or newer.
+
+### Visual Studio Build Tools
+
+GrabIt links against the Windows SDK and the MSVC CRT. Install the
+"Desktop development with C++" workload via Visual Studio Installer (the
+free **Build Tools for Visual Studio** SKU is enough). The Rust installer
+offers to do this for you on first run — accept if prompted.
+
+### Build
+
+From the repo root:
+
+```powershell
 cargo build --release
 ```
 
-Produces `target/release/grabit.exe`, a self-contained Windows binary around
-5 MB (statically linked CRT, LTO, stripped).
+Produces `target\release\grabit.exe`, a self-contained Windows binary
+around 5 MB (statically linked CRT, LTO, stripped). Run it directly; no
+installer is required.
+
+If a build fails with `error: failed to remove file … Access is denied`,
+a previous `grabit.exe` is still running. Quit it from the system tray
+(and close any open editor / settings windows — each is a subprocess of
+the same `.exe`) and rerun.
 
 ## Use
 
 Run `grabit.exe`. The logo appears in the system tray. Right-click for the
-menu. Left-click does nothing yet (reserved for future quick-capture).
+menu. Toggle **Launch at startup** in the tray to add/remove the
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\GrabIt` entry.
 
-Toggle **Launch at startup** in the tray menu to add/remove an entry under
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\GrabIt`.
-
-Default output folder: `%USERPROFILE%\Pictures\GrabIt\`.
-Settings: `%APPDATA%\GrabIt\settings.toml`.
-Logs / crash dumps: `%APPDATA%\GrabIt\logs\`.
+Output folder: configurable in Settings (default `%USERPROFILE%\Pictures\GrabIt`).
+Settings / presets / styles / logs: `%APPDATA%\GrabIt\`.
 
 ## Architecture
 
 ```
 src/
-  main.rs              entry; single-instance mutex; DPI + font init;
-                       event loop pumping tray, hotkeys, and commands
-  app/                 AppState, command dispatch, paths, single-instance
-  tray/                system-tray icon + menu
-  hotkeys/             global-hotkey registration + accelerator parsing
+  main.rs              entry + subprocess dispatch (--editor, --settings);
+                       single-instance mutex; DPI + font init; event loop
+  app/                 AppState, command dispatch, paths
+  tray/                tray icon + menu (capture / presets / settings / quit)
+  hotkeys/             global-hotkey registration, chord parser, runtime rebind
   autostart/           HKCU Run-key read/write
-  platform/            DPI, monitor enumeration, embedded font registration
+  platform/            DPI, monitor enumeration, JetBrains Mono font registration
   capture/
     gdi.rs             GDI BitBlt (fullscreen / region)
     window_pick.rs     PrintWindow(PW_RENDERFULLCONTENT)
     cursor.rs          GetCursorInfo + DrawIconEx → separate cursor layer
     region.rs          layered-window overlay (drag / window-hover)
+    exact_dims.rs      fixed-size positioner overlay
+    object_pick.rs     IUIAutomation element picker + WinEventHook menu pin
     delay.rs           countdown overlay
-    wgc.rs             WGC stub (activated in a later milestone)
+    wgc.rs             Windows.Graphics.Capture hooks (GDI fallback active)
   editor/
-    app.rs             eframe App: toolbar + canvas + arrow / text tools
+    app.rs             eframe App: toolbar + canvas + tool palette
     document.rs        Document schema (.grabit, MessagePack)
-    rasterize.rs       arrow + text baking into the saved PNG
-  settings/            TOML-serialized settings + hotkey bindings
+    commands.rs        command-pattern undo/redo history (bounded 200)
+    rasterize.rs       flatten annotations + effects onto PNG export
+    tools/             one module per tool
+  presets/             per-preset .toml records + hotkey rebinding
+  styles/              named quick-style presets per tool
+  settings/
+    mod.rs             settings.toml load/save
+    ui.rs              eframe GUI for the --settings subprocess
   export/              PNG write + Windows clipboard (CF_DIB)
 ```
 
-Editor runs on a worker thread via `eframe::run_native` with
-`EventLoopBuilderExtWindows::with_any_thread(true)` so the main-thread tray
-loop stays alive for concurrent captures.
-
-## Status
-
-| Milestone | Status | What it delivered |
-|---|---|---|
-| M0 | ✅ | Scaffold, tray, hotkey, GDI fullscreen capture, PNG + clipboard, Document schema |
-| M1 | ✅ | Per-monitor DPI, region/window overlay, PrintWindow window capture, countdown |
-| M2 | 🔶 | eframe/egui editor skeleton with Save + Copy buttons (pan/zoom + crop/resize/rotate deferred) |
-| M3 | 🔶 | Arrow + Text tools with click-to-re-edit (callouts/shapes/step/stamps/cursor-edit pending) |
-| M4 | ⏳ | Blur, cut-out, borders, magnify, capture-info |
-| M5 | ⏳ | Presets, per-preset hotkeys, quick styles |
-| M6 | ⏳ | Menu / object (UIAutomation) capture, multi-region composites |
-| M7 | ⏳ | Templates, batch processing |
-| M8 | ⏳ | Virtual printer capture (Authenticode-signed port monitor) |
-| M9 | ⏳ | Installer + portable zip + auto-update |
-
-Full plan with scope, risks, and verification lives at
-`.claude/plans/` outside this repo.
+Each editor and settings window runs as its own `grabit.exe` subprocess
+(`--editor <sidecar>` or `--settings`) because winit 0.30 refuses to
+recreate its event loop inside one process — the tray would deadlock after
+the first editor close otherwise. Subprocesses communicate with the tray
+via marker files under `%APPDATA%\GrabIt\` (one-shot reloads for settings,
+presets, and triggered preset captures).
 
 ## Credits
 
 - **Logo:** pixel-art TV by the project owner.
 - **Font:** [JetBrains Mono](https://www.jetbrains.com/lp/mono/) Regular &
-  Bold, SIL Open Font License 1.1. License text:
-  `assets/fonts/OFL.txt`.
+  Bold, SIL Open Font License 1.1. License text: `assets/fonts/OFL.txt`.
 - **Rust crates** (runtime): `windows`, `eframe` / `egui`, `tray-icon`,
-  `global-hotkey`, `image`, `ab_glyph`, `winreg`, `toml`, `rmp-serde`,
-  `serde`, `chrono`, `parking_lot`, `crossbeam-channel`, `anyhow`,
-  `thiserror`, `log` / `env_logger`, `uuid`, `rfd`, `dirs`.
+  `global-hotkey`, `image`, `imageproc`, `fast_image_resize`, `ab_glyph`,
+  `winreg`, `toml`, `rmp-serde`, `serde`, `chrono`, `parking_lot`,
+  `crossbeam-channel`, `anyhow`, `thiserror`, `log` / `env_logger`,
+  `uuid`, `rfd`, `dirs`.
 - **Rust crates** (build): `embed-resource`, `ico`, `image`.

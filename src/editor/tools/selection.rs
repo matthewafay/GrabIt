@@ -54,12 +54,11 @@ pub fn bounds_of_node(node: &AnnotationNode) -> Option<BBox> {
                 start[1].max(end[1]),
             ])
         }
-        AnnotationNode::Text { position, text, size_px, .. } => {
-            // Approximate: assume ~0.6em per char at `size_px`. Good enough
-            // for selection hit-testing; the editor recomputes the actual
-            // rect with egui's font metrics when drawing handles.
-            let w = (text.chars().count() as f32) * size_px * 0.62;
-            Some([position[0], position[1], position[0] + w.max(*size_px), position[1] + *size_px])
+        AnnotationNode::Text { rect, .. } => {
+            // Text is now a drag-created box — the stored rect IS the
+            // bounds. Overflowing text past the bottom still renders but
+            // selection/handles track the declared rect.
+            Some(*rect)
         }
         AnnotationNode::Callout { rect, .. } => Some(*rect),
         AnnotationNode::Shape { rect, .. } => Some(*rect),

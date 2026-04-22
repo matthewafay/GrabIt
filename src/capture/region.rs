@@ -65,7 +65,7 @@ mod imp {
         UnregisterClassW, HCURSOR, HICON, IDC_CROSS, LWA_ALPHA, LWA_COLORKEY, MSG, SW_SHOW,
         WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
         WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSEXW, WNDCLASS_STYLES, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+        SetForegroundWindow, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
     };
 
     const CLASS_NAME: PCWSTR = w!("GrabItRegionOverlay");
@@ -120,7 +120,11 @@ mod imp {
                 return Err(anyhow!("virtual desktop has zero size"));
             }
 
-            let style_ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            // Note: no WS_EX_NOACTIVATE — we want the overlay to become the
+            // foreground window so WM_KEYDOWN reaches us (Esc cancels, Enter
+            // commits). Otherwise keystrokes still land on whatever app had
+            // focus when the hotkey fired.
+            let style_ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
             let style = WS_POPUP | WS_VISIBLE;
 
             let hwnd = CreateWindowExW(
@@ -165,6 +169,7 @@ mod imp {
             });
 
             let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
 
             // Modal message loop — blocks the caller until WM_QUIT.
             let mut msg = MSG::default();

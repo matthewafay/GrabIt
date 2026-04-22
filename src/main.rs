@@ -31,6 +31,9 @@ fn main() -> Result<()> {
         let clipboard = args.iter().any(|a| a == "--clipboard");
         return run_editor_subprocess(&grabit, png_out.as_deref(), clipboard);
     }
+    if args.iter().any(|a| a == "--settings") {
+        return run_settings_subprocess();
+    }
 
     let _instance_guard = match app::single_instance::acquire() {
         Ok(g) => g,
@@ -38,7 +41,7 @@ fn main() -> Result<()> {
         Err(e) => return Err(anyhow::anyhow!("single-instance check failed: {e}")),
     };
 
-    let paths = app::paths::AppPaths::bootstrap().context("create app data directories")?;
+    let mut paths = app::paths::AppPaths::bootstrap().context("create app data directories")?;
     init_logging(&paths.log_file());
 
     info!("GrabIt v{} starting", env!("CARGO_PKG_VERSION"));
@@ -62,6 +65,7 @@ fn main() -> Result<()> {
 
     let settings = settings::Settings::load_or_default(&paths);
     settings.save(&paths).ok();
+    apply_output_dir_override(&mut paths, &settings);
 
     // On first run, honor the persisted autostart preference.
     if let Err(e) = autostart::sync(&settings.launch_at_startup) {
@@ -87,8 +91,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Apply the user's output-directory override from settings onto the
+/// bootstrapped `AppPaths`. No-op when the override is unset, blank, or
+/// the path can't be created.
+fn apply_output_dir_override(paths: &mut app::paths::AppPaths, settings: &settings::Settings) {
+    let Some(raw) = settings.output_dir.as_deref().map(str::trim) else { return };
+    if raw.is_empty() { return; }
+    let candidate = std::path::PathBuf::from(raw);
+    if let Err(e) = std::fs::create_dir_all(&candidate) {
+        warn!("output_dir override {} unusable: {e}; keeping default", candidate.display());
+        return;
+    }
+    info!("output_dir override: {}", candidate.display());
+    paths.output_dir = candidate;
+}
+
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+}
+
+fn run_settings_subprocess() -> Result<()> {
+    let paths = app::paths::AppPaths::bootstrap().context("create app data directories")?;
+    init_logging(&paths.log_file());
+    platform::dpi::init_process_awareness();
+    platform::fonts::register_with_gdi();
+    info!("settings subprocess start");
+    let initial = settings::Settings::load_or_default(&paths);
+    settings::ui::run_blocking(paths, initial)
 }
 
 fn run_editor_subprocess(
@@ -237,10 +266,45 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
             hotkeys::on_event(ev, &cmd_tx);
         }
 
-        // Cross-thread marker files from the editor's presets/styles panels.
-        // The editor runs on a worker thread and can't reach this loop
-        // directly; dropping small marker files is a lightweight bridge.
+        // Cross-process marker files from the editor + settings subprocesses.
+        // Subprocess IPC is file-based because crossbeam channels don't span
+        // process boundaries.
         check_marker_files(&state.paths, &cmd_tx);
+
+        // Settings subprocess has saved — reload settings, re-sync autostart,
+        // and rebuild the hotkey registrar with the new global bindings.
+        let settings_marker = state.paths.data_dir.join(".settings_refresh");
+        if settings_marker.exists() {
+            let _ = std::fs::remove_file(&settings_marker);
+            state.settings = settings::Settings::load_or_default(&state.paths);
+            apply_output_dir_override(&mut state.paths, &state.settings);
+            if let Err(e) = autostart::sync(&state.settings.launch_at_startup) {
+                warn!("autostart re-sync failed: {e}");
+            }
+            let bindings = [
+                (state.settings.hotkey.clone(), app::Command::CaptureFullscreen),
+                (state.settings.annotate_hotkey.clone(), app::Command::CaptureAndAnnotate),
+            ];
+            drop(hotkeys);
+            hotkeys = match hotkeys::Registrar::install(cmd_tx.clone(), &bindings) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("re-register hotkeys after settings reload failed: {e:?}");
+                    return Err(e);
+                }
+            };
+            let preset_hk: Vec<hotkeys::PresetHotkey> = state
+                .presets
+                .bound_hotkeys()
+                .into_iter()
+                .map(|(chord, name)| hotkeys::PresetHotkey { chord, preset_name: name })
+                .collect();
+            let report = hotkeys.refresh_hotkeys(&preset_hk);
+            for (name, chord, reason) in &report.failed {
+                warn!("preset {name:?} hotkey {chord:?} not bound: {reason}");
+            }
+            info!("settings reloaded");
+        }
 
         // Pump one Win32 message (non-blocking). Sleep briefly if idle to
         // keep CPU flat.

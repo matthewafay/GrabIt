@@ -20,6 +20,11 @@
 //! - v3 (M4): adds `Blur` and `CaptureInfo` annotation variants plus two
 //!   top-level document fields (`edge_effect`, `border`). New fields are
 //!   tagged `#[serde(default)]` so v1/v2 files still deserialize cleanly.
+//! - v4: `AnnotationNode::Text` changes shape from `position: [f32; 2]` to
+//!   `rect: [f32; 4]` (drag-to-create text box with word-wrap). v1/v2/v3
+//!   documents that contain any old-shape Text nodes will fail to
+//!   deserialize — that is an accepted migration cost. Documents with no
+//!   Text nodes continue to load from any prior version.
 
 use crate::capture::{CaptureMetadata, CaptureResult};
 use anyhow::{Context, Result};
@@ -32,10 +37,12 @@ use uuid::Uuid;
 /// older readers. M3 introduced five new `AnnotationNode` variants; because
 /// rmp-serde's internally-tagged enums gracefully accept the older (smaller)
 /// variant set, v1 files still load. M4 adds two more annotation variants
-/// plus two top-level fields (`edge_effect`, `border`) — writers stamp v3,
-/// readers accept {1, 2, 3}. The new fields are `#[serde(default)]` so v1/v2
-/// documents still deserialize cleanly.
-pub const DOCUMENT_SCHEMA_VERSION: u32 = 3;
+/// plus two top-level fields (`edge_effect`, `border`); the new fields are
+/// `#[serde(default)]` so v1/v2 documents still deserialize cleanly. v4
+/// reshapes the `Text` variant (`position` → `rect`): documents with no
+/// Text nodes load fine across versions; documents that contain old-shape
+/// Text nodes will fail to deserialize (accepted migration cost).
+pub const DOCUMENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -211,6 +218,40 @@ pub enum StampSource {
     Inline { png: Vec<u8> },
 }
 
+/// Horizontal text alignment inside a `Text` annotation's wrap-width box.
+/// Applied per visual line at rasterize-time and to the live preview's
+/// `LayoutJob`, so the two paths match. Serialized kebab-case so the wire
+/// format is human-readable if anyone hex-dumps a `.grabit`. A new field
+/// on `AnnotationNode::Text` uses `#[serde(default)]`, so legacy v4 docs
+/// without the tag deserialize with `Left`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// Per-paragraph list style for a `Text` annotation. Applied at rasterize-
+/// and preview-time: each `\n`-separated paragraph gets a marker prefix
+/// (`"• "` for `Bullet`, `"1. "`, `"2. "`, … for `Numbered`). Empty
+/// paragraphs stay empty and do NOT consume a number. Wrapped continuation
+/// lines are hanging-indented so body text aligns past the marker. Stored
+/// with `#[serde(default)]` on the node so legacy v4 docs load as `None`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextListStyle {
+    #[default]
+    None,
+    Bullet,
+    Numbered,
+}
+
 /// Annotation scene-graph node. Variants are added as each annotation tool
 /// lands. All coordinates are in image-pixel space (relative to the top-left
 /// of `base_png`), not editor-canvas space — tools convert.
@@ -228,13 +269,35 @@ pub enum AnnotationNode {
     },
     Text {
         id: Uuid,
-        /// Top-left anchor in image-pixel coordinates.
-        position: [f32; 2],
+        /// Text-box bounds in image-pixel coordinates: `[min_x, min_y,
+        /// max_x, max_y]`. Text word-wraps at `max_x`; `max_y` defines the
+        /// minimum render height but text overflowing below is still drawn
+        /// so nothing visibly disappears.
+        rect: [f32; 4],
         text: String,
         /// sRGB color in RGBA order.
         color: [u8; 4],
         /// Font size in image pixels (cap height + descender roughly = size_px).
         size_px: f32,
+        /// If true, render a frosted-glass backdrop (gaussian blur of the
+        /// base pixels + translucent white tint) behind the text. Optional
+        /// per-annotation toggle; `#[serde(default)]` keeps v4 docs loading.
+        #[serde(default)]
+        frosted: bool,
+        /// If true, render a soft dark drop shadow behind the text rect.
+        /// Per-annotation toggle; `#[serde(default)]` keeps v4 docs loading.
+        #[serde(default)]
+        shadow: bool,
+        /// Horizontal alignment of each wrapped line inside the text-box.
+        /// `#[serde(default)]` so pre-alignment v4 docs (and all earlier
+        /// schemas) load as `Left`.
+        #[serde(default)]
+        align: TextAlign,
+        /// Per-paragraph list style (None / Bullet / Numbered). Applied by
+        /// rasterize + preview. `#[serde(default)]` so pre-list documents
+        /// deserialize with `None`.
+        #[serde(default)]
+        list: TextListStyle,
     },
     /// Speech-balloon with a tail. The balloon is an axis-aligned rounded
     /// rectangle; the tail is a triangular pointer whose tip is at `tail`.
@@ -463,16 +526,281 @@ mod tests {
         let mut doc = stub_doc();
         doc.annotations.push(AnnotationNode::Text {
             id: Uuid::new_v4(),
-            position: [5.0, 6.0],
-            text: "hello".into(),
+            rect: [5.0, 6.0, 105.0, 56.0],
+            text: "hello\nworld".into(),
             color: [1, 2, 3, 4],
             size_px: 18.0,
+            frosted: false,
+            shadow: false,
+            align: TextAlign::Left,
+            list: TextListStyle::None,
         });
         let back = round_trip(&doc);
-        if let AnnotationNode::Text { text, .. } = &back.annotations[0] {
-            assert_eq!(text, "hello");
+        if let AnnotationNode::Text { rect, text, .. } = &back.annotations[0] {
+            assert_eq!(text, "hello\nworld");
+            assert_eq!(*rect, [5.0, 6.0, 105.0, 56.0]);
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    /// Frosted / shadow flags + alignment round-trip when set. Also
+    /// confirms the `#[serde(default)]` path: an old-shape v4 Text
+    /// document (no `frosted` / `shadow` / `align` fields on the wire)
+    /// deserialises with both flags off and align = `Left`.
+    #[test]
+    fn round_trip_text_effects_flags() {
+        let mut doc = stub_doc();
+        doc.annotations.push(AnnotationNode::Text {
+            id: Uuid::new_v4(),
+            rect: [0.0, 0.0, 100.0, 40.0],
+            text: "hi".into(),
+            color: [10, 20, 30, 255],
+            size_px: 16.0,
+            frosted: true,
+            shadow: true,
+            align: TextAlign::Center,
+            list: TextListStyle::None,
+        });
+        let back = round_trip(&doc);
+        match &back.annotations[0] {
+            AnnotationNode::Text { frosted, shadow, align, .. } => {
+                assert!(*frosted);
+                assert!(*shadow);
+                assert_eq!(*align, TextAlign::Center);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Old-shape v4 document that predates the flags: build a pared-down
+        // companion enum that serialises without the new fields and confirm
+        // it deserialises cleanly with defaults.
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum LegacyNode {
+            Text {
+                id: Uuid,
+                rect: [f32; 4],
+                text: String,
+                color: [u8; 4],
+                size_px: f32,
+            },
+        }
+        #[derive(Serialize)]
+        struct LegacyDoc {
+            schema_version: u32,
+            id: Uuid,
+            base_png: Vec<u8>,
+            base_width: u32,
+            base_height: u32,
+            cursor: Option<SerializedCursor>,
+            annotations: Vec<LegacyNode>,
+            metadata: CaptureMetadata,
+            edge_effect: Option<EdgeEffect>,
+            border: Option<Border>,
+        }
+        let base = stub_doc();
+        let legacy = LegacyDoc {
+            schema_version: 4,
+            id: base.id,
+            base_png: base.base_png.clone(),
+            base_width: base.base_width,
+            base_height: base.base_height,
+            cursor: None,
+            annotations: vec![LegacyNode::Text {
+                id: Uuid::new_v4(),
+                rect: [1.0, 2.0, 3.0, 4.0],
+                text: "old".into(),
+                color: [1, 2, 3, 4],
+                size_px: 12.0,
+            }],
+            metadata: base.metadata.clone(),
+            edge_effect: None,
+            border: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let loaded: Document = rmp_serde::from_slice(&bytes).expect("legacy text loads");
+        match &loaded.annotations[0] {
+            AnnotationNode::Text { frosted, shadow, align, .. } => {
+                assert!(!*frosted);
+                assert!(!*shadow);
+                assert_eq!(*align, TextAlign::Left);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Round-trip Text with each non-default `align` value, and confirm a
+    /// legacy-shape Text (frosted/shadow on the wire but no `align` key)
+    /// defaults to `Left`.
+    #[test]
+    fn round_trip_text_align() {
+        for variant in [TextAlign::Center, TextAlign::Right] {
+            let mut doc = stub_doc();
+            doc.annotations.push(AnnotationNode::Text {
+                id: Uuid::new_v4(),
+                rect: [0.0, 0.0, 100.0, 40.0],
+                text: "hi".into(),
+                color: [10, 20, 30, 255],
+                size_px: 16.0,
+                frosted: false,
+                shadow: false,
+                align: variant,
+                list: TextListStyle::None,
+            });
+            let back = round_trip(&doc);
+            match &back.annotations[0] {
+                AnnotationNode::Text { align, .. } => assert_eq!(*align, variant),
+                _ => panic!("wrong variant"),
+            }
+        }
+
+        // Legacy v4 document with frosted/shadow but no `align` key must
+        // deserialise with `align = Left`.
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum LegacyNoAlign {
+            Text {
+                id: Uuid,
+                rect: [f32; 4],
+                text: String,
+                color: [u8; 4],
+                size_px: f32,
+                frosted: bool,
+                shadow: bool,
+            },
+        }
+        #[derive(Serialize)]
+        struct LegacyDoc {
+            schema_version: u32,
+            id: Uuid,
+            base_png: Vec<u8>,
+            base_width: u32,
+            base_height: u32,
+            cursor: Option<SerializedCursor>,
+            annotations: Vec<LegacyNoAlign>,
+            metadata: CaptureMetadata,
+            edge_effect: Option<EdgeEffect>,
+            border: Option<Border>,
+        }
+        let base = stub_doc();
+        let legacy = LegacyDoc {
+            schema_version: 4,
+            id: base.id,
+            base_png: base.base_png.clone(),
+            base_width: base.base_width,
+            base_height: base.base_height,
+            cursor: None,
+            annotations: vec![LegacyNoAlign::Text {
+                id: Uuid::new_v4(),
+                rect: [1.0, 2.0, 3.0, 4.0],
+                text: "old".into(),
+                color: [1, 2, 3, 4],
+                size_px: 12.0,
+                frosted: true,
+                shadow: false,
+            }],
+            metadata: base.metadata.clone(),
+            edge_effect: None,
+            border: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let loaded: Document =
+            rmp_serde::from_slice(&bytes).expect("legacy text-no-align loads");
+        match &loaded.annotations[0] {
+            AnnotationNode::Text { align, frosted, .. } => {
+                assert_eq!(*align, TextAlign::Left);
+                assert!(*frosted);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Round-trip Text with each non-default list style, and confirm a
+    /// legacy-shape Text (align on the wire but no `list` key) defaults to
+    /// `TextListStyle::None`.
+    #[test]
+    fn round_trip_text_list() {
+        for variant in [TextListStyle::Bullet, TextListStyle::Numbered] {
+            let mut doc = stub_doc();
+            doc.annotations.push(AnnotationNode::Text {
+                id: Uuid::new_v4(),
+                rect: [0.0, 0.0, 100.0, 40.0],
+                text: "a\nb".into(),
+                color: [10, 20, 30, 255],
+                size_px: 16.0,
+                frosted: false,
+                shadow: false,
+                align: TextAlign::Left,
+                list: variant,
+            });
+            let back = round_trip(&doc);
+            match &back.annotations[0] {
+                AnnotationNode::Text { list, .. } => assert_eq!(*list, variant),
+                _ => panic!("wrong variant"),
+            }
+        }
+
+        // Legacy v4 document with frosted/shadow/align but no `list` key —
+        // must deserialize with `list = None`.
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum LegacyNoList {
+            Text {
+                id: Uuid,
+                rect: [f32; 4],
+                text: String,
+                color: [u8; 4],
+                size_px: f32,
+                frosted: bool,
+                shadow: bool,
+                align: TextAlign,
+            },
+        }
+        #[derive(Serialize)]
+        struct LegacyDoc {
+            schema_version: u32,
+            id: Uuid,
+            base_png: Vec<u8>,
+            base_width: u32,
+            base_height: u32,
+            cursor: Option<SerializedCursor>,
+            annotations: Vec<LegacyNoList>,
+            metadata: CaptureMetadata,
+            edge_effect: Option<EdgeEffect>,
+            border: Option<Border>,
+        }
+        let base = stub_doc();
+        let legacy = LegacyDoc {
+            schema_version: 4,
+            id: base.id,
+            base_png: base.base_png.clone(),
+            base_width: base.base_width,
+            base_height: base.base_height,
+            cursor: None,
+            annotations: vec![LegacyNoList::Text {
+                id: Uuid::new_v4(),
+                rect: [1.0, 2.0, 3.0, 4.0],
+                text: "old".into(),
+                color: [1, 2, 3, 4],
+                size_px: 12.0,
+                frosted: false,
+                shadow: false,
+                align: TextAlign::Right,
+            }],
+            metadata: base.metadata.clone(),
+            edge_effect: None,
+            border: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let loaded: Document =
+            rmp_serde::from_slice(&bytes).expect("legacy text-no-list loads");
+        match &loaded.annotations[0] {
+            AnnotationNode::Text { list, align, .. } => {
+                assert_eq!(*list, TextListStyle::None);
+                assert_eq!(*align, TextAlign::Right);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

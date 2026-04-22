@@ -18,11 +18,9 @@
 //! ```
 //!
 //! `target` takes one of: `"fullscreen"`, `"region"`, `"window"`,
-//! `"exact-dims"`, `"object"`, `"multi-region"`. When `target =
-//! "exact-dims"`, `width` and `height` (in physical pixels) must also be
-//! provided. `"object"` runs the UIA element picker (feature #5);
-//! `"multi-region"` runs the multi-rect picker and composes the captures
-//! into one image (feature #8).
+//! `"exact-dims"`, `"object"`. When `target = "exact-dims"`, `width` and
+//! `height` (in physical pixels) must also be provided. `"object"` runs
+//! the UIA element picker (feature #5).
 
 use crate::app::paths::AppPaths;
 use anyhow::{anyhow, Context, Result};
@@ -78,9 +76,6 @@ pub enum PresetTargetKind {
     ExactDims,
     /// Run the UIA object / menu picker (feature #5, M6).
     Object,
-    /// Run the multi-region picker (feature #8, M6). The composed output
-    /// is saved under this preset's filename template like any other.
-    MultiRegion,
 }
 
 impl PresetTargetKind {
@@ -91,17 +86,15 @@ impl PresetTargetKind {
             PresetTargetKind::Window => "Region / window",
             PresetTargetKind::ExactDims => "Exact dimensions",
             PresetTargetKind::Object => "Object / menu",
-            PresetTargetKind::MultiRegion => "Multi-region",
         }
     }
 
-    pub const ALL: [PresetTargetKind; 6] = [
+    pub const ALL: [PresetTargetKind; 5] = [
         PresetTargetKind::Fullscreen,
         PresetTargetKind::Region,
         PresetTargetKind::Window,
         PresetTargetKind::ExactDims,
         PresetTargetKind::Object,
-        PresetTargetKind::MultiRegion,
     ];
 }
 
@@ -454,29 +447,8 @@ mod tests {
     }
 
     #[test]
-    fn preset_roundtrip_multi_region() {
-        let p = Preset {
-            name: "Side by side".into(),
-            target: PresetTargetKind::MultiRegion,
-            delay_ms: 0,
-            include_cursor: false,
-            width: 0,
-            height: 0,
-            hotkey: "Ctrl+Shift+M".into(),
-            post_action: PostAction::SaveOnly,
-            filename_template: "multi-{timestamp}".into(),
-            subfolder: "".into(),
-        };
-        let back = roundtrip(&p);
-        assert_eq!(back.target, PresetTargetKind::MultiRegion);
-        let body = toml::to_string_pretty(&p).unwrap();
-        assert!(body.contains("target = \"multi-region\""), "body: {body}");
-    }
-
-    #[test]
     fn preset_all_list_contains_new_variants() {
         assert!(PresetTargetKind::ALL.contains(&PresetTargetKind::Object));
-        assert!(PresetTargetKind::ALL.contains(&PresetTargetKind::MultiRegion));
     }
 
     #[test]

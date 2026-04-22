@@ -5,7 +5,7 @@ use crate::capture::{CaptureRequest, CaptureTarget};
 use crate::presets::{Preset, PresetStore, PresetTargetKind};
 use crate::settings::Settings;
 use crate::styles::StyleStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{info, warn};
 use paths::AppPaths;
 
@@ -54,9 +54,6 @@ pub enum Command {
     /// Run the UI-Automation object / menu picker and capture whatever
     /// element the user highlights.
     CaptureObject,
-    /// Run the multi-region picker; compose the collected rectangles
-    /// into a single output image.
-    CaptureMultiRegion,
     /// Fire the preset with the given display name. Resolved against the
     /// live `PresetStore`; missing names are logged and ignored so stale
     /// tray entries can't crash the app.
@@ -141,20 +138,6 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
                 },
             )?;
         }
-        Command::CaptureMultiRegion => {
-            info!("dispatch: CaptureMultiRegion");
-            run_capture(
-                state,
-                CaptureRequest {
-                    target: CaptureTarget::MultiRegion,
-                    delay_ms: 0,
-                    // Cursor layer is meaningless for a composite of
-                    // non-contiguous rects — force off regardless of
-                    // the global setting.
-                    include_cursor: false,
-                },
-            )?;
-        }
         Command::CapturePreset(name) => {
             info!("dispatch: CapturePreset {name:?}");
             // Resolve against the loaded store; if the preset was deleted
@@ -202,10 +185,13 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
             state.settings.save(&state.paths).ok();
         }
         Command::OpenSettings => {
-            // Editor/settings UI lands in M2. For M0 we just open the TOML
-            // file in the user's default editor so they can hand-edit it.
-            let path = state.paths.settings_file();
-            open_in_explorer(&path);
+            // Settings GUI runs as a `grabit.exe --settings` subprocess so it
+            // gets its own winit event loop (the tray process can't host a
+            // second one).
+            let exe = std::env::current_exe().context("resolve current exe")?;
+            if let Err(e) = std::process::Command::new(exe).arg("--settings").spawn() {
+                warn!("spawn settings subprocess failed: {e}");
+            }
         }
         Command::Quit => { /* handled at loop root */ }
     }
@@ -259,19 +245,12 @@ fn run_preset_capture(state: &AppState, preset: &Preset) -> Result<()> {
             CaptureTarget::ExactDims { width: w, height: h }
         }
         PresetTargetKind::Object => CaptureTarget::Object,
-        PresetTargetKind::MultiRegion => CaptureTarget::MultiRegion,
     };
 
-    // Multi-region composites have no cursor layer, regardless of what
-    // the preset says.
-    let include_cursor = match preset.target {
-        PresetTargetKind::MultiRegion => false,
-        _ => preset.include_cursor,
-    };
     let req = CaptureRequest {
         target,
         delay_ms: 0, // already ticked via countdown above
-        include_cursor,
+        include_cursor: preset.include_cursor,
     };
 
     let Some(result) = crate::capture::perform(req)? else {

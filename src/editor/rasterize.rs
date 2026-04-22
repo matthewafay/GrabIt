@@ -7,7 +7,7 @@
 use crate::capture::CaptureMetadata;
 use crate::editor::document::{
     AnnotationNode, Border, CaptureInfoPosition, CaptureInfoStyle, Edge, EdgeEffect, FieldKind,
-    ShapeKind, StampSource,
+    ShapeKind, StampSource, TextAlign, TextListStyle,
 };
 use crate::editor::tools::stamp;
 use crate::platform::fonts::JETBRAINS_MONO_REGULAR;
@@ -41,8 +41,21 @@ pub fn flatten(
             AnnotationNode::Arrow { start, end, color, thickness, .. } => {
                 draw_arrow(&mut out, *start, *end, *color, *thickness);
             }
-            AnnotationNode::Text { position, text, color, size_px, .. } => {
-                draw_text(&mut out, font(), *position, text, *size_px, *color);
+            AnnotationNode::Text {
+                rect, text, color, size_px, frosted, shadow, align, list, ..
+            } => {
+                // Effects compose underneath the glyphs. Order per spec:
+                // shadow → frosted backdrop → text. Matches the live
+                // preview in `app.rs::paint_text_effects_live`.
+                if *shadow {
+                    draw_text_shadow(&mut out, *rect);
+                }
+                if *frosted {
+                    draw_text_frosted(&mut out, base, *rect);
+                }
+                draw_text_box(
+                    &mut out, font(), *rect, text, *size_px, *color, *align, *list,
+                );
             }
             AnnotationNode::Callout {
                 rect, tail, text, fill, stroke, stroke_width, text_color, text_size, ..
@@ -403,6 +416,257 @@ pub fn draw_text(
     }
 }
 
+/// Rasterize wrapping `text` into `canvas` starting at the top-left of
+/// `rect` in image-pixel space. The wrap width is `rect.width()`; rect
+/// height is advisory (defines the *minimum* extent) — text that
+/// overflows vertically is still drawn (`blend_pixel` bounds-checks).
+///
+/// Wrapping rules: explicit `\n` starts a new line; otherwise we greedily
+/// accumulate whitespace-delimited words and break when the next word
+/// would exceed the right edge. If a single word is wider than the box,
+/// it is hard-broken per glyph to avoid infinite loops.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text_box(
+    canvas: &mut RgbaImage,
+    font: &FontArc,
+    rect: [f32; 4],
+    text: &str,
+    size_px: f32,
+    color: [u8; 4],
+    align: TextAlign,
+    list: TextListStyle,
+) {
+    let r = normalise(rect);
+    let x0 = r[0];
+    let y0 = r[1];
+    let box_width = (r[2] - r[0]).max(0.0);
+
+    let scale = PxScale::from(size_px.max(6.0));
+    let scaled = font.as_scaled(scale);
+    let line_height = scaled.height() + scaled.line_gap();
+    let ascent = scaled.ascent();
+
+    // Render a run of glyphs on `baseline_y` starting at image-pixel
+    // `start_x`. Returns nothing — for measuring, use `run_width` instead.
+    let render_line = |canvas: &mut RgbaImage, line: &str, baseline_y: f32, start_x: f32| {
+        let mut cursor_x = start_x;
+        let mut prev_glyph: Option<ab_glyph::GlyphId> = None;
+        for ch in line.chars() {
+            if ch == '\r' {
+                continue;
+            }
+            let glyph_id = font.glyph_id(ch);
+            if let Some(prev) = prev_glyph {
+                cursor_x += scaled.kern(prev, glyph_id);
+            }
+            let glyph = glyph_id.with_scale_and_position(
+                scale,
+                ab_glyph::point(cursor_x, baseline_y),
+            );
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                outlined.draw(|gx, gy, coverage| {
+                    if coverage <= 0.0 {
+                        return;
+                    }
+                    let x = bounds.min.x as i32 + gx as i32;
+                    let y = bounds.min.y as i32 + gy as i32;
+                    if x < 0 || y < 0 {
+                        return;
+                    }
+                    let a = ((color[3] as f32) * coverage.clamp(0.0, 1.0)).round() as u8;
+                    blend_pixel(canvas, x as u32, y as u32, [color[0], color[1], color[2], a]);
+                });
+            }
+            cursor_x += scaled.h_advance(glyph_id);
+            prev_glyph = Some(glyph_id);
+        }
+    };
+
+    // Measure the x-advance of a run of glyphs (kerning included).
+    let run_width = |run: &str| -> f32 {
+        let mut w = 0.0f32;
+        let mut prev: Option<ab_glyph::GlyphId> = None;
+        for ch in run.chars() {
+            if ch == '\r' { continue; }
+            let g = font.glyph_id(ch);
+            if let Some(p) = prev {
+                w += scaled.kern(p, g);
+            }
+            w += scaled.h_advance(g);
+            prev = Some(g);
+        }
+        w
+    };
+
+    let mut baseline = y0 + ascent;
+    // Consecutive-non-empty paragraph counter for Numbered lists. Reset
+    // per annotation; an empty paragraph does not consume a number.
+    let mut number: u32 = 0;
+
+    // Iterate paragraphs (explicit `\n`). Empty paragraphs still consume a line.
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            // Empty paragraph: advance one line, DON'T emit a marker, and
+            // DON'T increment the numbered counter.
+            baseline += line_height;
+            continue;
+        }
+
+        // Build the marker string for this paragraph (if any).
+        let marker: String = match list {
+            TextListStyle::None => String::new(),
+            TextListStyle::Bullet => "\u{2022} ".to_string(),
+            TextListStyle::Numbered => {
+                number += 1;
+                format!("{}. ", number)
+            }
+        };
+        let marker_width = run_width(&marker);
+        // Effective body wrap width after reserving room for the marker
+        // (and its hanging indent on continuation lines).
+        let wrap_width = (box_width - marker_width).max(0.0);
+
+        // Horizontal offset for a single visual body line after trimming
+        // trailing whitespace so Center/Right don't over-shift lines that
+        // ended with a space. Applied WITHIN the body column — the marker
+        // column has already been reserved at `x0` by shifting the body
+        // start by `marker_width`.
+        let align_offset = |line: &str| -> f32 {
+            match align {
+                TextAlign::Left => 0.0,
+                TextAlign::Center => {
+                    let w = run_width(line.trim_end());
+                    ((wrap_width - w) * 0.5).max(0.0)
+                }
+                TextAlign::Right => {
+                    let w = run_width(line.trim_end());
+                    (wrap_width - w).max(0.0)
+                }
+            }
+        };
+
+        // `first_line_baseline` is the baseline at which the marker for
+        // this paragraph is drawn (only on the first visual line).
+        let first_line_baseline = baseline;
+        let mut emitted_first_line = false;
+        let emit_line = |canvas: &mut RgbaImage, line: &str, baseline_y: f32| {
+            let off = align_offset(line);
+            // Body always starts at x0 + marker_width (the hanging indent),
+            // then we shift by the alignment offset within the body column.
+            render_line(canvas, line, baseline_y, x0 + marker_width + off);
+        };
+
+        // Build visual lines by greedy whitespace wrapping, against the
+        // *body* wrap width (box_width − marker_width).
+        let mut current = String::new();
+        let mut remaining: &str = paragraph;
+        while !remaining.is_empty() {
+            let mut chars = remaining.char_indices();
+            let mut start = 0usize;
+            if current.is_empty() {
+                while let Some((i, c)) = chars.clone().next() {
+                    if c.is_whitespace() {
+                        chars.next();
+                        start = i + c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let after = &remaining[start..];
+            let word_end_rel = after
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(i, _)| i)
+                .unwrap_or(after.len());
+            let word = &after[..word_end_rel];
+            let post_word = &after[word_end_rel..];
+            let ws_end_rel = post_word
+                .char_indices()
+                .find(|(_, c)| !c.is_whitespace())
+                .map(|(i, _)| i)
+                .unwrap_or(post_word.len());
+            let trailing_ws = &post_word[..ws_end_rel];
+
+            if word.is_empty() && trailing_ws.is_empty() {
+                break;
+            }
+
+            if word.is_empty() {
+                if !current.is_empty() {
+                    emit_line(canvas, &current, baseline);
+                    emitted_first_line = true;
+                    baseline += line_height;
+                    current.clear();
+                }
+                break;
+            }
+
+            let candidate_width = if current.is_empty() {
+                run_width(word)
+            } else {
+                run_width(&current) + run_width(word)
+            };
+
+            if candidate_width <= wrap_width || current.is_empty() && run_width(word) <= wrap_width {
+                current.push_str(word);
+                current.push_str(trailing_ws);
+                remaining = &remaining[start + word_end_rel + ws_end_rel..];
+            } else if current.is_empty() {
+                let mut used = 0usize;
+                let mut width = 0.0f32;
+                let mut prev: Option<ab_glyph::GlyphId> = None;
+                for (idx, c) in word.char_indices() {
+                    let g = font.glyph_id(c);
+                    let mut adv = scaled.h_advance(g);
+                    if let Some(p) = prev {
+                        adv += scaled.kern(p, g);
+                    }
+                    if width + adv > wrap_width && used > 0 {
+                        break;
+                    }
+                    width += adv;
+                    used = idx + c.len_utf8();
+                    prev = Some(g);
+                }
+                if used == 0 {
+                    if let Some(c) = word.chars().next() {
+                        used = c.len_utf8();
+                    }
+                }
+                current.push_str(&word[..used]);
+                emit_line(canvas, &current, baseline);
+                emitted_first_line = true;
+                baseline += line_height;
+                current.clear();
+                remaining = &remaining[start + used..];
+            } else {
+                let trimmed = current.trim_end().to_string();
+                emit_line(canvas, &trimmed, baseline);
+                emitted_first_line = true;
+                baseline += line_height;
+                current.clear();
+            }
+        }
+
+        if !current.is_empty() {
+            let trimmed = current.trim_end().to_string();
+            emit_line(canvas, &trimmed, baseline);
+            emitted_first_line = true;
+            baseline += line_height;
+        }
+
+        // Draw the marker on the first visual line's baseline — ONLY if the
+        // paragraph actually produced at least one visual line. (If the
+        // paragraph was all whitespace and the loop above broke before
+        // emitting anything, don't draw a stray bullet.)
+        if !marker.is_empty() && emitted_first_line {
+            render_line(canvas, &marker, first_line_baseline, x0);
+        }
+    }
+}
+
 /// Measure a single-line text run at `size_px`. Returns (width, height) in
 /// image pixels. Height is cap-to-descender (ascent + descent).
 pub fn measure_text(font: &FontArc, text: &str, size_px: f32) -> (f32, f32) {
@@ -678,6 +942,104 @@ fn blend_pixel(canvas: &mut RgbaImage, x: u32, y: u32, color: [u8; 4]) {
     let b = (color[2] as u32 * sa + dst.0[2] as u32 * inv) / 255;
     let a = sa + (dst.0[3] as u32 * inv) / 255;
     *dst = Rgba([r as u8, g as u8, b as u8, a.min(255) as u8]);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Text effects: frosted backdrop + drop shadow (per-annotation, feature)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Drop-shadow offset in image pixels. Fixed defaults tuned to match the
+/// preview's look (`paint_text_effects_live`).
+const TEXT_SHADOW_OFFSET: [f32; 2] = [3.0, 4.0];
+/// Gaussian sigma for the drop shadow (image pixels).
+const TEXT_SHADOW_SIGMA: f32 = 8.0;
+/// Shadow colour (sRGB RGBA).
+const TEXT_SHADOW_COLOR: [u8; 4] = [0, 0, 0, 110];
+/// Gaussian sigma for the frosted-glass backdrop (image pixels).
+const TEXT_FROSTED_SIGMA: f32 = 10.0;
+
+/// Render a soft dark drop shadow behind the Text rect. This is a
+/// rect-level shadow — NOT a per-glyph blur — matching the live preview.
+pub fn draw_text_shadow(canvas: &mut RgbaImage, rect: [f32; 4]) {
+    let r = normalise(rect);
+    let rw = (r[2] - r[0]).ceil() as i32;
+    let rh = (r[3] - r[1]).ceil() as i32;
+    if rw <= 0 || rh <= 0 {
+        return;
+    }
+
+    // Work in an offscreen buffer padded by ~3σ on every side so the
+    // gaussian has room to bleed without clipping.
+    let pad = (TEXT_SHADOW_SIGMA * 3.0).ceil() as i32;
+    let buf_w = (rw + pad * 2).max(1) as u32;
+    let buf_h = (rh + pad * 2).max(1) as u32;
+    let mut buf = RgbaImage::from_pixel(buf_w, buf_h, Rgba([0, 0, 0, 0]));
+    // Stamp the solid shadow rect at `pad,pad` (inside the padded buffer).
+    for y in 0..rh {
+        for x in 0..rw {
+            buf.put_pixel(
+                (x + pad) as u32,
+                (y + pad) as u32,
+                Rgba(TEXT_SHADOW_COLOR),
+            );
+        }
+    }
+    let blurred = imageproc::filter::gaussian_blur_f32(&buf, TEXT_SHADOW_SIGMA);
+
+    // Blit with offset: buffer origin lands at rect.min - pad + shadow_offset.
+    let ox = (r[0] - pad as f32 + TEXT_SHADOW_OFFSET[0]).round() as i32;
+    let oy = (r[1] - pad as f32 + TEXT_SHADOW_OFFSET[1]).round() as i32;
+    for y in 0..buf_h {
+        for x in 0..buf_w {
+            let p = blurred.get_pixel(x, y).0;
+            if p[3] == 0 {
+                continue;
+            }
+            let dx = ox + x as i32;
+            let dy = oy + y as i32;
+            if dx < 0 || dy < 0 {
+                continue;
+            }
+            blend_pixel(canvas, dx as u32, dy as u32, p);
+        }
+    }
+}
+
+/// Render a frosted-glass backdrop behind the Text rect: gaussian-blur the
+/// base pixels inside the rect, then overlay a translucent white tint.
+/// `base` MUST be the untouched base image, matching the Blur pattern —
+/// sampling from the already-flattened `canvas` would leak earlier
+/// annotations through the frost.
+pub fn draw_text_frosted(canvas: &mut RgbaImage, base: &RgbaImage, rect: [f32; 4]) {
+    let r = normalise(rect);
+    let (bw, bh) = base.dimensions();
+    let x0 = r[0].floor().max(0.0) as u32;
+    let y0 = r[1].floor().max(0.0) as u32;
+    let x1 = (r[2].ceil() as u32).min(bw);
+    let y1 = (r[3].ceil() as u32).min(bh);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let w = x1 - x0;
+    let h = y1 - y0;
+
+    let mut crop = RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            crop.put_pixel(x, y, *base.get_pixel(x0 + x, y0 + y));
+        }
+    }
+    let blurred = imageproc::filter::gaussian_blur_f32(&crop, TEXT_FROSTED_SIGMA);
+
+    // Paint the blurred crop straight onto the canvas — no tint. Matches
+    // the Blur tool's look so a frosted Text rect reads as "that area is
+    // blurred" without the washed-out glass hue.
+    for y in 0..h {
+        for x in 0..w {
+            let p = blurred.get_pixel(x, y).0;
+            blend_pixel(canvas, x0 + x, y0 + y, p);
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1077,6 +1439,195 @@ mod tests {
             }
         }
         assert!(any_transparent);
+    }
+
+    #[test]
+    fn draw_text_box_renders_and_wraps() {
+        // Text with an explicit newline + a long enough second line to
+        // force a wrap on a narrow box. We just assert that at least one
+        // pixel below the first baseline has been drawn — i.e. the text
+        // wrapped / newlined into a second line.
+        let mut canvas = RgbaImage::from_pixel(120, 120, Rgba([255, 255, 255, 255]));
+        draw_text_box(
+            &mut canvas,
+            font(),
+            [2.0, 2.0, 60.0, 60.0],
+            "hi\nthis is a long sentence that wraps",
+            14.0,
+            [0, 0, 0, 255],
+            TextAlign::Left,
+            TextListStyle::None,
+        );
+        // Scan a band well below the first line for any non-white pixels.
+        let mut any_second_line = false;
+        for y in 28..56 {
+            for x in 0..60 {
+                let p = canvas.get_pixel(x, y).0;
+                if p[0] < 250 && p[1] < 250 && p[2] < 250 {
+                    any_second_line = true;
+                    break;
+                }
+            }
+            if any_second_line { break; }
+        }
+        assert!(any_second_line, "expected wrapped/newlined text on a second line");
+    }
+
+    #[test]
+    fn draw_text_box_center_aligns_lines() {
+        // A short single-line string inside a wide rect should produce
+        // glyphs only in the middle band of the box when rendered with
+        // TextAlign::Center. We scan the leftmost quarter for any
+        // non-white pixel and assert there are none — that's the whole
+        // "centering shifted the glyphs past x0" check, without needing
+        // to know exact glyph advances.
+        let mut canvas = RgbaImage::from_pixel(200, 40, Rgba([255, 255, 255, 255]));
+        draw_text_box(
+            &mut canvas,
+            font(),
+            [0.0, 0.0, 160.0, 40.0],
+            "hi",
+            14.0,
+            [0, 0, 0, 255],
+            TextAlign::Center,
+            TextListStyle::None,
+        );
+        // Left quarter: from x=0 to x=40. Nothing should be drawn here.
+        let mut any_left = false;
+        for y in 0..40 {
+            for x in 0..40 {
+                let p = canvas.get_pixel(x, y).0;
+                if p[0] < 250 && p[1] < 250 && p[2] < 250 {
+                    any_left = true;
+                    break;
+                }
+            }
+            if any_left { break; }
+        }
+        assert!(
+            !any_left,
+            "center-aligned short line should not land in the left quarter",
+        );
+        // And, to confirm the text DID render somewhere, scan the middle
+        // band for non-white pixels.
+        let mut any_middle = false;
+        for y in 0..40 {
+            for x in 60..100 {
+                let p = canvas.get_pixel(x, y).0;
+                if p[0] < 250 && p[1] < 250 && p[2] < 250 {
+                    any_middle = true;
+                    break;
+                }
+            }
+            if any_middle { break; }
+        }
+        assert!(any_middle, "expected centered glyphs in the middle band");
+    }
+
+    /// Helper: does any row of `canvas` within `y` range `[y0, y1)` have a
+    /// non-white pixel in the leftmost band `[x0, x1)`? We use this to
+    /// prove list markers render in the leftmost column.
+    fn any_dark_in_band(
+        canvas: &RgbaImage, x0: u32, x1: u32, y0: u32, y1: u32,
+    ) -> bool {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = canvas.get_pixel(x, y).0;
+                if p[0] < 240 && p[1] < 240 && p[2] < 240 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Bullets: two non-empty paragraphs each get a `\u{2022} ` prefix in
+    /// the leftmost column; an empty paragraph between them does NOT.
+    #[test]
+    fn draw_text_box_bullet_prefixes_paragraphs() {
+        let mut canvas = RgbaImage::from_pixel(160, 120, Rgba([255, 255, 255, 255]));
+        draw_text_box(
+            &mut canvas,
+            font(),
+            [0.0, 0.0, 160.0, 120.0],
+            "first\n\nsecond",
+            16.0,
+            [0, 0, 0, 255],
+            TextAlign::Left,
+            TextListStyle::Bullet,
+        );
+        // First paragraph baseline lives roughly in [0, 24); second in
+        // [40, 64) since the empty paragraph ate one line. Check the
+        // leftmost 10px for inked marker pixels in both bands. The exact
+        // marker-width is font-dependent; scanning 0..10 is conservative
+        // enough to catch the bullet's left edge.
+        assert!(
+            any_dark_in_band(&canvas, 0, 10, 0, 24),
+            "first paragraph should have a bullet in the leftmost column",
+        );
+        assert!(
+            any_dark_in_band(&canvas, 0, 10, 40, 70),
+            "second paragraph (after an empty paragraph) should also have a bullet",
+        );
+    }
+
+    /// Numbered: counter ignores empty paragraphs. With `"a\n\nb"`, both
+    /// non-empty paragraphs get numeric markers starting at 1.
+    #[test]
+    fn draw_text_box_numbered_counts_paragraphs() {
+        let mut canvas = RgbaImage::from_pixel(160, 120, Rgba([255, 255, 255, 255]));
+        draw_text_box(
+            &mut canvas,
+            font(),
+            [0.0, 0.0, 160.0, 120.0],
+            "a\n\nb",
+            16.0,
+            [0, 0, 0, 255],
+            TextAlign::Left,
+            TextListStyle::Numbered,
+        );
+        // Leftmost column should contain numeric glyph ink on both the
+        // first paragraph and the second — one is `1. `, the other `2. `.
+        assert!(
+            any_dark_in_band(&canvas, 0, 10, 0, 24),
+            "first numbered paragraph should have a marker in the leftmost column",
+        );
+        assert!(
+            any_dark_in_band(&canvas, 0, 10, 40, 70),
+            "second numbered paragraph should have a marker in the leftmost column",
+        );
+    }
+
+    #[test]
+    fn draw_text_shadow_paints_dark_pixels() {
+        let mut canvas = RgbaImage::from_pixel(64, 64, Rgba([255, 255, 255, 255]));
+        draw_text_shadow(&mut canvas, [10.0, 10.0, 40.0, 30.0]);
+        // Some pixel near the shadow rect should be visibly darker.
+        let mut any_dark = false;
+        for y in 10..40 {
+            for x in 10..50 {
+                let p = canvas.get_pixel(x, y).0;
+                if p[0] < 240 {
+                    any_dark = true;
+                    break;
+                }
+            }
+            if any_dark { break; }
+        }
+        assert!(any_dark, "shadow should darken some pixels under the rect");
+    }
+
+    #[test]
+    fn draw_text_frosted_preserves_base_hue() {
+        // Pure-blur backdrop: solid red base should stay red (blur of a
+        // uniform field is a no-op). This matches the Blur tool's look.
+        let base = RgbaImage::from_pixel(32, 32, Rgba([255, 0, 0, 255]));
+        let mut canvas = base.clone();
+        draw_text_frosted(&mut canvas, &base, [4.0, 4.0, 28.0, 28.0]);
+        let p = canvas.get_pixel(16, 16).0;
+        assert!(p[0] > 240, "red should stay dominant");
+        assert!(p[1] < 15, "green should stay near zero (no tint)");
+        assert!(p[2] < 15, "blue should stay near zero (no tint)");
     }
 
     #[test]

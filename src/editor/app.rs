@@ -4,8 +4,10 @@
 //! - Select  — click an annotation / cursor to grab it; drag handles to
 //!   move/resize; Delete key removes it. Undoable.
 //! - Arrow   — drag from tail to tip.
-//! - Text    — click to place; Enter commits, Escape cancels. Clicking an
-//!   existing text re-enters edit mode.
+//! - Text    — drag a rectangle to define a word-wrapping text box; typing
+//!   fills it (Enter inserts a newline). Esc, clicking outside, or
+//!   switching tools commits. Clicking an existing text's rect re-enters
+//!   edit mode with its buffer.
 //! - Callout — drag a rect; commits a speech-balloon with placeholder text.
 //! - Rect    — drag a rectangle.
 //! - Ellipse — drag an ellipse bounding rect.
@@ -28,7 +30,7 @@ use crate::editor::commands::{
 };
 use crate::editor::document::{
     AnnotationNode, CaptureInfoPosition, CaptureInfoStyle, Document, Edge,
-    FieldKind, ShapeKind, StampSource,
+    FieldKind, ShapeKind, StampSource, TextAlign, TextListStyle,
 };
 use crate::capture::CaptureMetadata;
 use crate::editor::rasterize;
@@ -57,6 +59,12 @@ use uuid::Uuid;
 /// every frame while the user drags a handle.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct BlurKey { x0: i32, y0: i32, x1: i32, y1: i32, radius_q: i32 }
+
+/// Quantised cache key for the frosted-glass backdrop texture behind a
+/// Text annotation. Same 8-px rounding as `BlurKey`; sigma is fixed by
+/// the feature spec so it isn't part of the key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TextBackdropKey { x0: i32, y0: i32, x1: i32, y1: i32 }
 
 /// Cache key for a baked capture-info banner texture. Metadata doesn't
 /// change within an editor session, so in practice the key only flips when
@@ -95,11 +103,25 @@ struct PendingDrag {
     current: [f32; 2],
 }
 
-/// Text annotation in the middle of being typed.
+/// Text annotation in the middle of being typed. The user drags out a
+/// rectangle with the Text tool; that rect becomes the wrap-width box.
 struct PendingText {
-    position: [f32; 2],
+    /// Text-box bounds in image-pixel coords: `[min_x, min_y, max_x, max_y]`.
+    rect: [f32; 4],
     buffer: String,
     editing_id: Option<Uuid>,
+    /// Frosted-glass backdrop toggle. For a fresh text this is seeded from
+    /// the EditorApp's `text_frosted` default; for a re-edit it's loaded
+    /// off the existing node so the floating overlay shows the real state.
+    frosted: bool,
+    /// Drop-shadow toggle. Same seeding rules as `frosted`.
+    shadow: bool,
+    /// Horizontal alignment. Same seeding rules as `frosted`/`shadow`: the
+    /// editor-default at drag-create time, or the node's existing value on
+    /// re-edit.
+    align: TextAlign,
+    /// Per-paragraph list style. Same seeding rules as `align`.
+    list: TextListStyle,
 }
 
 /// Currently-engaged handle on a selected annotation / the cursor.
@@ -149,6 +171,23 @@ pub struct EditorApp {
 
     thickness: f32,
     text_size: f32,
+    /// Frosted-glass backdrop toggle for freshly-drawn Text annotations.
+    /// Also the toolbar-level default while Tool::Text is active; when the
+    /// Select tool picks an existing Text the toolbar rebinds this checkbox
+    /// to the selected node's flag via an UpdateAnnotation command.
+    text_frosted: bool,
+    /// Drop-shadow toggle for freshly-drawn Text annotations. Same lifecycle
+    /// as `text_frosted`.
+    text_shadow: bool,
+    /// Horizontal alignment default for freshly-drawn Text annotations. Same
+    /// lifecycle as `text_frosted`/`text_shadow` — the toolbar segmented
+    /// control binds here when Tool::Text is active; when Tool::Select
+    /// picks a Text, the toolbar rebinds to emit an UpdateAnnotation
+    /// command against the node's existing `align`.
+    text_align: TextAlign,
+    /// Per-paragraph list style default for freshly-drawn Text annotations.
+    /// Same lifecycle + UI pattern as `text_align`.
+    text_list: TextListStyle,
     step_radius: f32,
     magnify_circular: bool,
 
@@ -174,6 +213,11 @@ pub struct EditorApp {
     /// Per-blur-node cached gaussian textures for the live canvas preview.
     /// Rebuilt only when the quantised rect/radius key changes.
     blur_textures: HashMap<Uuid, (BlurKey, egui::TextureHandle)>,
+    /// Per-Text-node cached frosted-backdrop textures (blurred base crop +
+    /// white tint). Keyed by the quantised rect; rebuilt only when the key
+    /// changes. Entries are also dropped when the user turns `frosted` off
+    /// or moves the rect enough that the quantised key flips.
+    text_backdrop_textures: HashMap<Uuid, (TextBackdropKey, egui::TextureHandle)>,
     /// Per-capture-info-node cached baked banner textures. Keyed by the
     /// node's field-set + position + style; rebuilt when any of those change.
     /// Also holds the baked banner's pixel size so we can paint it at 1:1.
@@ -243,6 +287,10 @@ impl EditorApp {
             use_fill: true,
             thickness: 6.0,
             text_size: 28.0,
+            text_frosted: false,
+            text_shadow: false,
+            text_align: TextAlign::Left,
+            text_list: TextListStyle::None,
             step_radius: 24.0,
             magnify_circular: true,
             blur_radius: 12.0,
@@ -256,6 +304,7 @@ impl EditorApp {
             cursor_texture: None,
             cursor_texture_key: None,
             blur_textures: HashMap::new(),
+            text_backdrop_textures: HashMap::new(),
             capture_info_textures: HashMap::new(),
             dirty: false,
             saved_once: false,
@@ -316,10 +365,13 @@ impl EditorApp {
 
     fn commit_pending_text(&mut self) {
         let Some(pt) = self.pending_text.take() else { return };
-        let trimmed = pt.buffer.trim();
+        // For wrapping-aware commit we DO keep internal newlines and
+        // leading/trailing spaces within lines; we only trim surrounding
+        // all-whitespace to decide "empty".
+        let is_empty = pt.buffer.trim().is_empty();
         let editing = pt.editing_id;
 
-        if editing.is_none() && trimmed.is_empty() {
+        if editing.is_none() && is_empty {
             return;
         }
 
@@ -332,17 +384,21 @@ impl EditorApp {
                     .find(|n| n.id() == id)
                     .cloned()
                 {
-                    if trimmed.is_empty() {
+                    if is_empty {
                         self.push_command(Box::new(RemoveAnnotation::new(id)));
                     } else {
                         let after = match &before {
-                            AnnotationNode::Text { id, position, color, size_px, .. } => {
+                            AnnotationNode::Text { id, rect, color, size_px, .. } => {
                                 AnnotationNode::Text {
                                     id: *id,
-                                    position: *position,
-                                    text: trimmed.to_string(),
+                                    rect: *rect,
+                                    text: pt.buffer.clone(),
                                     color: *color,
                                     size_px: *size_px,
+                                    frosted: pt.frosted,
+                                    shadow: pt.shadow,
+                                    align: pt.align,
+                                    list: pt.list,
                                 }
                             }
                             _ => before.clone(),
@@ -353,18 +409,18 @@ impl EditorApp {
             }
             None => {
                 let node = tool_text::make(
-                    pt.position,
-                    trimmed.to_string(),
+                    pt.rect,
+                    pt.buffer.clone(),
                     color_to_rgba(self.color),
                     self.text_size,
+                    pt.frosted,
+                    pt.shadow,
+                    pt.align,
+                    pt.list,
                 );
                 self.push_command(Box::new(AddAnnotation::new(node)));
             }
         }
-    }
-
-    fn cancel_pending_text(&mut self) {
-        self.pending_text = None;
     }
 
     fn copy_to_clipboard_only(&mut self) -> Result<()> {
@@ -495,6 +551,55 @@ impl EditorApp {
                 Tool::Text => {
                     ui.label("Size");
                     ui.add(egui::Slider::new(&mut self.text_size, 8.0..=128.0));
+                    // Per-annotation effect defaults; what the next new
+                    // text box will pick up at drag-create time.
+                    if ui.checkbox(&mut self.text_frosted, "Frosted").changed() {
+                        if let Some(pt) = self.pending_text.as_mut() {
+                            pt.frosted = self.text_frosted;
+                        }
+                    }
+                    if ui.checkbox(&mut self.text_shadow, "Shadow").changed() {
+                        if let Some(pt) = self.pending_text.as_mut() {
+                            pt.shadow = self.text_shadow;
+                        }
+                    }
+                    // Alignment segmented control. Flipping here also
+                    // propagates to any in-progress PendingText so the
+                    // overlay's layouter updates on the same frame.
+                    ui.label("Align");
+                    let mut align_changed = false;
+                    if ui.selectable_value(&mut self.text_align, TextAlign::Left, "L").changed() {
+                        align_changed = true;
+                    }
+                    if ui.selectable_value(&mut self.text_align, TextAlign::Center, "C").changed() {
+                        align_changed = true;
+                    }
+                    if ui.selectable_value(&mut self.text_align, TextAlign::Right, "R").changed() {
+                        align_changed = true;
+                    }
+                    if align_changed {
+                        if let Some(pt) = self.pending_text.as_mut() {
+                            pt.align = self.text_align;
+                        }
+                    }
+                    // List segmented control. Same propagation pattern.
+                    ui.separator();
+                    ui.label("List");
+                    let mut list_changed = false;
+                    if ui.selectable_value(&mut self.text_list, TextListStyle::None, "\u{2014}").changed() {
+                        list_changed = true;
+                    }
+                    if ui.selectable_value(&mut self.text_list, TextListStyle::Bullet, "\u{2022}").changed() {
+                        list_changed = true;
+                    }
+                    if ui.selectable_value(&mut self.text_list, TextListStyle::Numbered, "1.").changed() {
+                        list_changed = true;
+                    }
+                    if list_changed {
+                        if let Some(pt) = self.pending_text.as_mut() {
+                            pt.list = self.text_list;
+                        }
+                    }
                 }
                 Tool::Rect | Tool::Ellipse | Tool::Callout => {
                     ui.label("Stroke width");
@@ -557,7 +662,93 @@ impl EditorApp {
                         self.push_command(Box::new(AddAnnotation::new(node)));
                     }
                 }
-                Tool::Select => {}
+                Tool::Select => {
+                    // Restyle for the currently-selected Text annotation:
+                    // show the same toggles + alignment buttons; flipping
+                    // one emits an UpdateAnnotation command so the edit is
+                    // undoable.
+                    if let Some(SelectionTarget::Annotation(id)) = self.selection {
+                        let existing = self
+                            .document
+                            .annotations
+                            .iter()
+                            .find(|n| n.id() == id)
+                            .cloned();
+                        if let Some(before @ AnnotationNode::Text { .. }) = existing {
+                            if let AnnotationNode::Text {
+                                id: nid, rect, text, color, size_px, frosted, shadow, align, list,
+                            } = before.clone()
+                            {
+                                let mut new_frosted = frosted;
+                                let mut new_shadow = shadow;
+                                let mut new_align = align;
+                                let mut new_list = list;
+                                let mut changed = false;
+                                if ui.checkbox(&mut new_frosted, "Frosted").changed() {
+                                    changed = true;
+                                }
+                                if ui.checkbox(&mut new_shadow, "Shadow").changed() {
+                                    changed = true;
+                                }
+                                ui.label("Align");
+                                if ui
+                                    .selectable_value(&mut new_align, TextAlign::Left, "L")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .selectable_value(&mut new_align, TextAlign::Center, "C")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .selectable_value(&mut new_align, TextAlign::Right, "R")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.separator();
+                                ui.label("List");
+                                if ui
+                                    .selectable_value(&mut new_list, TextListStyle::None, "\u{2014}")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .selectable_value(&mut new_list, TextListStyle::Bullet, "\u{2022}")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .selectable_value(&mut new_list, TextListStyle::Numbered, "1.")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if changed {
+                                    let after = AnnotationNode::Text {
+                                        id: nid,
+                                        rect,
+                                        text,
+                                        color,
+                                        size_px,
+                                        frosted: new_frosted,
+                                        shadow: new_shadow,
+                                        align: new_align,
+                                        list: new_list,
+                                    };
+                                    self.push_command(Box::new(UpdateAnnotation::new(
+                                        before, after,
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -1344,13 +1535,20 @@ impl EditorApp {
 
         // Draw existing annotations. Blur, Magnify, and CaptureInfo need
         // `&mut self` for their cached textures, so we defer them into local
-        // vectors and handle them after the immutable pass.
+        // vectors and handle them after the immutable pass. Text nodes with
+        // effects (frosted/shadow) also need the mut-texture cache for the
+        // frosted crop, so we paint the effects first in a deferred pass —
+        // BEFORE `draw_node_preview` runs for the same Text, which keeps
+        // the glyphs rendering on top of the backdrop.
         let editing_id = self.pending_text.as_ref().and_then(|pt| pt.editing_id);
         let mut blurs: Vec<(Uuid, [f32; 4], f32)> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut magnifies: Vec<(Uuid, [f32; 4], [f32; 4], [u8; 4], f32, bool)> = Vec::new();
         let mut infos: Vec<(Uuid, Vec<FieldKind>, CaptureInfoPosition, CaptureInfoStyle)> =
             Vec::new();
+        // (id, rect, frosted, shadow) — collected in doc order so the
+        // effects paint at the right z-index relative to sibling Text.
+        let mut text_effects: Vec<(Uuid, [f32; 4], bool, bool)> = Vec::new();
         for node in &self.document.annotations {
             if Some(node.id()) == editing_id { continue; }
             match node {
@@ -1372,6 +1570,14 @@ impl EditorApp {
                 AnnotationNode::CaptureInfo { id, fields, position, style, .. } => {
                     infos.push((*id, fields.clone(), *position, *style));
                 }
+                AnnotationNode::Text { id, rect, frosted, shadow, .. }
+                    if *frosted || *shadow =>
+                {
+                    // Defer the effects pass; we still need to draw the
+                    // galley, so we DON'T skip `draw_node_preview` — we
+                    // just have to paint effects UNDER it.
+                    text_effects.push((*id, *rect, *frosted, *shadow));
+                }
                 _ => {
                     draw_node_preview(&painter, node, scale, &to_canvas);
                 }
@@ -1380,6 +1586,27 @@ impl EditorApp {
         let ctx = ui.ctx().clone();
         for (id, rect, radius) in blurs {
             self.paint_blur_live(&ctx, &painter, id, rect, radius, &to_canvas);
+        }
+        // Text effects: paint shadow + frosted backdrop, THEN the galley.
+        // Order matches rasterize::flatten's Text arm exactly.
+        for (id, text_rect, frosted, shadow) in &text_effects {
+            self.paint_text_effects_live(
+                &ctx, &painter, *id, *text_rect, *frosted, *shadow, scale, &to_canvas,
+            );
+        }
+        // Second pass over the affected Text nodes: render the galley on
+        // top. We re-find each by id so we pick up its current text/size.
+        if !text_effects.is_empty() {
+            for (id, _, _, _) in &text_effects {
+                if let Some(node) = self
+                    .document
+                    .annotations
+                    .iter()
+                    .find(|n| n.id() == *id)
+                {
+                    draw_node_preview(&painter, node, scale, &to_canvas);
+                }
+            }
         }
         for (_id, src, dst, border, border_w, circular) in magnifies {
             self.paint_magnify_live(
@@ -1422,6 +1649,13 @@ impl EditorApp {
                 Tool::Rect | Tool::Magnify => {
                     painter.rect_stroke(r, 0.0, egui::Stroke::new(
                         (self.thickness * scale).max(1.0),
+                        self.color,
+                    ));
+                }
+                Tool::Text => {
+                    // Drag-preview for the text-box outline.
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(
+                        1.5,
                         self.color,
                     ));
                 }
@@ -1473,37 +1707,136 @@ impl EditorApp {
             self.draw_selection_handles(&painter, sel, &to_canvas);
         }
 
-        // Floating text editor overlay.
+        // Floating text editor overlay — a multiline TextEdit sized to the
+        // user's drag-rect. Commits on lost_focus (clicking outside or
+        // switching tools), or on Esc (explicit commit). Enter is a normal
+        // newline inside the buffer because we use `multiline`.
         if self.pending_text.is_some() {
             let canvas_size = self.text_size * scale;
-            let anchor = {
+            let (anchor, rect_w_canvas, rect_h_canvas) = {
                 let pt = self.pending_text.as_ref().unwrap();
-                to_canvas(pt.position)
+                let r = norm_bbox(pt.rect);
+                let top_left = to_canvas([r[0], r[1]]);
+                let bot_right = to_canvas([r[2], r[3]]);
+                (top_left, (bot_right.x - top_left.x).max(32.0), (bot_right.y - top_left.y).max(canvas_size.max(12.0)))
             };
             let text_color = self.color;
+            let line_height = canvas_size.max(12.0) * 1.2;
+            let desired_rows = (rect_h_canvas / line_height).ceil().max(1.0) as usize;
 
             let ctx = ui.ctx().clone();
             let area_resp = egui::Area::new(egui::Id::new("grabit-pending-text"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(anchor)
                 .show(&ctx, |ui| {
+                    // Row 1: two checkboxes bound to the pending text's
+                    // per-annotation flags. Toggling either repaints the
+                    // canvas (and triggers a frosted-texture rebuild on the
+                    // next pass through paint_text_effects_live).
+                    let mut toggled = false;
+                    ui.horizontal(|ui| {
+                        let pt = self.pending_text.as_mut().unwrap();
+                        if ui.checkbox(&mut pt.frosted, "Frosted").changed() {
+                            toggled = true;
+                        }
+                        if ui.checkbox(&mut pt.shadow, "Shadow").changed() {
+                            toggled = true;
+                        }
+                    });
+
+                    // Row 1b: alignment segmented control. Mirroring the
+                    // toolbar — same three values — but bound directly to
+                    // the pending text so the layouter on Row 2 picks up
+                    // the change on the same frame. We also sync back to
+                    // `self.text_align` so the toolbar shows the right
+                    // state if the user committed via this overlay.
+                    ui.horizontal(|ui| {
+                        let pt = self.pending_text.as_mut().unwrap();
+                        ui.label("Align");
+                        if ui.selectable_value(&mut pt.align, TextAlign::Left, "L").changed() {
+                            toggled = true;
+                        }
+                        if ui.selectable_value(&mut pt.align, TextAlign::Center, "C").changed() {
+                            toggled = true;
+                        }
+                        if ui.selectable_value(&mut pt.align, TextAlign::Right, "R").changed() {
+                            toggled = true;
+                        }
+                        ui.separator();
+                        ui.label("List");
+                        if ui.selectable_value(&mut pt.list, TextListStyle::None, "\u{2014}").changed() {
+                            toggled = true;
+                        }
+                        if ui.selectable_value(&mut pt.list, TextListStyle::Bullet, "\u{2022}").changed() {
+                            toggled = true;
+                        }
+                        if ui.selectable_value(&mut pt.list, TextListStyle::Numbered, "1.").changed() {
+                            toggled = true;
+                        }
+                    });
+
+                    // Row 2: the multiline editor itself. We request focus
+                    // each frame so clicking the checkboxes (which steals
+                    // focus for a single frame) doesn't commit-the-text;
+                    // the next frame the TextEdit regains focus cleanly.
+                    //
+                    // A custom layouter makes the live TextEdit honour the
+                    // current alignment so the overlay visually matches
+                    // both the on-canvas preview and the PNG export.
                     let pt = self.pending_text.as_mut().unwrap();
-                    let edit = egui::TextEdit::singleline(&mut pt.buffer)
-                        .font(egui::FontId::monospace(canvas_size.max(12.0)))
+                    let font_id = egui::FontId::monospace(canvas_size.max(12.0));
+                    let align = pt.align;
+                    let list = pt.list;
+                    let layouter_font = font_id.clone();
+                    let layouter_color = text_color;
+                    let mut layouter =
+                        move |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                            // Prepend per-paragraph markers so the live
+                            // preview reads like the export. Pure-visual:
+                            // the actual `pt.buffer` is untouched and what
+                            // gets committed. NOTE: the cursor may drift
+                            // slightly past a marker because the galley is
+                            // longer than the backing string — this is the
+                            // documented preview-vs-export divergence;
+                            // hanging indent is only applied at rasterize.
+                            let decorated = decorate_for_list_preview(text, list);
+                            let mut job = egui::text::LayoutJob::single_section(
+                                decorated,
+                                egui::text::TextFormat {
+                                    font_id: layouter_font.clone(),
+                                    color: layouter_color,
+                                    ..Default::default()
+                                },
+                            );
+                            job.wrap.max_width = wrap_width;
+                            job.halign = match align {
+                                TextAlign::Left => egui::Align::LEFT,
+                                TextAlign::Center => egui::Align::Center,
+                                TextAlign::Right => egui::Align::RIGHT,
+                            };
+                            ui.fonts(|f| f.layout_job(job))
+                        };
+                    let edit = egui::TextEdit::multiline(&mut pt.buffer)
+                        .font(font_id)
                         .text_color(text_color)
-                        .desired_width(280.0)
-                        .hint_text("Type then Enter\u{2026}");
-                    let response = ui.add(edit);
+                        .desired_width(rect_w_canvas)
+                        .desired_rows(desired_rows)
+                        .hint_text("Type\u{2026}")
+                        .layouter(&mut layouter);
+                    let response = ui.add_sized([rect_w_canvas, rect_h_canvas], edit);
+                    // Always request focus — clicking a checkbox briefly
+                    // steals focus, and re-requesting avoids a stale
+                    // lost_focus event that would otherwise commit-on-check.
                     response.request_focus();
-                    response
+                    (response, toggled)
                 });
 
-            let commit_enter = area_resp.inner.lost_focus()
-                && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            // Esc and lost_focus both commit (keep the buffer). We skip
+            // commit on the frame a checkbox toggles — lost_focus fires
+            // momentarily there but the next frame restores focus.
+            let (edit_resp, toggled) = area_resp.inner;
             let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            if escape {
-                self.cancel_pending_text();
-            } else if commit_enter {
+            if escape || (edit_resp.lost_focus() && !toggled) {
                 self.commit_pending_text();
             }
         }
@@ -1545,48 +1878,80 @@ impl EditorApp {
         &mut self,
         response: &egui::Response,
         to_image: &dyn Fn(egui::Pos2) -> [f32; 2],
-        to_canvas: &dyn Fn([f32; 2]) -> egui::Pos2,
-        ui: &mut egui::Ui,
+        _to_canvas: &dyn Fn([f32; 2]) -> egui::Pos2,
+        _ui: &mut egui::Ui,
     ) {
-        if !response.clicked() { return; }
-        let Some(click_pos) = response.interact_pointer_pos() else { return };
-
-        // Hit-test existing text first so a click on placed text re-enters
-        // edit mode. We use egui's own font layout so the hit rect matches
-        // the on-screen glyph metrics.
-        let mut hit: Option<usize> = None;
-        for (i, node) in self.document.annotations.iter().enumerate().rev() {
-            if let AnnotationNode::Text { position, text, size_px, .. } = node {
-                let font_id = egui::FontId::monospace(*size_px);
-                let galley = ui.ctx().fonts(|f| {
-                    f.layout_no_wrap(text.clone(), font_id, egui::Color32::WHITE)
-                });
-                let r = egui::Rect::from_min_size(to_canvas(*position), galley.size());
-                if r.contains(click_pos) { hit = Some(i); break; }
+        // Drag-to-create text box. Drag-start stashes a pending rect; while
+        // the user is dragging, the rect-preview path renders the outline
+        // (see the `Tool::Rect | Tool::Magnify` preview block — we reuse a
+        // dedicated Text preview below). On drag-stop we either enter edit
+        // mode on the new empty rect, or — if the drag was a near-zero
+        // click — hit-test existing Text annotations to re-enter them.
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let p = to_image(pos);
+                self.pending_drag = Some(PendingDrag { start: p, current: p });
             }
         }
-
-        self.commit_pending_text();
-
-        if let Some(idx) = hit {
-            if let AnnotationNode::Text { id, position, text, color, size_px } =
-                self.document.annotations[idx].clone()
+        if response.dragged() {
+            if let (Some(current), Some(pd)) =
+                (response.interact_pointer_pos(), self.pending_drag.as_mut())
             {
-                self.color = egui::Color32::from_rgba_unmultiplied(
-                    color[0], color[1], color[2], color[3],
-                );
-                self.text_size = size_px;
-                self.pending_text = Some(PendingText {
-                    position,
-                    buffer: text,
-                    editing_id: Some(id),
-                });
+                pd.current = to_image(current);
             }
-        } else {
+        }
+        if response.drag_stopped() {
+            let Some(d) = self.pending_drag.take() else { return };
+            let raw_rect = [d.start[0], d.start[1], d.current[0], d.current[1]];
+            let r = norm_bbox(raw_rect);
+            let area = (r[2] - r[0]) * (r[3] - r[1]);
+
+            // Always commit any prior pending text first (drag could land
+            // on an unrelated area or on a different text).
+            self.commit_pending_text();
+
+            if area < 16.0 {
+                // Tiny drag → treat as a click; hit-test existing texts.
+                let click_pt = d.current;
+                let mut hit: Option<AnnotationNode> = None;
+                for node in self.document.annotations.iter().rev() {
+                    if let AnnotationNode::Text { rect, .. } = node {
+                        if hit_bbox(click_pt, *rect) {
+                            hit = Some(node.clone());
+                            break;
+                        }
+                    }
+                }
+                if let Some(AnnotationNode::Text {
+                    id, rect, text, color, size_px, frosted, shadow, align, list, ..
+                }) = hit
+                {
+                    self.color = egui::Color32::from_rgba_unmultiplied(
+                        color[0], color[1], color[2], color[3],
+                    );
+                    self.text_size = size_px;
+                    self.pending_text = Some(PendingText {
+                        rect,
+                        buffer: text,
+                        editing_id: Some(id),
+                        frosted,
+                        shadow,
+                        align,
+                        list,
+                    });
+                }
+                // If no hit, do nothing — the user clicked empty canvas.
+                return;
+            }
+
             self.pending_text = Some(PendingText {
-                position: to_image(click_pos),
+                rect: r,
                 buffer: String::new(),
                 editing_id: None,
+                frosted: self.text_frosted,
+                shadow: self.text_shadow,
+                align: self.text_align,
+                list: self.text_list,
             });
         }
     }
@@ -1657,8 +2022,12 @@ impl EditorApp {
                         self.text_size,
                     ),
                     Tool::Magnify => tool_magnify::make(
+                        tool_magnify::default_target_for_source(
+                            r,
+                            self.document.base_width,
+                            self.document.base_height,
+                        ),
                         r,
-                        tool_magnify::default_source_for_target(r),
                         color_to_rgba(self.stroke_color),
                         self.thickness,
                         self.magnify_circular,
@@ -1781,13 +2150,24 @@ impl EditorApp {
     /// Also starts a body-drag if the click lands inside the selection rect.
     /// Returns `None` if the click misses the selection.
     fn pick_handle(&mut self, p: [f32; 2]) -> Option<ActiveHandle> {
-        // First, if there's no selection, try to select something at p.
-        if self.selection.is_none() {
-            self.selection = self.pick_target(p);
+        // Try the current selection first — only its handles / body count.
+        if let Some(sel) = self.selection {
+            if let Some(ah) = self.try_handle_for(sel, p) {
+                return Some(ah);
+            }
         }
-        let sel = self.selection?;
+        // Miss on the current selection → re-pick whatever's under the
+        // pointer so click-and-drag on a different annotation switches
+        // selection and starts moving it in one gesture.
+        let sel = self.pick_target(p)?;
+        self.selection = Some(sel);
+        self.try_handle_for(sel, p)
+    }
 
-        let handle_r = 8.0; // hit radius in image pixels
+    fn try_handle_for(&self, sel: SelectionTarget, p: [f32; 2]) -> Option<ActiveHandle> {
+        // Hit radius in image pixels. Kept generous so handles remain
+        // clickable even when the canvas is scaled down on smaller displays.
+        let handle_r = 14.0;
         let (bbox, start_rect, start_tail, start_source, before_node, before_cursor)
             = match sel {
             SelectionTarget::Annotation(id) => {
@@ -1814,9 +2194,10 @@ impl EditorApp {
             }
         };
 
-        // Arrow endpoints (only for arrow annotations).
+        // Arrow endpoints take priority; otherwise any click close enough
+        // to the shaft body-drags the arrow as a whole.
         if let SelectionTarget::Annotation(id) = sel {
-            if let Some(AnnotationNode::Arrow { start, end, .. }) =
+            if let Some(arrow @ AnnotationNode::Arrow { start, end, thickness, .. }) =
                 self.document.annotations.iter().find(|n| n.id() == id)
             {
                 if dist_sq(p, *start) <= handle_r * handle_r {
@@ -1843,9 +2224,10 @@ impl EditorApp {
                         anchor: p,
                     });
                 }
-                // Body drag on arrows grabs the midpoint.
-                let mid = [0.5 * (start[0] + end[0]), 0.5 * (start[1] + end[1])];
-                if dist_sq(p, mid) <= 12.0 * 12.0 {
+                // Shaft body-drag: point-to-segment distance with a
+                // tolerance tied to the arrow's own thickness.
+                let tol = (thickness * 0.5 + 6.0).powi(2);
+                if dist2_to_segment(p, *start, *end) <= tol {
                     return Some(ActiveHandle {
                         target: sel,
                         handle: Handle::Body,
@@ -1857,6 +2239,7 @@ impl EditorApp {
                         anchor: p,
                     });
                 }
+                let _ = arrow;
                 return None;
             }
         }
@@ -1893,34 +2276,56 @@ impl EditorApp {
             }
         }
 
-        // Rect handles.
-        for (h, hp) in rect_handles(bbox) {
-            if dist_sq(p, hp) <= handle_r * handle_r {
-                return Some(ActiveHandle {
-                    target: sel,
-                    handle: h,
-                    start_rect,
-                    start_tail,
-                    start_source,
-                    before: before_node,
-                    before_cursor,
-                    anchor: p,
-                });
+        // Rect-edge handles. Corners win first (proximity to the exact
+        // corner point); then each edge is clickable anywhere along its
+        // line as long as the click is closer to that edge than the opposite
+        // parallel one (so tiny boxes still have a body-drag zone when the
+        // click is exactly in the middle).
+        let nb = norm_bbox(bbox);
+        let [x0, y0, x1, y1] = nb;
+        let make = |h: Handle| ActiveHandle {
+            target: sel,
+            handle: h,
+            start_rect,
+            start_tail,
+            start_source,
+            before: before_node.clone(),
+            before_cursor,
+            anchor: p,
+        };
+        let corners = [
+            (Handle::NW, [x0, y0]),
+            (Handle::NE, [x1, y0]),
+            (Handle::SW, [x0, y1]),
+            (Handle::SE, [x1, y1]),
+        ];
+        for (h, cp) in corners {
+            if dist_sq(p, cp) <= handle_r * handle_r {
+                return Some(make(h));
             }
+        }
+        let dx0 = (p[0] - x0).abs();
+        let dx1 = (p[0] - x1).abs();
+        let dy0 = (p[1] - y0).abs();
+        let dy1 = (p[1] - y1).abs();
+        let horiz_span = p[0] >= x0 - handle_r && p[0] <= x1 + handle_r;
+        let vert_span = p[1] >= y0 - handle_r && p[1] <= y1 + handle_r;
+        if horiz_span && dy0 <= handle_r && dy0 + handle_r < dy1 {
+            return Some(make(Handle::N));
+        }
+        if horiz_span && dy1 <= handle_r && dy1 + handle_r < dy0 {
+            return Some(make(Handle::S));
+        }
+        if vert_span && dx0 <= handle_r && dx0 + handle_r < dx1 {
+            return Some(make(Handle::W));
+        }
+        if vert_span && dx1 <= handle_r && dx1 + handle_r < dx0 {
+            return Some(make(Handle::E));
         }
 
         // Body-drag fallback.
         if hit_bbox(p, bbox) {
-            return Some(ActiveHandle {
-                target: sel,
-                handle: Handle::Body,
-                start_rect,
-                start_tail,
-                start_source,
-                before: before_node,
-                before_cursor,
-                anchor: p,
-            });
+            return Some(make(Handle::Body));
         }
 
         None
@@ -2000,6 +2405,93 @@ impl EditorApp {
             self.cursor_texture_key = Some(key);
         }
         self.cursor_texture.clone()
+    }
+
+    /// Paint the per-annotation Text effects (shadow behind, frosted-glass
+    /// backdrop in front of the shadow) into the live canvas preview. The
+    /// text galley itself is NOT drawn here — the caller runs
+    /// `draw_node_preview` afterwards so glyphs land on top.
+    ///
+    /// Order must match `rasterize.rs`'s Text arm: shadow → frosted → text.
+    /// The frosted crop is cached per Uuid via `text_backdrop_textures`,
+    /// keyed on the quantised rect; it rebuilds only when the user moves /
+    /// resizes the rect enough to cross an 8-px bucket or toggles frosted
+    /// off (the texture entry is removed below).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_text_effects_live(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        id: Uuid,
+        rect: [f32; 4],
+        frosted: bool,
+        shadow: bool,
+        scale: f32,
+        to_canvas: &impl Fn([f32; 2]) -> egui::Pos2,
+    ) {
+        // Shadow first. We fake gaussian softness with 4 concentric rects
+        // at decreasing alpha — same trick as `paint_border_preview`. The
+        // export uses a real `gaussian_blur_f32` via `draw_text_shadow`.
+        if shadow {
+            let r = norm_bbox(rect);
+            let rect_min = to_canvas([r[0], r[1]]);
+            let rect_max = to_canvas([r[2], r[3]]);
+            let base = egui::Rect::from_two_pos(rect_min, rect_max);
+            // Fixed offset + sigma from the rasterize constants; keep them
+            // in sync if you change the rasterize path.
+            let offset = egui::vec2(3.0 * scale, 4.0 * scale);
+            let shadow_rect = base.translate(offset);
+            let shadow_r = 8.0 * scale;
+            let base_alpha = 110.0f32;
+            let layers = 4i32;
+            for i in 0..layers {
+                let t = i as f32 / layers as f32; // 0..1
+                let outset = shadow_r * (1.0 - t);
+                let alpha = (base_alpha * (0.35 * (1.0 - t) + 0.15))
+                    .clamp(0.0, 255.0) as u8;
+                let c = egui::Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
+                painter.rect_filled(shadow_rect.expand(outset), 0.0, c);
+            }
+        }
+
+        // Frosted backdrop: cached blurred crop + white tint. If frosted
+        // is off, drop any stale cache entry so we don't leak memory when
+        // the user toggles it back and forth on a moving rect.
+        if frosted {
+            let Some(base) = self.base_rgba.as_ref() else { return };
+            let key = text_backdrop_key(rect);
+            let needs = self
+                .text_backdrop_textures
+                .get(&id)
+                .map(|(k, _)| *k != key)
+                .unwrap_or(true);
+            if needs {
+                match build_text_backdrop_texture(ctx, base, rect) {
+                    Some(tex) => {
+                        self.text_backdrop_textures.insert(id, (key, tex));
+                    }
+                    None => {
+                        self.text_backdrop_textures.remove(&id);
+                        return;
+                    }
+                }
+            }
+            if let Some((_, tex)) = self.text_backdrop_textures.get(&id) {
+                let r = egui::Rect::from_two_pos(
+                    to_canvas([rect[0], rect[1]]),
+                    to_canvas([rect[2], rect[3]]),
+                );
+                painter.image(
+                    tex.id(),
+                    r,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        } else {
+            // Text went un-frosted — free the cache slot.
+            self.text_backdrop_textures.remove(&id);
+        }
     }
 
     fn paint_blur_live(
@@ -2364,6 +2856,54 @@ fn blur_key(rect: [f32; 4], radius: f32) -> BlurKey {
     BlurKey { x0, y0, x1, y1, radius_q }
 }
 
+/// Quantise a Text rect for `text_backdrop_textures` cache lookups. Sigma
+/// is fixed by `rasterize::TEXT_FROSTED_SIGMA` so it doesn't need to be
+/// part of the key.
+fn text_backdrop_key(rect: [f32; 4]) -> TextBackdropKey {
+    let q = |v: f32| ((v / 8.0).round() as i32) * 8;
+    TextBackdropKey {
+        x0: q(rect[0].min(rect[2])),
+        y0: q(rect[1].min(rect[3])),
+        x1: q(rect[0].max(rect[2])),
+        y1: q(rect[1].max(rect[3])),
+    }
+}
+
+/// Crop `base` to the Text rect, gaussian-blur it, overlay the fixed
+/// translucent white tint, and upload as a texture. Mirrors
+/// `build_blur_texture` but uses fixed sigma / tint so the preview
+/// matches `rasterize::draw_text_frosted`.
+fn build_text_backdrop_texture(
+    ctx: &egui::Context,
+    base: &RgbaImage,
+    rect: [f32; 4],
+) -> Option<egui::TextureHandle> {
+    let (bw, bh) = base.dimensions();
+    let x0 = rect[0].min(rect[2]).floor().max(0.0) as u32;
+    let y0 = rect[1].min(rect[3]).floor().max(0.0) as u32;
+    let x1 = (rect[0].max(rect[2]).ceil() as u32).min(bw);
+    let y1 = (rect[1].max(rect[3]).ceil() as u32).min(bh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let mut crop = RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            crop.put_pixel(x, y, *base.get_pixel(x0 + x, y0 + y));
+        }
+    }
+    // Fixed sigma — keep in sync with `rasterize::TEXT_FROSTED_SIGMA`.
+    const SIGMA: f32 = 10.0;
+    let blurred = imageproc::filter::gaussian_blur_f32(&crop, SIGMA);
+    let ci = egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        blurred.as_raw(),
+    );
+    Some(ctx.load_texture("grabit-text-backdrop", ci, egui::TextureOptions::LINEAR))
+}
+
 /// Rasterize the capture-info banner into a transparent RGBA buffer sized
 /// tightly to the banner contents, upload as a texture, and return it plus
 /// the pixel size. The caller paints it scaled to the canvas.
@@ -2618,6 +3158,44 @@ impl eframe::App for EditorApp {
 // 4K stays well above 30 fps.
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Decorate `text` with per-paragraph list markers for the live preview
+/// and the pending-text overlay's layouter. Applied purely visually — the
+/// backing buffer is never modified. Empty paragraphs stay empty (no
+/// phantom bullet), and numbered paragraphs count consecutive non-empty
+/// paragraphs only (matching `rasterize::draw_text_box`).
+///
+/// Preview-vs-export divergence: the live preview uses a single `halign`
+/// layout, so wrapped continuation lines do NOT hanging-indent past the
+/// marker — they flush-left instead. The PNG export (via
+/// `rasterize::draw_text_box`) always renders the hanging indent. This
+/// keeps the preview cheap and avoids fighting egui's layout API.
+fn decorate_for_list_preview(text: &str, list: TextListStyle) -> String {
+    if matches!(list, TextListStyle::None) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut number: u32 = 0;
+    for (i, paragraph) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if paragraph.is_empty() {
+            // Empty paragraph: no marker, no counter bump.
+            continue;
+        }
+        match list {
+            TextListStyle::None => {}
+            TextListStyle::Bullet => out.push_str("\u{2022} "),
+            TextListStyle::Numbered => {
+                number += 1;
+                out.push_str(&format!("{}. ", number));
+            }
+        }
+        out.push_str(paragraph);
+    }
+    out
+}
+
 fn draw_node_preview(
     painter: &egui::Painter,
     node: &AnnotationNode,
@@ -2634,14 +3212,52 @@ fn draw_node_preview(
                 thickness * scale,
             );
         }
-        AnnotationNode::Text { position, text, color, size_px, .. } => {
-            painter.text(
-                to_canvas(*position),
-                egui::Align2::LEFT_TOP,
-                text,
-                egui::FontId::monospace(size_px * scale),
-                egui_color(*color),
-            );
+        AnnotationNode::Text { rect, text, color, size_px, align, list, .. } => {
+            // Lay out with wrap-width = rect width on canvas so the
+            // preview matches the exported wrap. Text overflowing below
+            // the rect still renders (we don't clip). `job.halign` picks
+            // up the annotation's alignment so the on-canvas preview
+            // matches `rasterize::draw_text_box`'s per-line offset.
+            //
+            // List markers: we prepend `"• "` / `"N. "` to each non-empty
+            // paragraph before layout. That's the documented divergence
+            // from export — the on-canvas preview lacks the hanging-
+            // indent of wrapped continuation lines. Export (and the
+            // PNG) always gets hanging indent right.
+            let tl = to_canvas([rect[0], rect[1]]);
+            let br = to_canvas([rect[2], rect[3]]);
+            let wrap_w = (br.x - tl.x).max(1.0);
+            let font_id = egui::FontId::monospace(size_px * scale);
+            let egui_col = egui_color(*color);
+            let decorated = decorate_for_list_preview(text, *list);
+            let galley = painter.ctx().fonts(|f| {
+                let mut job = egui::text::LayoutJob::single_section(
+                    decorated,
+                    egui::text::TextFormat {
+                        font_id: font_id.clone(),
+                        color: egui_col,
+                        ..Default::default()
+                    },
+                );
+                job.wrap.max_width = wrap_w;
+                job.wrap.break_anywhere = false;
+                job.halign = match align {
+                    TextAlign::Left => egui::Align::LEFT,
+                    TextAlign::Center => egui::Align::Center,
+                    TextAlign::Right => egui::Align::RIGHT,
+                };
+                f.layout_job(job)
+            });
+            // When halign != LEFT, epaint measures from the anchor point
+            // as the line's alignment pivot, so we shift the draw origin
+            // right by wrap_w/2 (Center) or wrap_w (Right) to keep the
+            // text inside the user's rect.
+            let anchor_x = match align {
+                TextAlign::Left => tl.x,
+                TextAlign::Center => tl.x + wrap_w * 0.5,
+                TextAlign::Right => tl.x + wrap_w,
+            };
+            painter.galley(egui::pos2(anchor_x, tl.y), galley, egui_col);
         }
         AnnotationNode::Callout {
             rect, tail, text, fill, stroke, stroke_width, text_color, text_size, ..
@@ -2926,11 +3542,8 @@ fn apply_drag_to_node(node: &mut AnnotationNode, ah: &ActiveHandle, dx: f32, dy:
                 _ => {}
             }
         }
-        AnnotationNode::Text { position, .. } => {
-            if ah.handle == Handle::Body {
-                position[0] = ah.start_rect[0] + dx;
-                position[1] = ah.start_rect[1] + dy;
-            }
+        AnnotationNode::Text { rect, .. } => {
+            *rect = drag_rect(ah.start_rect, ah.handle, dx, dy);
         }
         AnnotationNode::Callout { rect, tail, .. } => {
             if ah.handle == Handle::CalloutTail {
