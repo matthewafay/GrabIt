@@ -142,6 +142,75 @@ fn run_editor_subprocess(
     editor::run_blocking(document, png_path, grabit_path, clipboard, paths, settings)
 }
 
+/// Execute a hotkey-originated command from the worker thread. Capture
+/// commands run inline so they aren't gated on the main thread; everything
+/// else is forwarded to the main loop via `cmd_tx` (those commands touch
+/// `AppState` which lives on main).
+///
+/// Settings are re-read from `settings.json` per capture so we always use
+/// the user's latest `include_cursor` / `copy_to_clipboard` without
+/// needing a cross-thread sync channel.
+fn handle_hotkey_command(
+    cmd: app::Command,
+    paths: &app::paths::AppPaths,
+    cmd_tx: &crossbeam_channel::Sender<app::Command>,
+) {
+    use capture::{CaptureRequest, CaptureTarget};
+    match cmd {
+        app::Command::CaptureFullscreen => {
+            let settings = settings::Settings::load_or_default(paths);
+            let req = CaptureRequest {
+                target: CaptureTarget::Fullscreen,
+                delay_ms: 0,
+                include_cursor: settings.include_cursor,
+            };
+            match capture::perform(req) {
+                Ok(Some(result)) => {
+                    if let Err(e) = export::save_png(&result, paths) {
+                        warn!("fullscreen capture save failed: {e}");
+                    }
+                    if settings.copy_to_clipboard {
+                        if let Err(e) = export::copy_to_clipboard(&result) {
+                            warn!("fullscreen clipboard copy failed: {e}");
+                        }
+                    }
+                    info!("fullscreen capture (hotkey) complete");
+                }
+                Ok(None) => info!("fullscreen capture cancelled"),
+                Err(e) => warn!("fullscreen capture failed: {e}"),
+            }
+        }
+        app::Command::CaptureAndAnnotate => {
+            let settings = settings::Settings::load_or_default(paths);
+            let req = CaptureRequest {
+                target: CaptureTarget::Interactive { allow_windows: false },
+                delay_ms: 0,
+                include_cursor: settings.include_cursor,
+            };
+            match capture::perform(req) {
+                Ok(Some(result)) => {
+                    if let Err(e) = editor::open_from_capture(
+                        result,
+                        paths,
+                        settings.copy_to_clipboard,
+                    ) {
+                        warn!("editor spawn failed: {e}");
+                    }
+                }
+                Ok(None) => info!("annotate flow cancelled"),
+                Err(e) => warn!("annotate capture failed: {e}"),
+            }
+        }
+        other => {
+            // Non-capture commands still need AppState access — send to
+            // main's cmd channel.
+            if let Err(e) = cmd_tx.send(other) {
+                warn!("worker \u{2192} main send failed: {e}");
+            }
+        }
+    }
+}
+
 fn init_logging(log_file: &std::path::Path) {
     let default = if cfg!(debug_assertions) { "debug" } else { "info" };
     let mut builder = env_logger::Builder::from_env(
@@ -214,6 +283,29 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
     let tray_icon_rx = tray_icon::TrayIconEvent::receiver().clone();
     let hotkey_rx = global_hotkey::GlobalHotKeyEvent::receiver().clone();
 
+    // Drain hotkey events on a dedicated worker thread. For capture
+    // commands (CaptureFullscreen / CaptureAndAnnotate) the worker runs
+    // the capture *itself* — this bypasses the main thread's event loop
+    // entirely, which means the capture fires even while the main thread
+    // is parked inside a modal UI (e.g. the GrabIt tray popup menu). The
+    // menu stays open and shows up in the screenshot.
+    //
+    // Non-capture commands (Quit, RefreshHotkeys, SetLaunchAtStartup, …)
+    // still need to touch the main-thread `AppState` so they're forwarded
+    // via `cmd_tx` as before.
+    let paths_for_worker = state.paths.clone();
+    let worker_tx = cmd_tx.clone();
+    std::thread::Builder::new()
+        .name("grabit-hotkey-drain".into())
+        .spawn(move || {
+            while let Ok(ev) = hotkey_rx.recv() {
+                if let Some(cmd) = hotkeys::command_for_event(&ev) {
+                    handle_hotkey_command(cmd, &paths_for_worker, &worker_tx);
+                }
+            }
+        })
+        .expect("spawn grabit-hotkey-drain");
+
     // Pump Windows messages on the main thread while also consuming events
     // from the crossbeam channels. We do this by blocking-poll on the native
     // message loop and draining non-Win32 channels on each iteration.
@@ -263,9 +355,8 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
         while let Ok(ev) = tray_icon_rx.try_recv() {
             tray::on_tray_event(ev, &cmd_tx);
         }
-        while let Ok(ev) = hotkey_rx.try_recv() {
-            hotkeys::on_event(ev, &cmd_tx);
-        }
+        // Hotkey events are drained by the dedicated worker thread above;
+        // nothing to do for them here.
 
         // Cross-process marker files from the editor + settings subprocesses.
         // Subprocess IPC is file-based because crossbeam channels don't span

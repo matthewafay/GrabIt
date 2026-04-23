@@ -235,6 +235,38 @@ pub enum TextAlign {
     Right,
 }
 
+/// Shaft dash pattern for an `Arrow` annotation. `#[serde(default)]` on the
+/// node keeps pre-existing arrows loading as `Solid`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArrowLineStyle {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+/// Head/tail rendering for an `Arrow` annotation. `#[serde(default)]` on the
+/// node keeps pre-existing arrows loading as `FilledTriangle`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArrowHeadStyle {
+    #[default]
+    FilledTriangle,
+    /// Triangle stroked but not filled — flatter, more modern look.
+    OutlineTriangle,
+    /// Two short strokes forming `→` chevron, no filled shape.
+    LineOnly,
+    /// No head at all — just a line.
+    None,
+    /// Filled triangle at both endpoints (for equivalence / comparison).
+    DoubleEnded,
+}
+
 /// Per-paragraph list style for a `Text` annotation. Applied at rasterize-
 /// and preview-time: each `\n`-separated paragraph gets a marker prefix
 /// (`"• "` for `Bullet`, `"1. "`, `"2. "`, … for `Numbered`). Empty
@@ -271,6 +303,18 @@ pub enum AnnotationNode {
         /// (all schemas ≤ v4) loading with the shadow off.
         #[serde(default)]
         shadow: bool,
+        /// Shaft dash pattern. `#[serde(default)]` → Solid for older docs.
+        #[serde(default)]
+        line_style: ArrowLineStyle,
+        /// Head/cap treatment. `#[serde(default)]` → FilledTriangle.
+        #[serde(default)]
+        head_style: ArrowHeadStyle,
+        /// Optional quadratic-bezier control point (image-pixel coords). If
+        /// `Some`, the arrow renders as a curve from `start` through the
+        /// control to `end`. If `None`, it's a straight line (legacy
+        /// behaviour). `#[serde(default)]` → `None`.
+        #[serde(default)]
+        control: Option<[f32; 2]>,
     },
     Text {
         id: Uuid,
@@ -521,6 +565,9 @@ mod tests {
             color: [10, 20, 30, 40],
             thickness: 2.5,
             shadow: false,
+            line_style: ArrowLineStyle::default(),
+            head_style: ArrowHeadStyle::default(),
+            control: None,
         });
         let back = round_trip(&doc);
         assert_eq!(back.annotations.len(), 1);
@@ -937,6 +984,9 @@ mod tests {
             color: [255, 0, 0, 255],
             thickness: 4.0,
             shadow: false,
+            line_style: ArrowLineStyle::default(),
+            head_style: ArrowHeadStyle::default(),
+            control: None,
         });
         let back = round_trip(&doc);
         assert_eq!(back.schema_version, 1);
@@ -1048,6 +1098,9 @@ mod tests {
                 color: [255, 0, 0, 255],
                 thickness: 2.0,
                 shadow: false,
+                line_style: ArrowLineStyle::default(),
+                head_style: ArrowHeadStyle::default(),
+                control: None,
             }],
             metadata: base.metadata.clone(),
         };

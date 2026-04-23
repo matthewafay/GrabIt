@@ -5,6 +5,93 @@
 A lightweight Windows screenshot + annotation tool. Single `.exe`, lives in
 the system tray, launches with Windows.
 
+If GrabIt is useful to you, you can support development here:
+[☕ Buy me a coffee](https://buymeacoffee.com/matthewafay).
+
+## What's new in 1.2
+
+### Arrow — full style kit
+- **Line style**: Solid / Dashed / Dotted. Dashes survive along curves
+  (they're walked by arc length, not per polyline segment).
+- **Head style**: filled Triangle (default) / outline Triangle / Line
+  chevron / No head / Double-ended.
+- **Round caps** on the shaft — every capsule segment ends with a clean
+  semicircle instead of a hard cut. Visible on thick arrows, dashed
+  arrows, and `Head = None`.
+- **Curved arrows** — when an arrow is selected, a cyan mid-handle
+  appears between the two endpoint handles. Drag it to bend the arrow
+  into a quadratic bezier; drag the handle back toward the line to
+  straighten. Body-drag moves the whole curve; every line/head style
+  applies to curves too. The head's orientation follows the curve
+  tangent at the tip.
+- **4× supersampled export** — arrow rasterisation now renders into a 4×
+  offscreen buffer and downsamples, giving smooth edges at every angle in
+  the saved PNG and the clipboard image.
+- All new style fields round-trip through the `.grabit` sidecar
+  (serde defaults keep pre-1.2 arrows loading as solid filled-triangle
+  straight lines).
+
+### Text
+- **Resize while editing** — eight blue-outlined handles appear around
+  the text rect while it's in edit mode; drag a corner or edge to resize
+  the box. Word-wrap re-runs live as you drag.
+- **Double-click to re-edit** — from any tool, double-click a committed
+  text annotation to jump into edit mode on it. Tool switches to Text,
+  the toolbar re-seeds from the node's current size/color/align/list/
+  shadow/frosted, and the existing node is updated in place on commit.
+- **List cursor fix** — typing inside a bullet/numbered text box no
+  longer drifts the caret. Markers are applied at render/export time
+  only; the live edit layouter uses the raw buffer so cursor indices
+  map 1:1 to the string.
+
+### Editor UX
+- **Two-row toolbar** — tool selection on row 1, style controls on row 2.
+  Each row wraps independently, so adding a tool never shoves style
+  controls off-screen on a narrow window.
+- **Editor window minimum size** — a tiny capture (e.g. 1×1 px) now
+  opens a ≥1000×700 window with a hard 800×550 shrink floor, so toolbar
+  + inspector + status always have room.
+- **No more "unsaved changes" prompt after copy-to-clipboard** — a
+  successful clipboard copy clears the dirty flag; subsequent edits
+  re-arm the prompt as usual.
+
+### Settings window
+- **Reorganised into sections** — Hotkeys, Capture, Arrows. Each has a
+  bold heading, its own grid, and separators between groups.
+- **Click-to-record hotkeys** — click the field showing the current
+  chord, press the combo you want, then Confirm. Esc cancels. The
+  captured chord formats as `parse_chord` expects, so validation always
+  accepts it.
+- **Credit footer** — `GrabIt 2026 — Matthew Fay` pinned to the bottom
+  right of the Settings window.
+- **Arrow snap setting removed** — Shift always snaps to 15°; the
+  modifier convention made a toggle redundant. Existing
+  `settings.json` files with the field are read and quietly upgraded.
+
+### Slim tray menu
+The tray menu is down to 5 items: **Capture fullscreen**, **Capture &
+annotate…**, **Open output folder**, **Settings…**, **Quit GrabIt**.
+The two capture entries show their bound hotkey chord on the right
+side via a muda Accelerator. Launch-at-startup moved into the Settings
+window (Capture section).
+
+### Hotkeys don't get swallowed by menus
+- **Dedicated hotkey-drain thread** — `WM_HOTKEY` events are processed
+  on a worker thread, so a modal UI on the main thread (our own tray
+  popup, Windows context menus) can't delay dispatch.
+- **Captures run on the worker** — `CaptureFullscreen` and
+  `CaptureAndAnnotate` execute inline in the worker. Settings are
+  re-read from disk per capture so include-cursor / copy-to-clipboard
+  are always current.
+- **Capture-first frozen overlay for Annotate** — the full virtual
+  desktop is BitBlt'd *before* the region overlay shows. The overlay
+  paints that captured bitmap as its opaque background (dimmed outside
+  the drag rect, full-brightness inside). Windows naturally dismisses
+  any open popup menu when the overlay takes focus, but because the
+  overlay is showing the frozen capture, transient UI — tray menus,
+  context menus, hover tooltips — is preserved in the final image.
+  The selected rect is cropped out of the already-captured bitmap.
+
 ## What's new in 1.1
 
 - **Arrow polish** — shaft now renders as a proper anti-aliased line stroke
@@ -15,8 +102,7 @@ the system tray, launches with Windows.
   dark backgrounds. Toggle per-arrow from the toolbar or globally in
   Settings ("Default new arrows to drop shadow").
 - **Shift-drag snaps arrows to 15°** — freehand by default; hold Shift
-  mid-drag to lock the angle and pixel-snap endpoints. Can be disabled
-  entirely in Settings.
+  mid-drag to lock the angle and pixel-snap endpoints.
 - **Arrow color: simple vs. advanced mode** — simple mode (default) shows
   an 8-swatch palette (red, orange, yellow, green, blue, purple, black,
   white). Advanced mode unlocks the full picker plus a `#RRGGBB` hex input
@@ -105,22 +191,27 @@ as a named style and reapply later. Styles persist at
 
 ## Settings
 
-Tray → *Settings…* opens a GUI window with:
+Tray → *Settings…* opens a GUI window grouped into three sections:
 
-- Fullscreen hotkey chord (default `PrintScreen`)
-- Annotate hotkey chord (default `Ctrl+X`)
-- Launch at startup
-- Include cursor in captures
-- Copy every capture to clipboard
-- Shift+drag snaps arrows to 15° (uncheck to disable the Shift modifier)
-- Default new arrows to drop shadow
-- Arrow color — advanced mode (picker + hex)
-- Output folder (default `%USERPROFILE%\Pictures\GrabIt`, with Browse / Reset)
+- **Hotkeys**
+  - Fullscreen capture (default `PrintScreen`)
+  - Annotate (default `Ctrl+X`)
+
+  Click a field and press the combo you want, then Confirm. Esc cancels.
+- **Capture**
+  - Launch at startup
+  - Include cursor in captures
+  - Copy every capture to clipboard
+  - Output folder (default `%USERPROFILE%\Pictures\GrabIt`, with Browse / Reset)
+- **Arrows**
+  - Default new arrows to drop shadow
+  - Arrow color — advanced mode (picker + hex)
+
+  *Tip: hold Shift while dragging an arrow to snap to 15°.*
 
 Save writes `%APPDATA%\GrabIt\settings.json` and signals the tray to
 re-register hotkeys and re-sync autostart without restart. Any open editor
-also live-reloads its arrow/shadow flags. Chord parsing accepts
-`Ctrl+Shift+Z`, `Alt+PrtSc`, `Win+S`, etc.
+also live-reloads its arrow/shadow flags.
 
 > Global hotkeys win over focused apps — while the annotate hotkey is
 > `Ctrl+X` it intercepts Cut everywhere. Pick something unique (e.g.
@@ -175,7 +266,7 @@ the same `.exe`) and rerun.
 ## Use
 
 Run `grabit.exe`. The logo appears in the system tray. Right-click for the
-menu. Toggle **Launch at startup** in the tray to add/remove the
+menu. Toggle **Launch at startup** in the Settings window to add/remove the
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\GrabIt` entry.
 
 Output folder: configurable in Settings (default `%USERPROFILE%\Pictures\GrabIt`).

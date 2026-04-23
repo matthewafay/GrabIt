@@ -16,6 +16,7 @@
 
 use crate::capture::Rect;
 use anyhow::{anyhow, Result};
+use image::RgbaImage;
 
 #[derive(Debug, Clone)]
 pub enum RegionResult {
@@ -31,11 +32,27 @@ pub enum RegionResult {
 /// gesture.
 #[cfg(windows)]
 pub fn select(allow_windows: bool) -> Result<RegionResult> {
-    imp::run(allow_windows)
+    imp::run(allow_windows, None)
+}
+
+/// Frozen-background variant: paints `background` as the overlay's opaque
+/// backdrop, dimmed where the user isn't selecting and full-brightness
+/// inside the drag rect. Call this after capturing a fullscreen bitmap so
+/// transient UI (tray menus, etc.) is preserved in the final image even
+/// after focus moves to the overlay. Always returns `Region(...)` or
+/// `Cancelled` — window-pick is disabled in this mode.
+#[cfg(windows)]
+pub fn select_on_frozen(background: &RgbaImage) -> Result<RegionResult> {
+    imp::run(false, Some(background))
 }
 
 #[cfg(not(windows))]
 pub fn select(_allow_windows: bool) -> Result<RegionResult> {
+    Err(anyhow!("region selector is Windows-only"))
+}
+
+#[cfg(not(windows))]
+pub fn select_on_frozen(_background: &RgbaImage) -> Result<RegionResult> {
     Err(anyhow!("region selector is Windows-only"))
 }
 
@@ -50,9 +67,11 @@ mod imp {
         COLORREF, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint,
-        FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, TextOutW, FONT_CHARSET,
-        FW_SEMIBOLD, HBRUSH, HGDIOBJ, LOGFONTW, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+        BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
+        CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, GetDC,
+        InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, FONT_CHARSET, FW_SEMIBOLD,
+        HBITMAP, HBRUSH, HDC, HGDIOBJ, LOGFONTW, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -87,13 +106,35 @@ mod imp {
         result: Option<RegionResult>,
         overlay_hwnd: HWND,
         allow_windows: bool,
+        /// Pre-captured fullscreen bitmaps for frozen-background mode.
+        /// `full` is the unmodified capture; `dimmed` is the same image with
+        /// RGB multiplied by ~0.45 so the non-selected area reads as darker.
+        /// `None` means live transparent mode (legacy behaviour).
+        frozen: Option<FrozenBitmaps>,
+    }
+
+    struct FrozenBitmaps {
+        full: HBITMAP,
+        dimmed: HBITMAP,
+    }
+
+    impl Drop for FrozenBitmaps {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.full.0));
+                let _ = DeleteObject(HGDIOBJ(self.dimmed.0));
+            }
+        }
     }
 
     thread_local! {
         static STATE: RefCell<Option<State>> = RefCell::new(None);
     }
 
-    pub fn run(allow_windows: bool) -> Result<RegionResult> {
+    pub fn run(
+        allow_windows: bool,
+        frozen_image: Option<&image::RgbaImage>,
+    ) -> Result<RegionResult> {
         unsafe {
             let hinstance: HINSTANCE = GetModuleHandleW(PCWSTR::null())
                 .map_err(|e| anyhow!("GetModuleHandle: {e}"))?
@@ -147,13 +188,23 @@ mod imp {
                 return Err(anyhow!("CreateWindowEx returned null (GetLastError: {:?})", GetLastError()));
             }
 
-            // Magenta pixels fully transparent; everything else drawn at 75% alpha.
-            let _ = SetLayeredWindowAttributes(
-                hwnd,
-                rgb(KEY_R, KEY_G, KEY_B),
-                192,
-                LWA_COLORKEY | LWA_ALPHA,
-            );
+            // In live mode we keep the colour-key / alpha trick so the user
+            // sees the live desktop through the selection rect. In frozen
+            // mode the whole window is opaque (painted from the pre-
+            // captured bitmaps) and we set a normal per-window alpha of 255.
+            let frozen_bitmaps = if let Some(img) = frozen_image {
+                let fb = make_frozen_bitmaps(img)?;
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+                Some(fb)
+            } else {
+                let _ = SetLayeredWindowAttributes(
+                    hwnd,
+                    rgb(KEY_R, KEY_G, KEY_B),
+                    192,
+                    LWA_COLORKEY | LWA_ALPHA,
+                );
+                None
+            };
 
             STATE.with(|cell| {
                 *cell.borrow_mut() = Some(State {
@@ -165,6 +216,7 @@ mod imp {
                     result: None,
                     overlay_hwnd: hwnd,
                     allow_windows,
+                    frozen: frozen_bitmaps,
                 });
             });
 
@@ -338,7 +390,7 @@ mod imp {
     unsafe fn paint(hdc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND) {
         use windows::Win32::Graphics::Gdi::Rectangle;
 
-        let (virt_w, virt_h, selection, hover_rect) = with_state(|s| {
+        let (virt_w, virt_h, selection, hover_rect, frozen_handles) = with_state(|s| {
             let selection = if s.dragging {
                 let left = s.drag_start.x.min(s.current.x);
                 let top = s.drag_start.y.min(s.current.y);
@@ -353,41 +405,63 @@ mod imp {
             } else {
                 None
             };
+            let fh = s.frozen.as_ref().map(|f| (f.full, f.dimmed));
             (
                 s.virtual_rect.width as i32,
                 s.virtual_rect.height as i32,
                 selection,
                 hover,
+                fh,
             )
         });
         let _ = hwnd; // not needed past BeginPaint
-
-        // 1. Dim background — dark gray fills everything; becomes ~75% opaque.
-        let dim = CreateSolidBrush(rgb(30, 30, 30));
         let full = RECT { left: 0, top: 0, right: virt_w, bottom: virt_h };
-        FillRect(hdc, &full, dim);
-        let _ = DeleteObject(HGDIOBJ(dim.0));
 
-        // 2. Selection cut-out — magenta = transparent per color key.
+        if let Some((full_bmp, dim_bmp)) = frozen_handles {
+            // Frozen mode: draw pre-captured bitmaps. Dimmed covers the whole
+            // window; full-brightness draws over the selection rect only.
+            // No color-key transparency — the overlay is opaque.
+            let mem = CreateCompatibleDC(hdc);
+            let old = SelectObject(mem, HGDIOBJ(dim_bmp.0));
+            let _ = BitBlt(hdc, 0, 0, virt_w, virt_h, mem, 0, 0, SRCCOPY);
+            if let Some(r) = selection {
+                let sw = (r.right - r.left).max(0);
+                let sh = (r.bottom - r.top).max(0);
+                if sw > 0 && sh > 0 {
+                    SelectObject(mem, HGDIOBJ(full_bmp.0));
+                    let _ = BitBlt(hdc, r.left, r.top, sw, sh, mem, r.left, r.top, SRCCOPY);
+                }
+            }
+            SelectObject(mem, old);
+            let _ = DeleteDC(mem);
+        } else {
+            // Live mode: dark fill everywhere; color-keyed magenta inside
+            // the selection becomes transparent so the live desktop shows.
+            let dim = CreateSolidBrush(rgb(30, 30, 30));
+            FillRect(hdc, &full, dim);
+            let _ = DeleteObject(HGDIOBJ(dim.0));
+            if let Some(r) = selection {
+                let cut = CreateSolidBrush(rgb(KEY_R, KEY_G, KEY_B));
+                FillRect(hdc, &r, cut);
+                let _ = DeleteObject(HGDIOBJ(cut.0));
+            }
+        }
+
+        // Selection outline + size label, shared between both modes.
         if let Some(r) = selection {
-            let cut = CreateSolidBrush(rgb(KEY_R, KEY_G, KEY_B));
-            FillRect(hdc, &r, cut);
-            let _ = DeleteObject(HGDIOBJ(cut.0));
-
-            // Outline
             let pen = CreatePen(PS_SOLID, 2, rgb(0, 180, 255));
             let old = SelectObject(hdc, HGDIOBJ(pen.0));
             let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
             SelectObject(hdc, old);
             let _ = DeleteObject(HGDIOBJ(pen.0));
 
-            // Size label — "WxH" next to bottom-right corner.
             let w = (r.right - r.left).max(0);
             let h = (r.bottom - r.top).max(0);
             let text = format!("{} x {}", w, h);
             draw_label(hdc, r.right + 6, r.bottom + 6, &text);
         } else if let Some(r) = hover_rect {
-            // 3. Window hover highlight when not dragging.
+            // Window hover highlight is only meaningful in live mode (we
+            // don't enable allow_windows when painting a frozen overlay).
             let pen = CreatePen(PS_SOLID, 3, rgb(0, 200, 120));
             let old = SelectObject(hdc, HGDIOBJ(pen.0));
             let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
@@ -395,6 +469,78 @@ mod imp {
             let _ = DeleteObject(HGDIOBJ(pen.0));
             draw_label(hdc, r.left + 6, r.top + 6, "Click to capture window");
         }
+    }
+
+    /// Build two HBITMAPs from an RgbaImage: `full` is a faithful BGRA copy;
+    /// `dimmed` is the same image with RGB channels multiplied by ~0.45 so
+    /// the non-selected portion of the overlay reads as visibly darker than
+    /// the currently-selected region. Both are returned wrapped in a
+    /// `FrozenBitmaps` that takes care of `DeleteObject` on drop.
+    unsafe fn make_frozen_bitmaps(img: &image::RgbaImage) -> Result<FrozenBitmaps> {
+        let w = img.width() as i32;
+        let h = img.height() as i32;
+        if w <= 0 || h <= 0 {
+            return Err(anyhow!("frozen image has zero size"));
+        }
+        let screen_dc = GetDC(None);
+        if screen_dc.0.is_null() {
+            return Err(anyhow!("GetDC(NULL) returned null"));
+        }
+        let result = (|| -> Result<FrozenBitmaps> {
+            let full = alloc_dib_section(screen_dc, w, h, img, false)?;
+            let dimmed = alloc_dib_section(screen_dc, w, h, img, true)?;
+            Ok(FrozenBitmaps { full, dimmed })
+        })();
+        ReleaseDC(None, screen_dc);
+        result
+    }
+
+    unsafe fn alloc_dib_section(
+        dc: HDC,
+        w: i32,
+        h: i32,
+        img: &image::RgbaImage,
+        dim: bool,
+    ) -> Result<HBITMAP> {
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h; // top-down
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB.0;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbmp = CreateDIBSection(
+            dc,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .map_err(|e| anyhow!("CreateDIBSection: {e}"))?;
+        if hbmp.0.is_null() || bits.is_null() {
+            return Err(anyhow!("CreateDIBSection returned null"));
+        }
+        let src = img.as_raw();
+        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, src.len());
+        // Convert RGBA → BGRA, dimming RGB channels if requested.
+        if dim {
+            for (s, d) in src.chunks(4).zip(dst.chunks_mut(4)) {
+                d[0] = ((s[2] as u16) * 115 / 255) as u8; // B
+                d[1] = ((s[1] as u16) * 115 / 255) as u8; // G
+                d[2] = ((s[0] as u16) * 115 / 255) as u8; // R
+                d[3] = 255;
+            }
+        } else {
+            for (s, d) in src.chunks(4).zip(dst.chunks_mut(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 255;
+            }
+        }
+        Ok(hbmp)
     }
 
     unsafe fn draw_label(hdc: windows::Win32::Graphics::Gdi::HDC, x: i32, y: i32, text: &str) {

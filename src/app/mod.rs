@@ -37,6 +37,8 @@ impl AppState {
 /// main loop. Keeping this enum small and stable is what lets the
 /// input-surface modules (tray, hotkeys) stay decoupled from capture/editor.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Several variants are reachable only via preset hotkeys,
+                    // not from the slim tray menu.
 pub enum Command {
     /// Capture the entire virtual desktop.
     CaptureFullscreen,

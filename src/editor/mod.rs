@@ -69,16 +69,30 @@ pub fn run_blocking(
     paths: AppPaths,
     settings: Settings,
 ) -> Result<()> {
-    let w = document.base_width.max(320);
-    let h = document.base_height.max(240);
-    // Cap initial window to something sane for giant captures.
-    let init_w = (w as f32).min(1600.0);
-    let init_h = (h as f32).min(1000.0);
+    // Editor window sizing:
+    //  - Chrome adds ~16 px horizontal (margins / scrollbar) and ~80 px
+    //    vertical (toolbar + status row) on top of the canvas area.
+    //  - Floor: a 1×1 pixel capture would otherwise produce an unusable
+    //    336×320 window. Clamp the initial size to `MIN_*` so the
+    //    toolbar + inspector + status row have room to breathe.
+    //  - Ceiling: cap at MAX_* so a giant 4K capture doesn't spawn a window
+    //    larger than the screen. The canvas scrolls / fits-to-view inside.
+    //  - `min_inner_size`: hard floor users can't shrink below without
+    //    making the UI illegible.
+    const MIN_W: f32 = 1000.0;
+    const MIN_H: f32 = 700.0;
+    const MAX_W: f32 = 1616.0;
+    const MAX_H: f32 = 1080.0;
+    const SHRINK_FLOOR_W: f32 = 800.0;
+    const SHRINK_FLOOR_H: f32 = 550.0;
+    let init_w = ((document.base_width as f32 + 16.0).max(MIN_W)).min(MAX_W);
+    let init_h = ((document.base_height as f32 + 80.0).max(MIN_H)).min(MAX_H);
 
     let viewport = {
         let mut vb = egui::ViewportBuilder::default()
             .with_title("GrabIt editor")
-            .with_inner_size([init_w + 16.0, init_h + 80.0]);
+            .with_inner_size([init_w, init_h])
+            .with_min_inner_size([SHRINK_FLOOR_W, SHRINK_FLOOR_H]);
         if let Some(icon) = load_app_icon_data() {
             vb = vb.with_icon(std::sync::Arc::new(icon));
         }

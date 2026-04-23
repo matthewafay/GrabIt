@@ -29,8 +29,9 @@ use crate::editor::commands::{
     UpdateCursor, SetBorder, SetEdgeEffect,
 };
 use crate::editor::document::{
-    AnnotationNode, CaptureInfoPosition, CaptureInfoStyle, Document, Edge,
-    FieldKind, ShapeKind, StampSource, TextAlign, TextListStyle,
+    AnnotationNode, ArrowHeadStyle, ArrowLineStyle, CaptureInfoPosition,
+    CaptureInfoStyle, Document, Edge, FieldKind, ShapeKind, StampSource,
+    TextAlign, TextListStyle,
 };
 use crate::capture::CaptureMetadata;
 use crate::editor::rasterize;
@@ -39,7 +40,8 @@ use crate::editor::tools::{
     capture_info as tool_capture_info, magnify as tool_magnify,
     selection::{
         bounds_of_cursor, bounds_of_node, dist2_to_segment, drag_rect, hit_bbox,
-        normalise as norm_bbox, rect_handles, Handle, SelectionTarget,
+        normalise as norm_bbox, rect_handles, sample_bezier, Handle,
+        SelectionTarget,
     },
     shape as tool_shape, step as tool_step, text as tool_text, Tool,
 };
@@ -251,10 +253,6 @@ pub struct EditorApp {
     /// Whether the right-hand inspector shows presets or document effects.
     inspector_tab: InspectorTab,
 
-    /// Snap arrow angle to 15° on drag (Shift bypasses). Sourced from
-    /// `Settings.arrow_angle_snap` at editor launch; refreshed live on each
-    /// `settings.json` mtime change.
-    arrow_angle_snap: bool,
     /// Seed for the `shadow` flag on newly-drawn arrows. Sourced from
     /// `Settings.arrow_shadow`; refreshed live on `settings.json` mtime
     /// change. Per-arrow field rules the render — this only seeds new nodes.
@@ -270,6 +268,10 @@ pub struct EditorApp {
     /// Buffer for the hex text input in advanced color mode. Re-synced from
     /// `self.color` every frame unless the user is actively typing in it.
     hex_color_buffer: String,
+    /// Toolbar-level default shaft style for the next new arrow.
+    arrow_line_style: ArrowLineStyle,
+    /// Toolbar-level default head style for the next new arrow.
+    arrow_head_style: ArrowHeadStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,11 +344,12 @@ impl EditorApp {
             style_store,
             style_draft_name: String::new(),
             inspector_tab: InspectorTab::Document,
-            arrow_angle_snap: settings.arrow_angle_snap,
             arrow_shadow_default: settings.arrow_shadow,
             settings_mtime,
             arrow_advanced_color: settings.arrow_advanced_color,
             hex_color_buffer: format_hex(egui::Color32::from_rgb(220, 40, 40)),
+            arrow_line_style: ArrowLineStyle::default(),
+            arrow_head_style: ArrowHeadStyle::default(),
         }
     }
 
@@ -359,7 +362,6 @@ impl EditorApp {
         if self.settings_mtime == Some(mt) { return; }
         self.settings_mtime = Some(mt);
         let s = crate::settings::Settings::load_or_default(&self.paths);
-        self.arrow_angle_snap = s.arrow_angle_snap;
         self.arrow_shadow_default = s.arrow_shadow;
         self.arrow_advanced_color = s.arrow_advanced_color;
     }
@@ -404,6 +406,52 @@ impl EditorApp {
         if self.history.redo(&mut self.document) {
             self.dirty = true;
         }
+    }
+
+    /// Double-click re-edit: if a Text annotation's rect contains `p`,
+    /// commit any in-progress text, switch to the Text tool, and load the
+    /// hit node into `pending_text` so the user can type right away.
+    /// Returns `true` if a text was entered (callers can short-circuit
+    /// other click handling in that case).
+    fn reenter_text_at(&mut self, p: [f32; 2]) -> bool {
+        let mut hit: Option<AnnotationNode> = None;
+        for node in self.document.annotations.iter().rev() {
+            if let AnnotationNode::Text { rect, .. } = node {
+                if hit_bbox(p, *rect) {
+                    hit = Some(node.clone());
+                    break;
+                }
+            }
+        }
+        let Some(AnnotationNode::Text {
+            id, rect, text, color, size_px, frosted, shadow, align, list, ..
+        }) = hit
+        else {
+            return false;
+        };
+        self.commit_pending_text();
+        self.tool = Tool::Text;
+        self.selection = None;
+        self.active_handle = None;
+        self.pending_drag = None;
+        self.color = egui::Color32::from_rgba_unmultiplied(
+            color[0], color[1], color[2], color[3],
+        );
+        self.text_size = size_px;
+        self.text_frosted = frosted;
+        self.text_shadow = shadow;
+        self.text_align = align;
+        self.text_list = list;
+        self.pending_text = Some(PendingText {
+            rect,
+            buffer: text,
+            editing_id: Some(id),
+            frosted,
+            shadow,
+            align,
+            list,
+        });
+        true
     }
 
     fn commit_pending_text(&mut self) {
@@ -486,6 +534,10 @@ impl EditorApp {
         let flat = self.apply_export_resize(flat);
         copy_rgba_to_clipboard(&flat).context("copy to clipboard")?;
         self.status = "Copied to clipboard".to_string();
+        // Treat a successful clipboard copy as "I got my output" so closing
+        // the editor afterwards doesn't prompt about unsaved edits.
+        // Subsequent edits will flip `dirty` back on and re-arm the prompt.
+        self.dirty = false;
         Ok(())
     }
 
@@ -559,6 +611,8 @@ impl EditorApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        // Tool selection row — kept on its own line so adding a new tool
+        // doesn't shove the style controls off-screen on narrow windows.
         ui.horizontal_wrapped(|ui| {
             for t in [
                 Tool::Select, Tool::Arrow, Tool::Text, Tool::Callout,
@@ -575,8 +629,15 @@ impl EditorApp {
                     self.pending_drag = None;
                 }
             }
-            ui.separator();
+        });
 
+        // Style row — colour + per-tool controls. Separate wrap so tools and
+        // styles never share row space; each can wrap independently.
+        ui.horizontal_wrapped(|ui| {
+            // Cap slider widths so Size / Thickness / Blur radius / etc.
+            // don't stretch to fill the row and shove everything after
+            // them off-screen on narrow windows.
+            ui.spacing_mut().slider_width = 120.0;
             ui.label("Color");
             if matches!(self.tool, Tool::Arrow) && !self.arrow_advanced_color {
                 // Simple mode: 8 preset swatches, no free picker / hex.
@@ -616,6 +677,8 @@ impl EditorApp {
                     ui.add(egui::Slider::new(&mut self.thickness, 1.0..=40.0));
                     // Seed for the shadow flag on the next new arrow.
                     ui.checkbox(&mut self.arrow_shadow_default, "Shadow");
+                    arrow_line_style_combo(ui, "line-tool", &mut self.arrow_line_style);
+                    arrow_head_style_combo(ui, "head-tool", &mut self.arrow_head_style);
                 }
                 Tool::Text => {
                     ui.label("Size");
@@ -818,8 +881,8 @@ impl EditorApp {
                         }
 
                         // Restyle for a currently-selected Arrow annotation:
-                        // Shadow checkbox flips the per-arrow field via an
-                        // undoable UpdateAnnotation command.
+                        // Shadow + Line style + Head style flip via
+                        // undoable UpdateAnnotation commands.
                         if let Some(before @ AnnotationNode::Arrow { .. }) = self
                             .document
                             .annotations
@@ -829,10 +892,19 @@ impl EditorApp {
                         {
                             if let AnnotationNode::Arrow {
                                 id: nid, start, end, color, thickness, shadow,
+                                line_style, head_style, control,
                             } = before.clone()
                             {
                                 let mut new_shadow = shadow;
+                                let mut new_line = line_style;
+                                let mut new_head = head_style;
+                                let mut changed = false;
                                 if ui.checkbox(&mut new_shadow, "Shadow").changed() {
+                                    changed = true;
+                                }
+                                changed |= arrow_line_style_combo(ui, "line-sel", &mut new_line);
+                                changed |= arrow_head_style_combo(ui, "head-sel", &mut new_head);
+                                if changed {
                                     let after = AnnotationNode::Arrow {
                                         id: nid,
                                         start,
@@ -840,6 +912,9 @@ impl EditorApp {
                                         color,
                                         thickness,
                                         shadow: new_shadow,
+                                        line_style: new_line,
+                                        head_style: new_head,
+                                        control,
                                     };
                                     self.push_command(Box::new(UpdateAnnotation::new(
                                         before, after,
@@ -1734,8 +1809,25 @@ impl EditorApp {
             );
         }
 
+        // Double-click on a Text annotation (from any tool) re-enters edit
+        // mode on it — short-circuits the normal per-tool dispatch so the
+        // user doesn't have to switch to the Text tool first. If the
+        // double-click didn't land on a Text rect, fall through to the
+        // tool-specific handler below.
+        let consumed_by_reenter = if response.double_clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let p = to_image(pos);
+                self.reenter_text_at(p)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Handle input — must come BEFORE drawing the selection overlay so
         // the overlay reflects the latest state.
+        if !consumed_by_reenter {
         match self.tool {
             Tool::Select => self.handle_select_input(&response, &to_image),
             Tool::Arrow => self.handle_arrow_input(&response, &to_image),
@@ -1748,6 +1840,7 @@ impl EditorApp {
             // Capture-info is placed from the toolbar's "Place info" button,
             // not a canvas drag. The canvas ignores clicks.
             Tool::CaptureInfo => {}
+        }
         }
 
         // Draw in-progress drag preview.
@@ -1765,6 +1858,9 @@ impl EditorApp {
                     draw_arrow_preview(
                         &painter, s, e, self.color, self.thickness * scale,
                         self.arrow_shadow_default,
+                        self.arrow_line_style,
+                        self.arrow_head_style,
+                        None, // drag-in-progress arrow is always straight
                     );
                 }
                 Tool::Rect | Tool::Magnify => {
@@ -1826,6 +1922,51 @@ impl EditorApp {
         // Selection overlay.
         if let Some(sel) = self.selection {
             self.draw_selection_handles(&painter, sel, &to_canvas);
+        }
+
+        // Resize handles around the pending text rect — 8 compass points
+        // along the outline, each a draggable circle. Sits outside the
+        // TextEdit's area so clicks on a handle don't steal focus from the
+        // edit widget. drag_delta is applied incrementally so the rect
+        // follows the cursor live; no explicit anchor bookkeeping needed.
+        if self.pending_text.is_some() {
+            let pt_rect_canvas = {
+                let pt = self.pending_text.as_ref().unwrap();
+                let r = norm_bbox(pt.rect);
+                egui::Rect::from_two_pos(
+                    to_canvas([r[0], r[1]]),
+                    to_canvas([r[2], r[3]]),
+                )
+            };
+            let mx = pt_rect_canvas.center().x;
+            let my = pt_rect_canvas.center().y;
+            let handles: [(Handle, egui::Pos2); 8] = [
+                (Handle::NW, pt_rect_canvas.left_top()),
+                (Handle::N,  egui::pos2(mx, pt_rect_canvas.top())),
+                (Handle::NE, pt_rect_canvas.right_top()),
+                (Handle::E,  egui::pos2(pt_rect_canvas.right(), my)),
+                (Handle::SE, pt_rect_canvas.right_bottom()),
+                (Handle::S,  egui::pos2(mx, pt_rect_canvas.bottom())),
+                (Handle::SW, pt_rect_canvas.left_bottom()),
+                (Handle::W,  egui::pos2(pt_rect_canvas.left(), my)),
+            ];
+            let handle_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(60, 160, 255));
+            for (h, pos) in handles {
+                let hit_rect = egui::Rect::from_center_size(pos, egui::vec2(14.0, 14.0));
+                let id = egui::Id::new(("grabit-pending-text-handle", h));
+                let hresp = ui.interact(hit_rect, id, egui::Sense::drag());
+                painter.circle(pos, 5.0, egui::Color32::WHITE, handle_stroke);
+                if hresp.dragged() {
+                    let d = hresp.drag_delta();
+                    if scale > 0.0 {
+                        let dx_img = d.x / scale;
+                        let dy_img = d.y / scale;
+                        if let Some(pt) = self.pending_text.as_mut() {
+                            pt.rect = drag_rect(pt.rect, h, dx_img, dy_img);
+                        }
+                    }
+                }
+            }
         }
 
         // Floating text editor overlay — a multiline TextEdit sized to the
@@ -1907,22 +2048,21 @@ impl EditorApp {
                     let pt = self.pending_text.as_mut().unwrap();
                     let font_id = egui::FontId::monospace(canvas_size.max(12.0));
                     let align = pt.align;
-                    let list = pt.list;
                     let layouter_font = font_id.clone();
                     let layouter_color = text_color;
                     let mut layouter =
                         move |ui: &egui::Ui, text: &str, wrap_width: f32| {
-                            // Prepend per-paragraph markers so the live
-                            // preview reads like the export. Pure-visual:
-                            // the actual `pt.buffer` is untouched and what
-                            // gets committed. NOTE: the cursor may drift
-                            // slightly past a marker because the galley is
-                            // longer than the backing string — this is the
-                            // documented preview-vs-export divergence;
-                            // hanging indent is only applied at rasterize.
-                            let decorated = decorate_for_list_preview(text, list);
+                            // Lay out the RAW buffer while editing — no
+                            // bullet/number marker decoration. Decorating
+                            // here would produce a galley longer than the
+                            // backing string, so egui's cursor positions
+                            // (which are galley indices) wouldn't map
+                            // cleanly to buffer indices — the cursor would
+                            // drift as the user typed. List markers still
+                            // appear once the text is committed; see the
+                            // `draw_node_preview` Text arm + rasterize.
                             let mut job = egui::text::LayoutJob::single_section(
-                                decorated,
+                                text.to_string(),
                                 egui::text::TextFormat {
                                     font_id: layouter_font.clone(),
                                     color: layouter_color,
@@ -1990,6 +2130,8 @@ impl EditorApp {
                     let node = tool_arrow::make(
                         start, end, color_to_rgba(self.color), self.thickness,
                         self.arrow_shadow_default,
+                        self.arrow_line_style,
+                        self.arrow_head_style,
                     );
                     self.push_command(Box::new(AddAnnotation::new(node)));
                 }
@@ -1997,19 +2139,15 @@ impl EditorApp {
         }
     }
 
-    /// Freehand by default. When the setting is on AND the user holds
-    /// Shift during drag, snap the end angle to the nearest 15° increment
-    /// and pixel-snap both endpoints. Otherwise returns the drag positions
-    /// unchanged.
+    /// Freehand by default. When the user holds Shift during drag, snap
+    /// the end angle to the nearest 15° increment and pixel-snap both
+    /// endpoints. Otherwise returns the drag positions unchanged.
     fn maybe_snap_arrow(
         &self,
         ctx: &egui::Context,
         start: [f32; 2],
         current: [f32; 2],
     ) -> ([f32; 2], [f32; 2]) {
-        if !self.arrow_angle_snap {
-            return (start, current);
-        }
         if !ctx.input(|i| i.modifiers.shift) {
             return (start, current);
         }
@@ -2348,10 +2486,11 @@ impl EditorApp {
             }
         };
 
-        // Arrow endpoints take priority; otherwise any click close enough
-        // to the shaft body-drags the arrow as a whole.
+        // Arrow endpoints take priority; the curve's mid-handle takes next
+        // priority; otherwise any click close enough to the shaft (straight
+        // or curved) body-drags the arrow as a whole.
         if let SelectionTarget::Annotation(id) = sel {
-            if let Some(arrow @ AnnotationNode::Arrow { start, end, thickness, .. }) =
+            if let Some(AnnotationNode::Arrow { start, end, thickness, control, .. }) =
                 self.document.annotations.iter().find(|n| n.id() == id)
             {
                 if dist_sq(p, *start) <= handle_r * handle_r {
@@ -2378,10 +2517,40 @@ impl EditorApp {
                         anchor: p,
                     });
                 }
-                // Shaft body-drag: point-to-segment distance with a
-                // tolerance tied to the arrow's own thickness.
+                // Mid handle: draws the curve's midpoint (or line-midpoint
+                // when the arrow is straight). Dragging it bends / re-
+                // shapes the quadratic bezier control.
+                let mid = match control {
+                    Some(c) => [
+                        0.25 * start[0] + 0.5 * c[0] + 0.25 * end[0],
+                        0.25 * start[1] + 0.5 * c[1] + 0.25 * end[1],
+                    ],
+                    None => [0.5 * (start[0] + end[0]), 0.5 * (start[1] + end[1])],
+                };
+                if dist_sq(p, mid) <= handle_r * handle_r {
+                    return Some(ActiveHandle {
+                        target: sel,
+                        handle: Handle::ArrowMid,
+                        start_rect,
+                        start_tail,
+                        start_source,
+                        before: before_node.clone(),
+                        before_cursor,
+                        anchor: p,
+                    });
+                }
+                // Shaft body-drag: distance to the rendered path (straight
+                // segment or sampled bezier) with tolerance tied to the
+                // arrow's own thickness.
                 let tol = (thickness * 0.5 + 6.0).powi(2);
-                if dist2_to_segment(p, *start, *end) <= tol {
+                let body_hit = if let Some(c) = control {
+                    let path = sample_bezier(*start, *end, *c, 16);
+                    path.windows(2)
+                        .any(|w| dist2_to_segment(p, w[0], w[1]) <= tol)
+                } else {
+                    dist2_to_segment(p, *start, *end) <= tol
+                };
+                if body_hit {
                     return Some(ActiveHandle {
                         target: sel,
                         handle: Handle::Body,
@@ -2393,7 +2562,6 @@ impl EditorApp {
                         anchor: p,
                     });
                 }
-                let _ = arrow;
                 return None;
             }
         }
@@ -2534,9 +2702,26 @@ impl EditorApp {
                             egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 60)),
                         );
                     }
-                    AnnotationNode::Arrow { start, end, .. } => {
+                    AnnotationNode::Arrow { start, end, control, .. } => {
                         painter.circle(to_canvas(*start), 5.0, handle_color, handle_stroke);
                         painter.circle(to_canvas(*end), 5.0, handle_color, handle_stroke);
+                        // Mid handle for curve bending. Position = B(0.5)
+                        // of the current curve, or line midpoint for a
+                        // straight arrow. Drawn a touch smaller and tinted
+                        // so it reads as "optional / secondary".
+                        let mid = match control {
+                            Some(c) => [
+                                0.25 * start[0] + 0.5 * c[0] + 0.25 * end[0],
+                                0.25 * start[1] + 0.5 * c[1] + 0.25 * end[1],
+                            ],
+                            None => [0.5 * (start[0] + end[0]), 0.5 * (start[1] + end[1])],
+                        };
+                        painter.circle(
+                            to_canvas(mid),
+                            4.5,
+                            egui::Color32::from_rgb(140, 200, 255),
+                            handle_stroke,
+                        );
                     }
                     _ => {}
                 }
@@ -3358,7 +3543,10 @@ fn draw_node_preview(
     to_canvas: &dyn Fn([f32; 2]) -> egui::Pos2,
 ) {
     match node {
-        AnnotationNode::Arrow { start, end, color, thickness, shadow, .. } => {
+        AnnotationNode::Arrow {
+            start, end, color, thickness, shadow, line_style, head_style, control,
+            ..
+        } => {
             draw_arrow_preview(
                 painter,
                 to_canvas(*start),
@@ -3366,6 +3554,9 @@ fn draw_node_preview(
                 egui_color(*color),
                 thickness * scale,
                 *shadow,
+                *line_style,
+                *head_style,
+                control.map(|c| to_canvas(c)),
             );
         }
         AnnotationNode::Text { rect, text, color, size_px, align, list, .. } => {
@@ -3642,6 +3833,7 @@ fn draw_node_preview(
 
 /// 8-swatch preset palette for the Arrow tool in simple mode. Clicking a
 /// swatch sets `color`; the currently-active one gets a highlighted border.
+/// Tight 16-px squares so the row stays compact on narrow editor windows.
 fn draw_arrow_swatches(ui: &mut egui::Ui, color: &mut egui::Color32) {
     const PALETTE: [egui::Color32; 8] = [
         egui::Color32::from_rgb(220, 40, 40),   // red
@@ -3657,7 +3849,7 @@ fn draw_arrow_swatches(ui: &mut egui::Ui, color: &mut egui::Color32) {
         let selected = color.r() == swatch.r()
             && color.g() == swatch.g()
             && color.b() == swatch.b();
-        let size = egui::vec2(20.0, 20.0);
+        let size = egui::vec2(16.0, 16.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, swatch);
@@ -3671,6 +3863,50 @@ fn draw_arrow_swatches(ui: &mut egui::Ui, color: &mut egui::Color32) {
             *color = swatch;
         }
     }
+}
+
+/// Line-style combo used in both the Arrow toolbar and the Select-edit
+/// panel. Returns `true` if the selection changed this frame.
+fn arrow_line_style_combo(ui: &mut egui::Ui, salt: &str, v: &mut ArrowLineStyle) -> bool {
+    ui.label("Line");
+    let before = *v;
+    egui::ComboBox::from_id_salt(salt)
+        .width(78.0)
+        .selected_text(match *v {
+            ArrowLineStyle::Solid => "Solid",
+            ArrowLineStyle::Dashed => "Dashed",
+            ArrowLineStyle::Dotted => "Dotted",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(v, ArrowLineStyle::Solid, "Solid");
+            ui.selectable_value(v, ArrowLineStyle::Dashed, "Dashed");
+            ui.selectable_value(v, ArrowLineStyle::Dotted, "Dotted");
+        });
+    *v != before
+}
+
+/// Head-style combo used in both the Arrow toolbar and the Select-edit
+/// panel. Returns `true` if the selection changed this frame.
+fn arrow_head_style_combo(ui: &mut egui::Ui, salt: &str, v: &mut ArrowHeadStyle) -> bool {
+    ui.label("Head");
+    let before = *v;
+    egui::ComboBox::from_id_salt(salt)
+        .width(92.0)
+        .selected_text(match *v {
+            ArrowHeadStyle::FilledTriangle => "Triangle",
+            ArrowHeadStyle::OutlineTriangle => "Outline",
+            ArrowHeadStyle::LineOnly => "Line",
+            ArrowHeadStyle::None => "None",
+            ArrowHeadStyle::DoubleEnded => "Double",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(v, ArrowHeadStyle::FilledTriangle, "Triangle (filled)");
+            ui.selectable_value(v, ArrowHeadStyle::OutlineTriangle, "Triangle (outline)");
+            ui.selectable_value(v, ArrowHeadStyle::LineOnly, "Line chevron");
+            ui.selectable_value(v, ArrowHeadStyle::None, "No head");
+            ui.selectable_value(v, ArrowHeadStyle::DoubleEnded, "Double-ended");
+        });
+    *v != before
 }
 
 /// Format an `egui::Color32` as `#RRGGBB` (ignoring alpha — arrows are opaque).
@@ -3689,6 +3925,7 @@ fn parse_hex(s: &str) -> Option<egui::Color32> {
     Some(egui::Color32::from_rgb(r, g, b))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_arrow_preview(
     painter: &egui::Painter,
     start: egui::Pos2,
@@ -3696,28 +3933,46 @@ fn draw_arrow_preview(
     color: egui::Color32,
     thickness_px: f32,
     shadow: bool,
+    line_style: ArrowLineStyle,
+    head_style: ArrowHeadStyle,
+    control: Option<egui::Pos2>,
 ) {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 1.0 { return; }
-    let ux = dx / len;
-    let uy = dy / len;
-    let px = -uy;
-    let py = ux;
+    let dx_full = end.x - start.x;
+    let dy_full = end.y - start.y;
+    if (dx_full * dx_full + dy_full * dy_full) < 1.0 { return; }
 
-    let head_len = (thickness_px * 4.0).max(10.0).min(len * 0.45);
+    // Sample the path once; shares the arc-length walker with the rasterize
+    // path so the previewed curve and the exported curve match 1:1.
+    let path: Vec<egui::Pos2> = if let Some(c) = control {
+        preview_sample_bezier(start, end, c, 64)
+    } else {
+        vec![start, end]
+    };
+    let cum = preview_cumulative_lengths(&path);
+    let total = *cum.last().unwrap_or(&0.0);
+    if total < 1.0 { return; }
+
+    let head_len = (thickness_px * 4.0).max(10.0).min(total * 0.45);
     let head_half = head_len * 0.55;
-    let shaft_end = egui::pos2(end.x - ux * head_len, end.y - uy * head_len);
 
-    // Shaft: proper AA line stroke (not a thin filled polygon). egui's line
-    // renderer handles arbitrary-angle sub-pixel coverage cleanly, which is
-    // the thing that was making oblique freehand arrows look soft.
+    let end_trim = match head_style {
+        ArrowHeadStyle::FilledTriangle
+        | ArrowHeadStyle::OutlineTriangle
+        | ArrowHeadStyle::DoubleEnded => head_len,
+        ArrowHeadStyle::LineOnly | ArrowHeadStyle::None => 0.0,
+    };
+    let start_trim = if matches!(head_style, ArrowHeadStyle::DoubleEnded) {
+        head_len
+    } else {
+        0.0
+    };
+    let shaft_lo = start_trim;
+    let shaft_hi = total - end_trim;
+
+    let tan_end = preview_tangent_end(&path);
+    let tan_start = preview_tangent_start(&path);
+
     if shadow {
-        // Shadow color is a darkened version of the arrow color, not pure
-        // black. This reads as a "shadow" on light backgrounds AND keeps a
-        // visible colored echo on dark ones (a red arrow gets a dark-red
-        // shadow that still contrasts with black).
         let off = (thickness_px * 0.35).max(2.0);
         let shadow_col = egui::Color32::from_rgba_unmultiplied(
             (color.r() as f32 * 0.3) as u8,
@@ -3725,37 +3980,186 @@ fn draw_arrow_preview(
             (color.b() as f32 * 0.3) as u8,
             170,
         );
-        painter.line_segment(
-            [
-                egui::pos2(start.x + off, start.y + off),
-                egui::pos2(shaft_end.x + off, shaft_end.y + off),
-            ],
-            egui::Stroke::new(thickness_px, shadow_col),
-        );
-        let head = vec![
-            egui::pos2(end.x + off, end.y + off),
-            egui::pos2(shaft_end.x + px * head_half + off, shaft_end.y + py * head_half + off),
-            egui::pos2(shaft_end.x - px * head_half + off, shaft_end.y - py * head_half + off),
-        ];
-        painter.add(egui::Shape::convex_polygon(head, shadow_col, egui::Stroke::NONE));
+        let off_v = egui::vec2(off, off);
+        let shadow_path: Vec<egui::Pos2> = path.iter().map(|p| *p + off_v).collect();
+        preview_shaft_path(painter, &shadow_path, &cum, thickness_px, shadow_col, line_style, shaft_lo, shaft_hi);
+        preview_head(painter, end + off_v, tan_end.0, tan_end.1, -tan_end.1, tan_end.0, head_len, head_half, thickness_px, shadow_col, head_style);
+        if matches!(head_style, ArrowHeadStyle::DoubleEnded) {
+            preview_head(painter, start + off_v, tan_start.0, tan_start.1, -tan_start.1, tan_start.0, head_len, head_half, thickness_px, shadow_col, ArrowHeadStyle::FilledTriangle);
+        }
     }
 
-    painter.line_segment(
-        [start, shaft_end],
-        egui::Stroke::new(thickness_px, color),
-    );
+    preview_shaft_path(painter, &path, &cum, thickness_px, color, line_style, shaft_lo, shaft_hi);
+    preview_head(painter, end, tan_end.0, tan_end.1, -tan_end.1, tan_end.0, head_len, head_half, thickness_px, color, head_style);
+    if matches!(head_style, ArrowHeadStyle::DoubleEnded) {
+        preview_head(painter, start, tan_start.0, tan_start.1, -tan_start.1, tan_start.0, head_len, head_half, thickness_px, color, ArrowHeadStyle::FilledTriangle);
+    }
+}
 
-    let head = vec![
-        end,
-        egui::pos2(shaft_end.x + px * head_half, shaft_end.y + py * head_half),
-        egui::pos2(shaft_end.x - px * head_half, shaft_end.y - py * head_half),
-    ];
-    painter.add(egui::Shape::convex_polygon(head, color, egui::Stroke::NONE));
+fn preview_sample_bezier(
+    start: egui::Pos2,
+    end: egui::Pos2,
+    control: egui::Pos2,
+    steps: usize,
+) -> Vec<egui::Pos2> {
+    let steps = steps.max(2);
+    let mut out = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let u = 1.0 - t;
+        out.push(egui::pos2(
+            u * u * start.x + 2.0 * u * t * control.x + t * t * end.x,
+            u * u * start.y + 2.0 * u * t * control.y + t * t * end.y,
+        ));
+    }
+    out
+}
+
+fn preview_cumulative_lengths(path: &[egui::Pos2]) -> Vec<f32> {
+    let mut out = vec![0.0; path.len()];
+    for i in 1..path.len() {
+        out[i] = out[i - 1] + (path[i] - path[i - 1]).length();
+    }
+    out
+}
+
+fn preview_tangent_end(path: &[egui::Pos2]) -> (f32, f32) {
+    let n = path.len();
+    let d = path[n - 1] - path[n - 2];
+    let len = d.length().max(1e-6);
+    (d.x / len, d.y / len)
+}
+
+fn preview_tangent_start(path: &[egui::Pos2]) -> (f32, f32) {
+    let d = path[0] - path[1];
+    let len = d.length().max(1e-6);
+    (d.x / len, d.y / len)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_shaft_path(
+    painter: &egui::Painter,
+    path: &[egui::Pos2],
+    cum: &[f32],
+    thickness: f32,
+    color: egui::Color32,
+    line_style: ArrowLineStyle,
+    lo: f32,
+    hi: f32,
+) {
+    match line_style {
+        ArrowLineStyle::Solid => preview_emit_arc_span(painter, path, cum, lo, hi, thickness, color),
+        ArrowLineStyle::Dashed => {
+            preview_dashed_along_path(painter, path, cum, lo, hi, thickness, color, thickness * 2.0, thickness);
+        }
+        ArrowLineStyle::Dotted => {
+            preview_dashed_along_path(painter, path, cum, lo, hi, thickness, color, thickness, thickness * 1.5);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_dashed_along_path(
+    painter: &egui::Painter,
+    path: &[egui::Pos2],
+    cum: &[f32],
+    arc_lo: f32,
+    arc_hi: f32,
+    thickness: f32,
+    color: egui::Color32,
+    dash: f32,
+    gap: f32,
+) {
+    let period = (dash + gap).max(0.01);
+    let mut t = arc_lo;
+    while t < arc_hi {
+        let lo = t;
+        let hi = (t + dash).min(arc_hi);
+        if hi > lo + 0.01 {
+            preview_emit_arc_span(painter, path, cum, lo, hi, thickness, color);
+        }
+        t += period;
+    }
+}
+
+fn preview_emit_arc_span(
+    painter: &egui::Painter,
+    path: &[egui::Pos2],
+    cum: &[f32],
+    lo: f32,
+    hi: f32,
+    thickness: f32,
+    color: egui::Color32,
+) {
+    if hi <= lo + 0.001 || path.len() < 2 { return; }
+    let n = path.len();
+    let stroke = egui::Stroke::new(thickness, color);
+    let mut i = 1;
+    while i < n && cum[i] <= lo { i += 1; }
+    if i >= n { return; }
+
+    let mut cur = lo;
+    while i < n {
+        let seg_end = cum[i];
+        let end_pos = seg_end.min(hi);
+        let a = preview_interp(&path[i - 1], &path[i], cum[i - 1], cum[i], cur);
+        let b = preview_interp(&path[i - 1], &path[i], cum[i - 1], cum[i], end_pos);
+        painter.line_segment([a, b], stroke);
+        if end_pos >= hi { return; }
+        cur = end_pos;
+        i += 1;
+    }
+}
+
+fn preview_interp(
+    a: &egui::Pos2, b: &egui::Pos2,
+    a_cum: f32, b_cum: f32,
+    d: f32,
+) -> egui::Pos2 {
+    let seg_len = (b_cum - a_cum).max(1e-6);
+    let t = ((d - a_cum) / seg_len).clamp(0.0, 1.0);
+    egui::pos2(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_head(
+    painter: &egui::Painter,
+    tip: egui::Pos2,
+    ux: f32, uy: f32,
+    px: f32, py: f32,
+    head_len: f32,
+    head_half: f32,
+    thickness: f32,
+    color: egui::Color32,
+    head_style: ArrowHeadStyle,
+) {
+    let base = egui::pos2(tip.x - ux * head_len, tip.y - uy * head_len);
+    let b = egui::pos2(base.x + px * head_half, base.y + py * head_half);
+    let c = egui::pos2(base.x - px * head_half, base.y - py * head_half);
+    match head_style {
+        ArrowHeadStyle::FilledTriangle | ArrowHeadStyle::DoubleEnded => {
+            painter.add(egui::Shape::convex_polygon(vec![tip, b, c], color, egui::Stroke::NONE));
+        }
+        ArrowHeadStyle::OutlineTriangle => {
+            let ot = (thickness * 0.7).max(1.5);
+            let stroke = egui::Stroke::new(ot, color);
+            painter.line_segment([tip, b], stroke);
+            painter.line_segment([b, c], stroke);
+            painter.line_segment([c, tip], stroke);
+        }
+        ArrowHeadStyle::LineOnly => {
+            let lt = thickness.max(1.5);
+            let stroke = egui::Stroke::new(lt, color);
+            painter.line_segment([tip, b], stroke);
+            painter.line_segment([tip, c], stroke);
+        }
+        ArrowHeadStyle::None => {}
+    }
 }
 
 fn apply_drag_to_node(node: &mut AnnotationNode, ah: &ActiveHandle, dx: f32, dy: f32) {
     match node {
-        AnnotationNode::Arrow { start, end, .. } => {
+        AnnotationNode::Arrow { start, end, control, .. } => {
             match ah.handle {
                 Handle::ArrowStart => {
                     start[0] = ah.start_rect[0] + dx;
@@ -3765,11 +4169,40 @@ fn apply_drag_to_node(node: &mut AnnotationNode, ah: &ActiveHandle, dx: f32, dy:
                     end[0] = ah.start_rect[2] + dx;
                     end[1] = ah.start_rect[3] + dy;
                 }
+                Handle::ArrowMid => {
+                    // Translating the curve's B(0.5) midpoint by (dx, dy)
+                    // requires moving the quadratic control by (2*dx, 2*dy)
+                    // (the B(0.5) coefficient on the control is 0.5, so we
+                    // double the delta to compensate).
+                    let initial = if let Some(AnnotationNode::Arrow {
+                        control: Some(c0), ..
+                    }) = &ah.before
+                    {
+                        *c0
+                    } else {
+                        // Arrow was straight: the "initial control" equals
+                        // the line midpoint, which makes the formula below
+                        // collapse to `line_mid + 2*delta` — i.e., the new
+                        // control is exactly where it needs to be for the
+                        // curve's B(0.5) to follow the cursor.
+                        [
+                            0.5 * (ah.start_rect[0] + ah.start_rect[2]),
+                            0.5 * (ah.start_rect[1] + ah.start_rect[3]),
+                        ]
+                    };
+                    *control = Some([initial[0] + 2.0 * dx, initial[1] + 2.0 * dy]);
+                }
                 Handle::Body => {
                     start[0] = ah.start_rect[0] + dx;
                     start[1] = ah.start_rect[1] + dy;
                     end[0] = ah.start_rect[2] + dx;
                     end[1] = ah.start_rect[3] + dy;
+                    // Translate the control point along with start/end so
+                    // the curve shape stays fixed relative to the arrow
+                    // during a body drag.
+                    if let Some(AnnotationNode::Arrow { control: Some(c0), .. }) = &ah.before {
+                        *control = Some([c0[0] + dx, c0[1] + dy]);
+                    }
                 }
                 _ => {}
             }

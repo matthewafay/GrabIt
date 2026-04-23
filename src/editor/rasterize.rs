@@ -6,9 +6,11 @@
 
 use crate::capture::CaptureMetadata;
 use crate::editor::document::{
-    AnnotationNode, Border, CaptureInfoPosition, CaptureInfoStyle, Edge, EdgeEffect, FieldKind,
-    ShapeKind, StampSource, TextAlign, TextListStyle,
+    AnnotationNode, ArrowHeadStyle, ArrowLineStyle, Border, CaptureInfoPosition,
+    CaptureInfoStyle, Edge, EdgeEffect, FieldKind, ShapeKind, StampSource,
+    TextAlign, TextListStyle,
 };
+use crate::editor::tools::selection::sample_bezier;
 use crate::editor::tools::stamp;
 use crate::platform::fonts::JETBRAINS_MONO_REGULAR;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
@@ -38,8 +40,15 @@ pub fn flatten(
     let mut out = base.clone();
     for node in annotations {
         match node {
-            AnnotationNode::Arrow { start, end, color, thickness, shadow, .. } => {
-                draw_arrow(&mut out, *start, *end, *color, *thickness, *shadow);
+            AnnotationNode::Arrow {
+                start, end, color, thickness, shadow,
+                line_style, head_style, control,
+                ..
+            } => {
+                draw_arrow(
+                    &mut out, *start, *end, *color, *thickness, *shadow,
+                    *line_style, *head_style, *control,
+                );
             }
             AnnotationNode::Text {
                 rect, text, color, size_px, frosted, shadow, align, list, ..
@@ -118,8 +127,12 @@ pub fn apply_document_effects(
 // Arrow
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Render an arrow (shaft + triangular head) on `canvas`. If `shadow` is
-/// true, a darkened translucent copy is drawn first at a small offset.
+/// Render an arrow (shaft + head) on `canvas`. If `shadow` is true, a
+/// darkened tint of the arrow's colour is drawn first at a small offset.
+/// Rasterized through 4× supersampling (16 samples per output pixel) so
+/// oblique edges read as smooth rather than pixel-jagged. `control`
+/// promotes the shaft from a straight line to a quadratic bezier.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_arrow(
     canvas: &mut RgbaImage,
     start: [f32; 2],
@@ -127,29 +140,144 @@ pub fn draw_arrow(
     color: [u8; 4],
     thickness: f32,
     shadow: bool,
+    line_style: ArrowLineStyle,
+    head_style: ArrowHeadStyle,
+    control: Option<[f32; 2]>,
 ) {
-    let sx = start[0]; let sy = start[1];
-    let ex = end[0]; let ey = end[1];
-    let dx = ex - sx;
-    let dy = ey - sy;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 1.0 { return; }
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    if (dx * dx + dy * dy) < 1.0 { return; }
 
-    let ux = dx / len;
-    let uy = dy / len;
-    let px = -uy;
-    let py = ux;
+    // AABB: pad generously for the head's perpendicular extent, the shaft
+    // thickness, the shadow offset, and the control point if present (a
+    // quadratic bezier is fully contained by the convex hull of its three
+    // anchor points).
+    let head_len_est = (thickness * 4.0).max(14.0);
+    let head_half = head_len_est * 0.55;
+    let shadow_off = if shadow { (thickness * 0.35).max(2.0) } else { 0.0 };
+    let pad = (thickness * 0.5 + head_half).max(thickness + 2.0) + shadow_off + 2.0;
 
-    let head_len = (thickness * 4.0).max(14.0).min(len * 0.45);
+    let mut minx = start[0].min(end[0]);
+    let mut miny = start[1].min(end[1]);
+    let mut maxx = start[0].max(end[0]);
+    let mut maxy = start[1].max(end[1]);
+    if let Some(c) = control {
+        minx = minx.min(c[0]);
+        miny = miny.min(c[1]);
+        maxx = maxx.max(c[0]);
+        maxy = maxy.max(c[1]);
+    }
+    let (minx, miny, maxx, maxy) = (minx - pad, miny - pad, maxx + pad, maxy + pad);
+
+    let (cw, ch) = canvas.dimensions();
+    let x0 = (minx.floor() as i32).max(0) as u32;
+    let y0 = (miny.floor() as i32).max(0) as u32;
+    let x1 = (maxx.ceil() as i32).min(cw as i32).max(0) as u32;
+    let y1 = (maxy.ceil() as i32).min(ch as i32).max(0) as u32;
+    if x1 <= x0 || y1 <= y0 { return; }
+
+    let sub_w = x1 - x0;
+    let sub_h = y1 - y0;
+    const SSAA: u32 = 4;
+    let mut hi = RgbaImage::new(sub_w * SSAA, sub_h * SSAA);
+
+    let shift = |p: [f32; 2]| -> [f32; 2] {
+        [
+            (p[0] - x0 as f32) * SSAA as f32,
+            (p[1] - y0 as f32) * SSAA as f32,
+        ]
+    };
+    draw_arrow_aliased(
+        &mut hi,
+        shift(start),
+        shift(end),
+        color,
+        thickness * SSAA as f32,
+        shadow,
+        line_style,
+        head_style,
+        control.map(shift),
+    );
+
+    // Downsample SSAA×SSAA → 1 by averaging RGBA, then alpha-blend onto canvas.
+    let n = (SSAA * SSAA) as u32;
+    for dy in 0..sub_h {
+        for dx in 0..sub_w {
+            let mut sum: [u32; 4] = [0, 0, 0, 0];
+            for oy in 0..SSAA {
+                for ox in 0..SSAA {
+                    let p = hi.get_pixel(dx * SSAA + ox, dy * SSAA + oy).0;
+                    sum[0] += p[0] as u32;
+                    sum[1] += p[1] as u32;
+                    sum[2] += p[2] as u32;
+                    sum[3] += p[3] as u32;
+                }
+            }
+            let avg = [
+                (sum[0] / n) as u8,
+                (sum[1] / n) as u8,
+                (sum[2] / n) as u8,
+                (sum[3] / n) as u8,
+            ];
+            if avg[3] > 0 {
+                blend_pixel(canvas, x0 + dx, y0 + dy, avg);
+            }
+        }
+    }
+}
+
+/// Aliased arrow draw (no SSAA wrapper). Supports all line styles, head
+/// styles, and an optional bezier curve. Called at 4× resolution inside the
+/// SSAA sub-image.
+#[allow(clippy::too_many_arguments)]
+fn draw_arrow_aliased(
+    canvas: &mut RgbaImage,
+    start: [f32; 2],
+    end: [f32; 2],
+    color: [u8; 4],
+    thickness: f32,
+    shadow: bool,
+    line_style: ArrowLineStyle,
+    head_style: ArrowHeadStyle,
+    control: Option<[f32; 2]>,
+) {
+    // Sample path (2 points for straight, 64 for curves) and compute
+    // cumulative arc lengths so we can trim by distance.
+    let path = if let Some(c) = control {
+        sample_bezier(start, end, c, 64)
+    } else {
+        vec![start, end]
+    };
+    let cum = cumulative_lengths(&path);
+    let total = *cum.last().unwrap_or(&0.0);
+    if total < 1.0 { return; }
+
+    let head_len = (thickness * 4.0).max(14.0).min(total * 0.45);
     let head_half = head_len * 0.55;
 
-    let shaft_ex = ex - ux * head_len;
-    let shaft_ey = ey - uy * head_len;
-    let ht = (thickness * 0.5).max(0.5);
+    // Trim the shaft's arc-length range so filled/outlined triangles
+    // don't bleed through from underneath.
+    let end_trim = match head_style {
+        ArrowHeadStyle::FilledTriangle
+        | ArrowHeadStyle::OutlineTriangle
+        | ArrowHeadStyle::DoubleEnded => head_len,
+        ArrowHeadStyle::LineOnly | ArrowHeadStyle::None => 0.0,
+    };
+    let start_trim = if matches!(head_style, ArrowHeadStyle::DoubleEnded) {
+        head_len
+    } else {
+        0.0
+    };
+    let shaft_lo = start_trim;
+    let shaft_hi = total - end_trim;
+
+    // Tangent at path end (for head direction). For straight arrows this is
+    // just (end - start) / len; for curves it's 2*(end - control) per the
+    // quadratic bezier derivative at t=1.
+    let tan_end = path_tangent_end(&path);
+    let tan_start = path_tangent_start(&path);
 
     if shadow {
-        // Darkened version of the arrow's own colour — see the matching
-        // branch in `draw_arrow_preview` for rationale. Matches WYSIWYG.
         let off = (thickness * 0.35).max(2.0);
         let shadow_col: [u8; 4] = [
             (color[0] as f32 * 0.3) as u8,
@@ -157,47 +285,211 @@ pub fn draw_arrow(
             (color[2] as f32 * 0.3) as u8,
             170,
         ];
-        fill_convex_polygon(
-            canvas,
-            &[
-                [sx + px * ht + off, sy + py * ht + off],
-                [sx - px * ht + off, sy - py * ht + off],
-                [shaft_ex - px * ht + off, shaft_ey - py * ht + off],
-                [shaft_ex + px * ht + off, shaft_ey + py * ht + off],
-            ],
-            shadow_col,
+        let shadow_path: Vec<[f32; 2]> =
+            path.iter().map(|p| [p[0] + off, p[1] + off]).collect();
+        // cum unchanged — offsetting doesn't change arc lengths.
+        draw_shaft_path(
+            canvas, &shadow_path, &cum, thickness, shadow_col, line_style,
+            shaft_lo, shaft_hi,
         );
-        fill_convex_polygon(
-            canvas,
-            &[
-                [ex + off, ey + off],
-                [shaft_ex + px * head_half + off, shaft_ey + py * head_half + off],
-                [shaft_ex - px * head_half + off, shaft_ey - py * head_half + off],
-            ],
-            shadow_col,
+        draw_head(
+            canvas, [end[0] + off, end[1] + off],
+            tan_end[0], tan_end[1], -tan_end[1], tan_end[0],
+            head_len, head_half, thickness, shadow_col, head_style,
         );
+        if matches!(head_style, ArrowHeadStyle::DoubleEnded) {
+            draw_head(
+                canvas, [start[0] + off, start[1] + off],
+                tan_start[0], tan_start[1], -tan_start[1], tan_start[0],
+                head_len, head_half, thickness, shadow_col,
+                ArrowHeadStyle::FilledTriangle,
+            );
+        }
     }
 
-    fill_convex_polygon(
-        canvas,
-        &[
-            [sx + px * ht, sy + py * ht],
-            [sx - px * ht, sy - py * ht],
-            [shaft_ex - px * ht, shaft_ey - py * ht],
-            [shaft_ex + px * ht, shaft_ey + py * ht],
-        ],
-        color,
+    draw_shaft_path(canvas, &path, &cum, thickness, color, line_style, shaft_lo, shaft_hi);
+    draw_head(
+        canvas, end,
+        tan_end[0], tan_end[1], -tan_end[1], tan_end[0],
+        head_len, head_half, thickness, color, head_style,
     );
+    if matches!(head_style, ArrowHeadStyle::DoubleEnded) {
+        draw_head(
+            canvas, start,
+            tan_start[0], tan_start[1], -tan_start[1], tan_start[0],
+            head_len, head_half, thickness, color,
+            ArrowHeadStyle::FilledTriangle,
+        );
+    }
+}
 
-    fill_convex_polygon(
-        canvas,
-        &[
-            [ex, ey],
-            [shaft_ex + px * head_half, shaft_ey + py * head_half],
-            [shaft_ex - px * head_half, shaft_ey - py * head_half],
-        ],
-        color,
-    );
+/// Cumulative polyline arc lengths. `cum[0] = 0`, `cum[i]` = distance
+/// along the polyline from `path[0]` to `path[i]`.
+fn cumulative_lengths(path: &[[f32; 2]]) -> Vec<f32> {
+    let mut out = vec![0.0; path.len()];
+    for i in 1..path.len() {
+        let dx = path[i][0] - path[i - 1][0];
+        let dy = path[i][1] - path[i - 1][1];
+        out[i] = out[i - 1] + (dx * dx + dy * dy).sqrt();
+    }
+    out
+}
+
+/// Unit tangent at the path's final point, pointing forward (into the tip).
+fn path_tangent_end(path: &[[f32; 2]]) -> [f32; 2] {
+    let n = path.len();
+    let a = path[n - 2];
+    let b = path[n - 1];
+    let d = [b[0] - a[0], b[1] - a[1]];
+    let len = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
+    [d[0] / len, d[1] / len]
+}
+
+/// Unit tangent at the path's first point, pointing BACKWARD (away from
+/// the curve — into the start-side head tip for DoubleEnded).
+fn path_tangent_start(path: &[[f32; 2]]) -> [f32; 2] {
+    let a = path[0];
+    let b = path[1];
+    let d = [a[0] - b[0], a[1] - b[1]];
+    let len = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
+    [d[0] / len, d[1] / len]
+}
+
+/// Stroke a portion of a polyline (arc range `[lo, hi]`) with the given
+/// line style. Round caps and dash pattern survive through curves because
+/// we walk arc length rather than segments.
+#[allow(clippy::too_many_arguments)]
+fn draw_shaft_path(
+    canvas: &mut RgbaImage,
+    path: &[[f32; 2]],
+    cum: &[f32],
+    thickness: f32,
+    color: [u8; 4],
+    line_style: ArrowLineStyle,
+    lo: f32,
+    hi: f32,
+) {
+    match line_style {
+        ArrowLineStyle::Solid => {
+            emit_arc_span(canvas, path, cum, lo, hi, thickness, color);
+        }
+        ArrowLineStyle::Dashed => {
+            stroke_dashed_along_path(canvas, path, cum, lo, hi, thickness, color, thickness * 2.0, thickness);
+        }
+        ArrowLineStyle::Dotted => {
+            stroke_dashed_along_path(canvas, path, cum, lo, hi, thickness, color, thickness, thickness * 1.5);
+        }
+    }
+}
+
+/// Dashed stroke along a polyline arc. Walks in (dash + gap) periods;
+/// for each period, emits a capsule-stroked arc span of length `dash`.
+#[allow(clippy::too_many_arguments)]
+fn stroke_dashed_along_path(
+    canvas: &mut RgbaImage,
+    path: &[[f32; 2]],
+    cum: &[f32],
+    arc_lo: f32,
+    arc_hi: f32,
+    thickness: f32,
+    color: [u8; 4],
+    dash: f32,
+    gap: f32,
+) {
+    let period = (dash + gap).max(0.01);
+    let mut t = arc_lo;
+    while t < arc_hi {
+        let lo = t;
+        let hi = (t + dash).min(arc_hi);
+        if hi > lo + 0.01 {
+            emit_arc_span(canvas, path, cum, lo, hi, thickness, color);
+        }
+        t += period;
+    }
+}
+
+/// Stroke every polyline segment that intersects the arc-length span
+/// `[lo, hi]` with round-capped capsules. Partial-coverage segments are
+/// trimmed to the arc span.
+fn emit_arc_span(
+    canvas: &mut RgbaImage,
+    path: &[[f32; 2]],
+    cum: &[f32],
+    lo: f32,
+    hi: f32,
+    thickness: f32,
+    color: [u8; 4],
+) {
+    if hi <= lo + 0.001 || path.len() < 2 { return; }
+    let n = path.len();
+    // Find first segment index whose end exceeds `lo`.
+    let mut i = 1;
+    while i < n && cum[i] <= lo { i += 1; }
+    if i >= n { return; }
+
+    let mut cur = lo;
+    while i < n {
+        let seg_end = cum[i];
+        let end_pos = seg_end.min(hi);
+        let a = interp_on_segment(&path[i - 1], &path[i], cum[i - 1], cum[i], cur);
+        let b = interp_on_segment(&path[i - 1], &path[i], cum[i - 1], cum[i], end_pos);
+        stroke_segment(canvas, a, b, thickness, color);
+        if end_pos >= hi { return; }
+        cur = end_pos;
+        i += 1;
+    }
+}
+
+/// Interpolate a point at arc distance `d` within a single polyline
+/// segment. `a_cum` / `b_cum` are the segment endpoints' cumulative arc
+/// lengths; `d` is expected to lie within `[a_cum, b_cum]`.
+fn interp_on_segment(
+    a: &[f32; 2], b: &[f32; 2],
+    a_cum: f32, b_cum: f32,
+    d: f32,
+) -> [f32; 2] {
+    let seg_len = (b_cum - a_cum).max(1e-6);
+    let t = ((d - a_cum) / seg_len).clamp(0.0, 1.0);
+    [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]
+}
+
+/// Draw the head for one end of an arrow.
+/// `tip` = the outermost point the head converges to.
+/// `(ux, uy)` = forward unit vector pointing into the tip (from shaft toward tip).
+/// `(px, py)` = perpendicular unit (90° CCW of forward).
+#[allow(clippy::too_many_arguments)]
+fn draw_head(
+    canvas: &mut RgbaImage,
+    tip: [f32; 2],
+    ux: f32, uy: f32,
+    px: f32, py: f32,
+    head_len: f32,
+    head_half: f32,
+    thickness: f32,
+    color: [u8; 4],
+    head_style: ArrowHeadStyle,
+) {
+    let base_x = tip[0] - ux * head_len;
+    let base_y = tip[1] - uy * head_len;
+    let b = [base_x + px * head_half, base_y + py * head_half];
+    let c = [base_x - px * head_half, base_y - py * head_half];
+    match head_style {
+        ArrowHeadStyle::FilledTriangle | ArrowHeadStyle::DoubleEnded => {
+            fill_convex_polygon(canvas, &[tip, b, c], color);
+        }
+        ArrowHeadStyle::OutlineTriangle => {
+            let ot = (thickness * 0.7).max(1.5);
+            stroke_segment(canvas, tip, b, ot, color);
+            stroke_segment(canvas, b, c, ot, color);
+            stroke_segment(canvas, c, tip, ot, color);
+        }
+        ArrowHeadStyle::LineOnly => {
+            let lt = thickness.max(1.5);
+            stroke_segment(canvas, tip, b, lt, color);
+            stroke_segment(canvas, tip, c, lt, color);
+        }
+        ArrowHeadStyle::None => {}
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

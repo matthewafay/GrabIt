@@ -95,6 +95,31 @@ pub struct MonitorInfo {
 /// backend, attaches a cursor layer if requested, and returns the result.
 /// Returns `Ok(None)` if the user cancelled the interactive selector.
 pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
+    // Annotate flow (allow_windows = false): capture-first, then show a
+    // frozen overlay painted with that capture so any transient UI (tray
+    // popups, context menus, hover tooltips) is preserved in the final
+    // image even after focus moves to the overlay and dismisses it. The
+    // selected region is cropped out of the already-captured bitmap — we
+    // never do a second BitBlt.
+    if let CaptureTarget::Interactive { allow_windows: false } = req.target {
+        let cursor = if req.include_cursor {
+            cursor::sample().ok().flatten()
+        } else {
+            None
+        };
+        let (frozen, frozen_rect) = gdi::capture_virtual_desktop()
+            .context("GDI fullscreen capture for frozen overlay")?;
+        let region = match region::select_on_frozen(&frozen)? {
+            region::RegionResult::Region(r) => r,
+            region::RegionResult::Window(_) | region::RegionResult::Cancelled => {
+                // Window pick is disabled in frozen mode; any other variant
+                // counts as a cancel.
+                return Ok(None);
+            }
+        };
+        return Ok(Some(assemble_from_frozen(frozen, frozen_rect, region, cursor)));
+    }
+
     // Resolve Interactive / ExactDims / Object before the delay/countdown
     // so the overlay's closing does not flash into the output.
     let resolved_target = match req.target.clone() {
@@ -168,6 +193,57 @@ pub fn perform(req: CaptureRequest) -> Result<Option<CaptureResult>> {
     });
 
     Ok(Some(CaptureResult { base, cursor, metadata }))
+}
+
+/// Crop a pre-captured virtual-desktop bitmap down to the user's selected
+/// region and build a `CaptureResult`. Used by the capture-first annotate
+/// path so the overlay isn't allowed to race the bitmap (transient UI
+/// stays inside the captured pixels).
+fn assemble_from_frozen(
+    frozen: RgbaImage,
+    frozen_rect: Rect,
+    region: Rect,
+    cursor: Option<CursorLayer>,
+) -> CaptureResult {
+    // Express the region in the bitmap's coordinate space (the bitmap was
+    // captured starting at frozen_rect.x/y). Clamp to stay inside the
+    // bitmap bounds even if the user drags off-screen.
+    let src_x = (region.x - frozen_rect.x).max(0);
+    let src_y = (region.y - frozen_rect.y).max(0);
+    let max_w = frozen.width() as i32 - src_x;
+    let max_h = frozen.height() as i32 - src_y;
+    let w = (region.width as i32).min(max_w).max(1) as u32;
+    let h = (region.height as i32).min(max_h).max(1) as u32;
+
+    let base = image::imageops::crop_imm(&frozen, src_x as u32, src_y as u32, w, h)
+        .to_image();
+
+    let adjusted_rect = Rect { x: region.x, y: region.y, width: w, height: h };
+
+    let metadata = CaptureMetadata {
+        captured_at: Utc::now(),
+        foreground_title: platform::foreground_window_title(),
+        foreground_process: platform::foreground_process_name(),
+        os_version: platform::os_version_string(),
+        monitors: platform::enumerate_monitors(),
+        capture_rect: adjusted_rect,
+    };
+
+    let cursor = cursor.and_then(|mut c| {
+        c.x -= adjusted_rect.x;
+        c.y -= adjusted_rect.y;
+        if c.x + c.image.width() as i32 <= 0
+            || c.y + c.image.height() as i32 <= 0
+            || c.x >= adjusted_rect.width as i32
+            || c.y >= adjusted_rect.height as i32
+        {
+            None
+        } else {
+            Some(c)
+        }
+    });
+
+    CaptureResult { base, cursor, metadata }
 }
 
 mod platform {

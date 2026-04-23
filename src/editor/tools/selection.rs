@@ -29,7 +29,7 @@ pub type BBox = [f32; 4];
 /// direction. `CalloutTail` is the callout balloon's tail tip. `MagnifySource`
 /// grabs the source rect of a `Magnify` node (center drag only — we don't
 /// resize the source from the UI to keep the UX simple).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Handle {
     Body,
     N, S, E, W,
@@ -39,6 +39,9 @@ pub enum Handle {
     /// Arrow endpoints — arrows aren't rect-shaped.
     ArrowStart,
     ArrowEnd,
+    /// Arrow mid-control handle. Dragging it bends a straight arrow into a
+    /// quadratic bezier; dragging back near the line midpoint straightens.
+    ArrowMid,
 }
 
 /// Compute the bounding rect for an annotation, or `None` if the node has
@@ -46,13 +49,18 @@ pub enum Handle {
 /// approximate text as an `size_px`-tall block starting at `position`).
 pub fn bounds_of_node(node: &AnnotationNode) -> Option<BBox> {
     match node {
-        AnnotationNode::Arrow { start, end, .. } => {
-            Some([
-                start[0].min(end[0]),
-                start[1].min(end[1]),
-                start[0].max(end[0]),
-                start[1].max(end[1]),
-            ])
+        AnnotationNode::Arrow { start, end, control, .. } => {
+            // Include the bezier control point when present — the curve is
+            // bounded by the convex hull of {start, control, end}.
+            let (mut minx, mut miny) = (start[0].min(end[0]), start[1].min(end[1]));
+            let (mut maxx, mut maxy) = (start[0].max(end[0]), start[1].max(end[1]));
+            if let Some(c) = control {
+                minx = minx.min(c[0]);
+                miny = miny.min(c[1]);
+                maxx = maxx.max(c[0]);
+                maxy = maxy.max(c[1]);
+            }
+            Some([minx, miny, maxx, maxy])
         }
         AnnotationNode::Text { rect, .. } => {
             // Text is now a drag-created box — the stored rect IS the
@@ -136,6 +144,27 @@ pub fn drag_rect(bbox: BBox, handle: Handle, dx: f32, dy: f32) -> BBox {
 pub fn hit_bbox(p: [f32; 2], bbox: BBox) -> bool {
     let n = normalise(bbox);
     p[0] >= n[0] && p[0] <= n[2] && p[1] >= n[1] && p[1] <= n[3]
+}
+
+/// Sample a quadratic bezier from `start` through `control` to `end` into
+/// `steps + 1` polyline points. Shared by rasterize, preview, and hit-test.
+pub fn sample_bezier(
+    start: [f32; 2],
+    end: [f32; 2],
+    control: [f32; 2],
+    steps: usize,
+) -> Vec<[f32; 2]> {
+    let steps = steps.max(2);
+    let mut out = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let u = 1.0 - t;
+        out.push([
+            u * u * start[0] + 2.0 * u * t * control[0] + t * t * end[0],
+            u * u * start[1] + 2.0 * u * t * control[1] + t * t * end[1],
+        ]);
+    }
+    out
 }
 
 /// Point-to-segment squared distance. Used for Arrow hit-testing.

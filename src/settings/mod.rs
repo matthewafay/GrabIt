@@ -32,10 +32,6 @@ pub struct Settings {
     /// Override the capture output directory. `None` = default
     /// `%USERPROFILE%\Pictures\GrabIt`.
     pub output_dir: Option<String>,
-    /// When on, **holding Shift** while dragging an arrow snaps its angle to
-    /// 15° increments and pixel-snaps the endpoints. Freehand otherwise — no
-    /// auto-snap. Set to false to make Shift do nothing special.
-    pub arrow_angle_snap: bool,
     /// New arrows default to shadow = true when this is on. Per-arrow
     /// `shadow` field still rules the final render — this only seeds the
     /// default at creation time.
@@ -54,7 +50,6 @@ impl Default for Settings {
             include_cursor: true,
             copy_to_clipboard: true,
             output_dir: None,
-            arrow_angle_snap: true,
             arrow_shadow: true,
             arrow_advanced_color: false,
         }

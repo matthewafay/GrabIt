@@ -229,16 +229,19 @@ impl Drop for Registrar {
     }
 }
 
-pub fn on_event(ev: GlobalHotKeyEvent, cmd_tx: &Sender<Command>) {
+/// Return the `Command` this hotkey event maps to, or `None` for events
+/// we don't bind (key release, unknown id). The worker thread decides
+/// whether to run the command inline (captures) or forward to the main
+/// loop (everything else).
+pub fn command_for_event(ev: &GlobalHotKeyEvent) -> Option<Command> {
     if ev.state != HotKeyState::Pressed {
-        return;
+        return None;
     }
     let guard = DISPATCH.lock();
-    if let Some((_, cmd)) = guard.iter().find(|(id, _)| *id == ev.id) {
-        if let Err(e) = cmd_tx.send(cmd.clone()) {
-            warn!("hotkey command send failed: {e}");
-        }
-    }
+    guard
+        .iter()
+        .find(|(id, _)| *id == ev.id)
+        .map(|(_, cmd)| cmd.clone())
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -325,6 +325,9 @@ mod tests {
             color: [10, 20, 30, 255],
             thickness: 2.0,
             shadow: false,
+            line_style: Default::default(),
+            head_style: Default::default(),
+            control: None,
         }
     }
 
