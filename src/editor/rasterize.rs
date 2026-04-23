@@ -38,8 +38,8 @@ pub fn flatten(
     let mut out = base.clone();
     for node in annotations {
         match node {
-            AnnotationNode::Arrow { start, end, color, thickness, .. } => {
-                draw_arrow(&mut out, *start, *end, *color, *thickness);
+            AnnotationNode::Arrow { start, end, color, thickness, shadow, .. } => {
+                draw_arrow(&mut out, *start, *end, *color, *thickness, *shadow);
             }
             AnnotationNode::Text {
                 rect, text, color, size_px, frosted, shadow, align, list, ..
@@ -118,13 +118,15 @@ pub fn apply_document_effects(
 // Arrow
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Render an arrow (shaft + triangular head) on `canvas`.
+/// Render an arrow (shaft + triangular head) on `canvas`. If `shadow` is
+/// true, a darkened translucent copy is drawn first at a small offset.
 pub fn draw_arrow(
     canvas: &mut RgbaImage,
     start: [f32; 2],
     end: [f32; 2],
     color: [u8; 4],
     thickness: f32,
+    shadow: bool,
 ) {
     let sx = start[0]; let sy = start[1];
     let ex = end[0]; let ey = end[1];
@@ -144,6 +146,37 @@ pub fn draw_arrow(
     let shaft_ex = ex - ux * head_len;
     let shaft_ey = ey - uy * head_len;
     let ht = (thickness * 0.5).max(0.5);
+
+    if shadow {
+        // Darkened version of the arrow's own colour — see the matching
+        // branch in `draw_arrow_preview` for rationale. Matches WYSIWYG.
+        let off = (thickness * 0.35).max(2.0);
+        let shadow_col: [u8; 4] = [
+            (color[0] as f32 * 0.3) as u8,
+            (color[1] as f32 * 0.3) as u8,
+            (color[2] as f32 * 0.3) as u8,
+            170,
+        ];
+        fill_convex_polygon(
+            canvas,
+            &[
+                [sx + px * ht + off, sy + py * ht + off],
+                [sx - px * ht + off, sy - py * ht + off],
+                [shaft_ex - px * ht + off, shaft_ey - py * ht + off],
+                [shaft_ex + px * ht + off, shaft_ey + py * ht + off],
+            ],
+            shadow_col,
+        );
+        fill_convex_polygon(
+            canvas,
+            &[
+                [ex + off, ey + off],
+                [shaft_ex + px * head_half + off, shaft_ey + py * head_half + off],
+                [shaft_ex - px * head_half + off, shaft_ey - py * head_half + off],
+            ],
+            shadow_col,
+        );
+    }
 
     fill_convex_polygon(
         canvas,

@@ -136,9 +136,10 @@ fn run_editor_subprocess(
         .unwrap_or_else(|| grabit_path.with_extension("png"));
     let document = editor::document::load(&grabit_path)
         .with_context(|| format!("load sidecar {}", grabit_path.display()))?;
+    let settings = settings::Settings::load_or_default(&paths);
 
     info!("editor subprocess → {}", grabit_path.display());
-    editor::run_blocking(document, png_path, grabit_path, clipboard, paths)
+    editor::run_blocking(document, png_path, grabit_path, clipboard, paths, settings)
 }
 
 fn init_logging(log_file: &std::path::Path) {

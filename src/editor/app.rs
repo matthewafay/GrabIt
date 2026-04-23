@@ -250,6 +250,26 @@ pub struct EditorApp {
     style_draft_name: String,
     /// Whether the right-hand inspector shows presets or document effects.
     inspector_tab: InspectorTab,
+
+    /// Snap arrow angle to 15° on drag (Shift bypasses). Sourced from
+    /// `Settings.arrow_angle_snap` at editor launch; refreshed live on each
+    /// `settings.json` mtime change.
+    arrow_angle_snap: bool,
+    /// Seed for the `shadow` flag on newly-drawn arrows. Sourced from
+    /// `Settings.arrow_shadow`; refreshed live on `settings.json` mtime
+    /// change. Per-arrow field rules the render — this only seeds new nodes.
+    arrow_shadow_default: bool,
+    /// Last-observed mtime of `settings.json`. Used to detect when the
+    /// Settings subprocess saves so the open editor can pick up new values
+    /// without needing a restart.
+    settings_mtime: Option<std::time::SystemTime>,
+    /// Arrow color UI: simple 8-swatch palette when false, full picker +
+    /// hex input when true. Sourced from `Settings.arrow_advanced_color`
+    /// with live-reload.
+    arrow_advanced_color: bool,
+    /// Buffer for the hex text input in advanced color mode. Re-synced from
+    /// `self.color` every frame unless the user is actively typing in it.
+    hex_color_buffer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,11 +286,15 @@ impl EditorApp {
         grabit_path: PathBuf,
         copy_to_clipboard: bool,
         paths: AppPaths,
+        settings: crate::settings::Settings,
     ) -> Self {
         let resize_width = document.base_width;
         let resize_height = document.base_height;
         let preset_store = PresetStore::load(&paths);
         let style_store = StyleStore::load(&paths);
+        let settings_mtime = std::fs::metadata(paths.settings_file())
+            .and_then(|m| m.modified())
+            .ok();
         Self {
             document,
             history: History::new(),
@@ -318,7 +342,26 @@ impl EditorApp {
             style_store,
             style_draft_name: String::new(),
             inspector_tab: InspectorTab::Document,
+            arrow_angle_snap: settings.arrow_angle_snap,
+            arrow_shadow_default: settings.arrow_shadow,
+            settings_mtime,
+            arrow_advanced_color: settings.arrow_advanced_color,
+            hex_color_buffer: format_hex(egui::Color32::from_rgb(220, 40, 40)),
         }
+    }
+
+    /// Re-read `settings.json` if its mtime has changed since last poll.
+    /// Called each frame in `update`; stat is cheap enough to do unthrottled.
+    fn poll_settings_reload(&mut self) {
+        let path = self.paths.settings_file();
+        let Ok(meta) = std::fs::metadata(&path) else { return };
+        let Ok(mt) = meta.modified() else { return };
+        if self.settings_mtime == Some(mt) { return; }
+        self.settings_mtime = Some(mt);
+        let s = crate::settings::Settings::load_or_default(&self.paths);
+        self.arrow_angle_snap = s.arrow_angle_snap;
+        self.arrow_shadow_default = s.arrow_shadow;
+        self.arrow_advanced_color = s.arrow_advanced_color;
     }
 
     fn ensure_image_loaded(&mut self, ctx: &egui::Context) -> bool {
@@ -535,7 +578,31 @@ impl EditorApp {
             ui.separator();
 
             ui.label("Color");
-            ui.color_edit_button_srgba(&mut self.color);
+            if matches!(self.tool, Tool::Arrow) && !self.arrow_advanced_color {
+                // Simple mode: 8 preset swatches, no free picker / hex.
+                draw_arrow_swatches(ui, &mut self.color);
+            } else {
+                ui.color_edit_button_srgba(&mut self.color);
+                if matches!(self.tool, Tool::Arrow) {
+                    // Advanced mode: hex field alongside the picker. Re-sync
+                    // the buffer from self.color whenever the user is NOT
+                    // actively typing in it — so external color changes
+                    // (picker / swatches / style apply) show up here, but
+                    // in-progress typing isn't clobbered mid-keystroke.
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.hex_color_buffer)
+                            .desired_width(76.0)
+                            .hint_text("#RRGGBB"),
+                    );
+                    if resp.changed() {
+                        if let Some(c) = parse_hex(&self.hex_color_buffer) {
+                            self.color = c;
+                        }
+                    } else if !resp.has_focus() {
+                        self.hex_color_buffer = format_hex(self.color);
+                    }
+                }
+            }
 
             if matches!(self.tool, Tool::Rect | Tool::Ellipse | Tool::Callout | Tool::Magnify) {
                 ui.label("Stroke");
@@ -547,6 +614,8 @@ impl EditorApp {
                 Tool::Arrow => {
                     ui.label("Thickness");
                     ui.add(egui::Slider::new(&mut self.thickness, 1.0..=40.0));
+                    // Seed for the shadow flag on the next new arrow.
+                    ui.checkbox(&mut self.arrow_shadow_default, "Shadow");
                 }
                 Tool::Text => {
                     ui.label("Size");
@@ -747,6 +816,37 @@ impl EditorApp {
                                 }
                             }
                         }
+
+                        // Restyle for a currently-selected Arrow annotation:
+                        // Shadow checkbox flips the per-arrow field via an
+                        // undoable UpdateAnnotation command.
+                        if let Some(before @ AnnotationNode::Arrow { .. }) = self
+                            .document
+                            .annotations
+                            .iter()
+                            .find(|n| n.id() == id)
+                            .cloned()
+                        {
+                            if let AnnotationNode::Arrow {
+                                id: nid, start, end, color, thickness, shadow,
+                            } = before.clone()
+                            {
+                                let mut new_shadow = shadow;
+                                if ui.checkbox(&mut new_shadow, "Shadow").changed() {
+                                    let after = AnnotationNode::Arrow {
+                                        id: nid,
+                                        start,
+                                        end,
+                                        color,
+                                        thickness,
+                                        shadow: new_shadow,
+                                    };
+                                    self.push_command(Box::new(UpdateAnnotation::new(
+                                        before, after,
+                                    )));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -788,7 +888,22 @@ impl EditorApp {
         });
 
         if !self.status.is_empty() {
-            ui.label(&self.status);
+            ui.horizontal(|ui| {
+                ui.label(&self.status);
+                // After a successful save, offer a one-click "Copy path" so
+                // users can paste the saved file's location into chat,
+                // Explorer, etc. without hunting in the Pictures folder.
+                if self.saved_once && self.status.starts_with("Saved to ") {
+                    if ui.small_button("Copy path").clicked() {
+                        let path_str = self.png_path.display().to_string();
+                        ui.ctx().copy_text(path_str);
+                        self.status = format!(
+                            "Path copied: {}",
+                            self.png_path.display()
+                        );
+                    }
+                }
+            });
         }
     }
 
@@ -1637,13 +1752,19 @@ impl EditorApp {
 
         // Draw in-progress drag preview.
         if let Some(d) = &self.pending_drag {
-            let s = to_canvas(d.start);
-            let e = to_canvas(d.current);
+            let (draw_start, draw_end) = if matches!(self.tool, Tool::Arrow) {
+                self.maybe_snap_arrow(ui.ctx(), d.start, d.current)
+            } else {
+                (d.start, d.current)
+            };
+            let s = to_canvas(draw_start);
+            let e = to_canvas(draw_end);
             let r = egui::Rect::from_two_pos(s, e);
             match self.tool {
                 Tool::Arrow => {
                     draw_arrow_preview(
                         &painter, s, e, self.color, self.thickness * scale,
+                        self.arrow_shadow_default,
                     );
                 }
                 Tool::Rect | Tool::Magnify => {
@@ -1865,13 +1986,46 @@ impl EditorApp {
                 let dx = d.current[0] - d.start[0];
                 let dy = d.current[1] - d.start[1];
                 if dx * dx + dy * dy >= 4.0 {
+                    let (start, end) = self.maybe_snap_arrow(&response.ctx, d.start, d.current);
                     let node = tool_arrow::make(
-                        d.start, d.current, color_to_rgba(self.color), self.thickness,
+                        start, end, color_to_rgba(self.color), self.thickness,
+                        self.arrow_shadow_default,
                     );
                     self.push_command(Box::new(AddAnnotation::new(node)));
                 }
             }
         }
+    }
+
+    /// Freehand by default. When the setting is on AND the user holds
+    /// Shift during drag, snap the end angle to the nearest 15° increment
+    /// and pixel-snap both endpoints. Otherwise returns the drag positions
+    /// unchanged.
+    fn maybe_snap_arrow(
+        &self,
+        ctx: &egui::Context,
+        start: [f32; 2],
+        current: [f32; 2],
+    ) -> ([f32; 2], [f32; 2]) {
+        if !self.arrow_angle_snap {
+            return (start, current);
+        }
+        if !ctx.input(|i| i.modifiers.shift) {
+            return (start, current);
+        }
+        let start = [start[0].round(), start[1].round()];
+        let dx = current[0] - start[0];
+        let dy = current[1] - start[1];
+        let len2 = dx * dx + dy * dy;
+        if len2 < 1.0 {
+            return (start, [current[0].round(), current[1].round()]);
+        }
+        let len = len2.sqrt();
+        let step = std::f32::consts::PI / 12.0; // 15°
+        let snapped = (dy.atan2(dx) / step).round() * step;
+        let ex = start[0] + len * snapped.cos();
+        let ey = start[1] + len * snapped.sin();
+        (start, [ex.round(), ey.round()])
     }
 
     fn handle_text_input(
@@ -3059,6 +3213,7 @@ impl EditorApp {
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_image_loaded(ctx);
+        self.poll_settings_reload();
 
         // Intercept window-close while there are unsaved edits and show a
         // Save / Discard / Cancel modal. Once dirty flips to false (Save
@@ -3203,13 +3358,14 @@ fn draw_node_preview(
     to_canvas: &dyn Fn([f32; 2]) -> egui::Pos2,
 ) {
     match node {
-        AnnotationNode::Arrow { start, end, color, thickness, .. } => {
+        AnnotationNode::Arrow { start, end, color, thickness, shadow, .. } => {
             draw_arrow_preview(
                 painter,
                 to_canvas(*start),
                 to_canvas(*end),
                 egui_color(*color),
                 thickness * scale,
+                *shadow,
             );
         }
         AnnotationNode::Text { rect, text, color, size_px, align, list, .. } => {
@@ -3484,12 +3640,62 @@ fn draw_node_preview(
     }
 }
 
+/// 8-swatch preset palette for the Arrow tool in simple mode. Clicking a
+/// swatch sets `color`; the currently-active one gets a highlighted border.
+fn draw_arrow_swatches(ui: &mut egui::Ui, color: &mut egui::Color32) {
+    const PALETTE: [egui::Color32; 8] = [
+        egui::Color32::from_rgb(220, 40, 40),   // red
+        egui::Color32::from_rgb(255, 140, 0),   // orange
+        egui::Color32::from_rgb(235, 180, 0),   // yellow
+        egui::Color32::from_rgb(40, 180, 60),   // green
+        egui::Color32::from_rgb(30, 130, 220),  // blue
+        egui::Color32::from_rgb(150, 70, 200),  // purple
+        egui::Color32::from_rgb(30, 30, 30),    // black
+        egui::Color32::from_rgb(240, 240, 240), // white
+    ];
+    for swatch in PALETTE {
+        let selected = color.r() == swatch.r()
+            && color.g() == swatch.g()
+            && color.b() == swatch.b();
+        let size = egui::vec2(20.0, 20.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, swatch);
+        let border = if selected {
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 140, 230))
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(90))
+        };
+        painter.rect_stroke(rect, 3.0, border);
+        if resp.clicked() {
+            *color = swatch;
+        }
+    }
+}
+
+/// Format an `egui::Color32` as `#RRGGBB` (ignoring alpha — arrows are opaque).
+fn format_hex(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+/// Parse `#RRGGBB` (leading `#` optional) into an `egui::Color32`. Returns
+/// `None` on any malformed input so callers can keep the existing color.
+fn parse_hex(s: &str) -> Option<egui::Color32> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 { return None; }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
 fn draw_arrow_preview(
     painter: &egui::Painter,
     start: egui::Pos2,
     end: egui::Pos2,
     color: egui::Color32,
     thickness_px: f32,
+    shadow: bool,
 ) {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
@@ -3503,15 +3709,41 @@ fn draw_arrow_preview(
     let head_len = (thickness_px * 4.0).max(10.0).min(len * 0.45);
     let head_half = head_len * 0.55;
     let shaft_end = egui::pos2(end.x - ux * head_len, end.y - uy * head_len);
-    let ht = (thickness_px * 0.5).max(0.5);
 
-    let shaft = vec![
-        egui::pos2(start.x + px * ht, start.y + py * ht),
-        egui::pos2(start.x - px * ht, start.y - py * ht),
-        egui::pos2(shaft_end.x - px * ht, shaft_end.y - py * ht),
-        egui::pos2(shaft_end.x + px * ht, shaft_end.y + py * ht),
-    ];
-    painter.add(egui::Shape::convex_polygon(shaft, color, egui::Stroke::NONE));
+    // Shaft: proper AA line stroke (not a thin filled polygon). egui's line
+    // renderer handles arbitrary-angle sub-pixel coverage cleanly, which is
+    // the thing that was making oblique freehand arrows look soft.
+    if shadow {
+        // Shadow color is a darkened version of the arrow color, not pure
+        // black. This reads as a "shadow" on light backgrounds AND keeps a
+        // visible colored echo on dark ones (a red arrow gets a dark-red
+        // shadow that still contrasts with black).
+        let off = (thickness_px * 0.35).max(2.0);
+        let shadow_col = egui::Color32::from_rgba_unmultiplied(
+            (color.r() as f32 * 0.3) as u8,
+            (color.g() as f32 * 0.3) as u8,
+            (color.b() as f32 * 0.3) as u8,
+            170,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(start.x + off, start.y + off),
+                egui::pos2(shaft_end.x + off, shaft_end.y + off),
+            ],
+            egui::Stroke::new(thickness_px, shadow_col),
+        );
+        let head = vec![
+            egui::pos2(end.x + off, end.y + off),
+            egui::pos2(shaft_end.x + px * head_half + off, shaft_end.y + py * head_half + off),
+            egui::pos2(shaft_end.x - px * head_half + off, shaft_end.y - py * head_half + off),
+        ];
+        painter.add(egui::Shape::convex_polygon(head, shadow_col, egui::Stroke::NONE));
+    }
+
+    painter.line_segment(
+        [start, shaft_end],
+        egui::Stroke::new(thickness_px, color),
+    );
 
     let head = vec![
         end,

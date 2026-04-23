@@ -266,6 +266,11 @@ pub enum AnnotationNode {
         color: [u8; 4],
         /// Stroke thickness in image pixels.
         thickness: f32,
+        /// If true, render a soft dark drop shadow under the arrow.
+        /// Per-annotation toggle; `#[serde(default)]` keeps pre-shadow docs
+        /// (all schemas ≤ v4) loading with the shadow off.
+        #[serde(default)]
+        shadow: bool,
     },
     Text {
         id: Uuid,
@@ -515,6 +520,7 @@ mod tests {
             end: [3.0, 4.0],
             color: [10, 20, 30, 40],
             thickness: 2.5,
+            shadow: false,
         });
         let back = round_trip(&doc);
         assert_eq!(back.annotations.len(), 1);
@@ -930,6 +936,7 @@ mod tests {
             end: [10.0, 10.0],
             color: [255, 0, 0, 255],
             thickness: 4.0,
+            shadow: false,
         });
         let back = round_trip(&doc);
         assert_eq!(back.schema_version, 1);
@@ -1040,6 +1047,7 @@ mod tests {
                 end: [4.0, 4.0],
                 color: [255, 0, 0, 255],
                 thickness: 2.0,
+                shadow: false,
             }],
             metadata: base.metadata.clone(),
         };

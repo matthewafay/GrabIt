@@ -24,6 +24,7 @@ fn load_app_icon_data() -> Option<egui::IconData> {
 
 use crate::app::paths::AppPaths;
 use crate::capture::CaptureResult;
+use crate::settings::Settings;
 use anyhow::{Context, Result};
 use log::info;
 use std::path::PathBuf;
@@ -66,6 +67,7 @@ pub fn run_blocking(
     grabit_path: PathBuf,
     copy_to_clipboard: bool,
     paths: AppPaths,
+    settings: Settings,
 ) -> Result<()> {
     let w = document.base_width.max(320);
     let h = document.base_height.max(240);
@@ -113,6 +115,7 @@ pub fn run_blocking(
                 grabit_path,
                 copy_to_clipboard,
                 paths,
+                settings,
             )))
         }),
     )

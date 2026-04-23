@@ -5,6 +5,32 @@
 A lightweight Windows screenshot + annotation tool. Single `.exe`, lives in
 the system tray, launches with Windows.
 
+## What's new in 1.1
+
+- **Arrow polish** — shaft now renders as a proper anti-aliased line stroke
+  (no more "soft" freehand arrows at oblique angles); the head stays a clean
+  triangle.
+- **Color-derived drop shadow on arrows** — optional per-arrow shadow is a
+  darkened tint of the arrow's own colour, so it reads on both light and
+  dark backgrounds. Toggle per-arrow from the toolbar or globally in
+  Settings ("Default new arrows to drop shadow").
+- **Shift-drag snaps arrows to 15°** — freehand by default; hold Shift
+  mid-drag to lock the angle and pixel-snap endpoints. Can be disabled
+  entirely in Settings.
+- **Arrow color: simple vs. advanced mode** — simple mode (default) shows
+  an 8-swatch palette (red, orange, yellow, green, blue, purple, black,
+  white). Advanced mode unlocks the full picker plus a `#RRGGBB` hex input
+  field. Toggle under Settings → "Arrow color — advanced mode".
+- **Settings now persisted as JSON** — `%APPDATA%\GrabIt\settings.json`
+  replaces the old `settings.toml` (the old file still migrates in on
+  first launch).
+- **Live settings reload** — change a setting in the Settings window and
+  any already-open editor picks up the new values immediately; no restart
+  required.
+- **Copy-path button** — after a successful save, a one-click "Copy path"
+  button next to the "Saved to …" status copies the full PNG path to the
+  clipboard for pasting into chat / Explorer / a prompt.
+
 ## Capture
 
 - **Fullscreen** — `PrintScreen` or tray → *Capture fullscreen*. Saves PNG
@@ -86,11 +112,15 @@ Tray → *Settings…* opens a GUI window with:
 - Launch at startup
 - Include cursor in captures
 - Copy every capture to clipboard
+- Shift+drag snaps arrows to 15° (uncheck to disable the Shift modifier)
+- Default new arrows to drop shadow
+- Arrow color — advanced mode (picker + hex)
 - Output folder (default `%USERPROFILE%\Pictures\GrabIt`, with Browse / Reset)
 
-Save writes `%APPDATA%\GrabIt\settings.toml` and signals the tray to
-re-register hotkeys and re-sync autostart without restart. Chord parsing
-accepts `Ctrl+Shift+Z`, `Alt+PrtSc`, `Win+S`, etc.
+Save writes `%APPDATA%\GrabIt\settings.json` and signals the tray to
+re-register hotkeys and re-sync autostart without restart. Any open editor
+also live-reloads its arrow/shadow flags. Chord parsing accepts
+`Ctrl+Shift+Z`, `Alt+PrtSc`, `Win+S`, etc.
 
 > Global hotkeys win over focused apps — while the annotate hotkey is
 > `Ctrl+X` it intercepts Cut everywhere. Pick something unique (e.g.
@@ -180,7 +210,7 @@ src/
   presets/             per-preset .toml records + hotkey rebinding
   styles/              named quick-style presets per tool
   settings/
-    mod.rs             settings.toml load/save
+    mod.rs             settings.json load/save (legacy settings.toml auto-migrates)
     ui.rs              eframe GUI for the --settings subprocess
   export/              PNG write + Windows clipboard (CF_DIB)
 ```
@@ -199,7 +229,7 @@ presets, and triggered preset captures).
   Bold, SIL Open Font License 1.1. License text: `assets/fonts/OFL.txt`.
 - **Rust crates** (runtime): `windows`, `eframe` / `egui`, `tray-icon`,
   `global-hotkey`, `image`, `imageproc`, `fast_image_resize`, `ab_glyph`,
-  `winreg`, `toml`, `rmp-serde`, `serde`, `chrono`, `parking_lot`,
+  `winreg`, `toml`, `serde_json`, `rmp-serde`, `serde`, `chrono`, `parking_lot`,
   `crossbeam-channel`, `anyhow`, `thiserror`, `log` / `env_logger`,
   `uuid`, `rfd`, `dirs`.
 - **Rust crates** (build): `embed-resource`, `ico`, `image`.

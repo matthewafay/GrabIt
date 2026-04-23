@@ -1,4 +1,4 @@
-//! Settings window — eframe form that edits `%APPDATA%\GrabIt\settings.toml`
+//! Settings window — eframe form that edits `%APPDATA%\GrabIt\settings.json`
 //! and signals the tray to reload via a `.settings_refresh` marker file.
 
 use crate::app::paths::AppPaths;
@@ -94,6 +94,18 @@ impl eframe::App for SettingsApp {
 
                     ui.label("Copy every capture to clipboard");
                     ui.checkbox(&mut self.settings.copy_to_clipboard, "");
+                    ui.end_row();
+
+                    ui.label("Shift+drag snaps arrows to 15°");
+                    ui.checkbox(&mut self.settings.arrow_angle_snap, "");
+                    ui.end_row();
+
+                    ui.label("Default new arrows to drop shadow");
+                    ui.checkbox(&mut self.settings.arrow_shadow, "");
+                    ui.end_row();
+
+                    ui.label("Arrow color — advanced mode (picker + hex)");
+                    ui.checkbox(&mut self.settings.arrow_advanced_color, "");
                     ui.end_row();
 
                     ui.label("Output folder");

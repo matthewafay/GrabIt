@@ -42,6 +42,13 @@ impl AppPaths {
     }
 
     pub fn settings_file(&self) -> PathBuf {
+        self.data_dir.join("settings.json")
+    }
+
+    /// One-shot migration path: pre-JSON installs wrote `settings.toml`. On
+    /// load we read this only if the JSON file doesn't exist yet, then the
+    /// next save rewrites as JSON.
+    pub fn legacy_settings_file(&self) -> PathBuf {
         self.data_dir.join("settings.toml")
     }
 
