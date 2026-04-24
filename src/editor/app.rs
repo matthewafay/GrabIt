@@ -615,7 +615,7 @@ impl EditorApp {
         // doesn't shove the style controls off-screen on narrow windows.
         ui.horizontal_wrapped(|ui| {
             for t in [
-                Tool::Select, Tool::Arrow, Tool::Text, Tool::Callout,
+                Tool::Select, Tool::Arrow, Tool::Text,
                 Tool::Rect, Tool::Ellipse, Tool::Step, Tool::Magnify,
                 Tool::Blur, Tool::CaptureInfo,
             ] {
@@ -1003,25 +1003,27 @@ impl EditorApp {
             }
             if let Some(mut e) = self.document.edge_effect {
                 let mut changed = false;
-                egui::ComboBox::from_id_salt("edge-side")
-                    .selected_text(match e.edge {
-                        Edge::Top => "Top",
-                        Edge::Bottom => "Bottom",
-                        Edge::Left => "Left",
-                        Edge::Right => "Right",
-                    })
-                    .show_ui(ui, |ui| {
-                        for (lbl, side) in [
-                            ("Top", Edge::Top),
-                            ("Bottom", Edge::Bottom),
-                            ("Left", Edge::Left),
-                            ("Right", Edge::Right),
-                        ] {
-                            if ui.selectable_value(&mut e.edge, side, lbl).changed() {
-                                changed = true;
-                            }
-                        }
-                    });
+                // Normalise legacy docs that only had `edge: Edge` set so
+                // the checkboxes below show the right initial state.
+                let any_explicit = e.top || e.bottom || e.left || e.right;
+                if !any_explicit {
+                    match e.edge {
+                        Edge::Top => e.top = true,
+                        Edge::Bottom => e.bottom = true,
+                        Edge::Left => e.left = true,
+                        Edge::Right => e.right = true,
+                    }
+                    changed = true;
+                }
+                ui.label("Edges");
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut e.top, "Top").changed() { changed = true; }
+                    if ui.checkbox(&mut e.bottom, "Bottom").changed() { changed = true; }
+                });
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut e.left, "Left").changed() { changed = true; }
+                    if ui.checkbox(&mut e.right, "Right").changed() { changed = true; }
+                });
                 if ui
                     .add(egui::Slider::new(&mut e.depth, 1.0..=80.0).text("Depth"))
                     .changed()
@@ -1099,6 +1101,30 @@ impl EditorApp {
                 {
                     changed = true;
                 }
+                // Matte band — the inner ring between the outer border
+                // and the image. Width 0 = off (classic single-band look);
+                // non-zero = photo-frame look. Colour defaults to ivory.
+                if ui
+                    .add(
+                        egui::Slider::new(&mut b.matte_width, 0.0..=60.0)
+                            .text("Matte width"),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                let mut matte_col = egui::Color32::from_rgba_unmultiplied(
+                    b.matte_color[0], b.matte_color[1], b.matte_color[2], b.matte_color[3],
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Matte color");
+                    if ui.color_edit_button_srgba(&mut matte_col).changed() {
+                        b.matte_color = [
+                            matte_col.r(), matte_col.g(), matte_col.b(), matte_col.a(),
+                        ];
+                        changed = true;
+                    }
+                });
                 if changed {
                     let before = self.document.border;
                     self.push_command(Box::new(SetBorder::new(before, Some(b))));
@@ -1662,6 +1688,28 @@ impl EditorApp {
         }
     }
 
+    /// Return per-side document frame margins in image-pixel units —
+    /// border + matte + drop-shadow spread + offset. Used by `canvas` to
+    /// allocate enough painter space that the live border preview isn't
+    /// clipped to the bare image rect.
+    fn document_frame_margins_px(&self) -> (f32, f32, f32, f32) {
+        let Some(b) = self.document.border else {
+            return (0.0, 0.0, 0.0, 0.0);
+        };
+        let bw = b.width.max(0.0);
+        let mw = b.matte_width.max(0.0);
+        let frame = bw + mw;
+        let sr = b.shadow_radius.max(0.0);
+        let sox = b.shadow_offset[0];
+        let soy = b.shadow_offset[1];
+        (
+            frame + sr + (-sox).max(0.0),
+            frame + sr + sox.max(0.0),
+            frame + sr + (-soy).max(0.0),
+            frame + sr + soy.max(0.0),
+        )
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let Some(texture) = self.texture.as_ref().cloned() else {
             ui.centered_and_justified(|ui| ui.label("Loading capture\u{2026}"));
@@ -1673,12 +1721,37 @@ impl EditorApp {
             return;
         }
 
+        // Document-level frame margins (border + matte + drop-shadow
+        // spread + offset) in image-pixel units. These extend the
+        // painter's clip rect outward so the live border preview isn't
+        // clipped to the bare image rect.
+        let (margin_l, margin_r, margin_t, margin_b) = self.document_frame_margins_px();
+
         let available = ui.available_size();
-        let scale = (available.x / img_w).min(available.y / img_h).clamp(0.01, 1.0);
-        let display = egui::vec2(img_w * scale, img_h * scale);
+        // Solve for scale that fits image+margins inside available space.
+        let scale = ((available.x - (margin_l + margin_r))
+            / img_w)
+            .min((available.y - (margin_t + margin_b)) / img_h)
+            .clamp(0.01, 1.0);
+
+        let ml = margin_l * scale;
+        let mr = margin_r * scale;
+        let mt = margin_t * scale;
+        let mb = margin_b * scale;
+        let display = egui::vec2(
+            img_w * scale + ml + mr,
+            img_h * scale + mt + mb,
+        );
 
         let (response, painter) = ui.allocate_painter(display, egui::Sense::click_and_drag());
-        let rect = response.rect;
+        // `rect` is the IMAGE area (offset inside the larger allocated
+        // painter). Annotations / coords-mapping all use this; the border
+        // preview can paint into the surrounding margin without clipping.
+        let outer = response.rect;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(outer.min.x + ml, outer.min.y + mt),
+            egui::vec2(img_w * scale, img_h * scale),
+        );
 
         // Document-level border preview (shadow behind + frame around the
         // base image). The frame sits outside `rect` so it doesn't occlude
@@ -3045,27 +3118,27 @@ impl EditorApp {
     ) {
         let Some(b) = self.document.border else { return };
 
+        let bw = b.width * scale;
+        let mw = b.matte_width * scale;
+        let frame = bw + mw;
+
         // Shadow first — behind the base image. Offset in image pixels
         // scaled to canvas.
         if b.shadow_color[3] > 0 && (b.shadow_radius > 0.0 || b.shadow_offset != [0.0, 0.0]) {
             let sox = b.shadow_offset[0] * scale;
             let soy = b.shadow_offset[1] * scale;
             let shadow_r = b.shadow_radius * scale;
-            // The exported shadow is the (base rect + border) silhouette,
-            // offset and blurred. Start with the border-outer rect shifted.
-            let bw = b.width * scale;
-            let base_outer = egui::Rect::from_min_max(
-                egui::pos2(canvas_rect.min.x - bw, canvas_rect.min.y - bw),
-                egui::pos2(canvas_rect.max.x + bw, canvas_rect.max.y + bw),
-            );
+            // The exported shadow is the (image + full frame) silhouette,
+            // offset and blurred. Start with the outer-frame rect shifted.
+            let base_outer = canvas_rect.expand(frame);
             let shadow_rect = base_outer.translate(egui::vec2(sox, soy));
             // Fake softness: 4 concentric rects, each inset by 25% of
             // shadow_r, with decreasing opacity. Gives a passable gaussian
             // halo without blurring on the CPU every frame.
             let layers = 4i32;
             for i in 0..layers {
-                let t = i as f32 / layers as f32; // 0..1
-                let outset = shadow_r * (1.0 - t); // outermost = full radius
+                let t = i as f32 / layers as f32;
+                let outset = shadow_r * (1.0 - t);
                 let alpha = (b.shadow_color[3] as f32
                     * (0.35 * (1.0 - t) + 0.15))
                     .clamp(0.0, 255.0) as u8;
@@ -3080,15 +3153,26 @@ impl EditorApp {
             }
         }
 
-        // Border frame: stroke outside the base canvas rect, width scaled.
-        if b.width > 0.0 && b.color[3] > 0 {
-            let bw = b.width * scale;
-            // A stroke centred on the outer edge draws half-in, half-out.
-            // Push the stroke centre out by bw/2 so the band sits fully
-            // outside the base image, matching the export.
-            let outer = canvas_rect.expand(bw * 0.5);
-            let color = egui_color(b.color);
-            painter.rect_stroke(outer, 0.0, egui::Stroke::new(bw, color));
+        // Outer border band — stroke centred between the matte edge (inner)
+        // and the outer frame edge (outer). The stroke's centre is mw + bw/2
+        // outside the image, width = bw.
+        if bw > 0.0 && b.color[3] > 0 {
+            let centre = canvas_rect.expand(mw + bw * 0.5);
+            painter.rect_stroke(
+                centre,
+                0.0,
+                egui::Stroke::new(bw, egui_color(b.color)),
+            );
+        }
+
+        // Matte band — stroke centred mw/2 outside the image, width = mw.
+        if mw > 0.0 && b.matte_color[3] > 0 {
+            let centre = canvas_rect.expand(mw * 0.5);
+            painter.rect_stroke(
+                centre,
+                0.0,
+                egui::Stroke::new(mw, egui_color(b.matte_color)),
+            );
         }
     }
 
@@ -3113,8 +3197,8 @@ impl EditorApp {
         let teeth = e.teeth.max(4.0);
 
         // Identical hash as rasterize::apply_torn_edge so teeth line up.
-        let jitter = |n: u32| -> f32 {
-            let mut s = n.wrapping_mul(2654435761).wrapping_add(1);
+        let jitter = |n: u32, salt: u32| -> f32 {
+            let mut s = n.wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503));
             s ^= s >> 16;
             s = s.wrapping_mul(0x85ebca6b);
             let u = (s & 0xFFFF) as f32 / 65536.0;
@@ -3123,62 +3207,66 @@ impl EditorApp {
 
         // For each image-pixel column/row compute the cut depth, then paint
         // a thin canvas-space rect covering that strip. `scale` maps image
-        // pixels → canvas pixels.
-        match e.edge {
-            Edge::Top | Edge::Bottom => {
-                for x in 0..w {
-                    let idx = x as f32 / teeth;
-                    let tooth_n = idx.floor() as u32;
-                    let frac = idx - idx.floor();
-                    let tri = 1.0 - (2.0 * frac - 1.0).abs();
-                    let j = 1.0 + jitter(tooth_n);
-                    let d = (depth * tri * j).max(0.0);
-                    if d <= 0.0 {
-                        continue;
+        // pixels → canvas pixels. Runs per active edge.
+        for edge in e.active_edges() {
+            let salt = match edge {
+                Edge::Top => 1,
+                Edge::Bottom => 2,
+                Edge::Left => 3,
+                Edge::Right => 4,
+            };
+            match edge {
+                Edge::Top | Edge::Bottom => {
+                    for x in 0..w {
+                        let idx = x as f32 / teeth;
+                        let tooth_n = idx.floor() as u32;
+                        let frac = idx - idx.floor();
+                        let tri = 1.0 - (2.0 * frac - 1.0).abs();
+                        let j = 1.0 + jitter(tooth_n, salt);
+                        let d = (depth * tri * j).max(0.0);
+                        if d <= 0.0 { continue; }
+                        let col_min_x = canvas_rect.min.x + x as f32 * scale;
+                        let col_max_x = canvas_rect.min.x + (x + 1) as f32 * scale;
+                        let (ty0, ty1) = match edge {
+                            Edge::Top => (canvas_rect.min.y, canvas_rect.min.y + d * scale),
+                            Edge::Bottom => (canvas_rect.max.y - d * scale, canvas_rect.max.y),
+                            _ => unreachable!(),
+                        };
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(col_min_x, ty0),
+                                egui::pos2(col_max_x, ty1),
+                            ),
+                            0.0,
+                            bg,
+                        );
                     }
-                    let col_min_x = canvas_rect.min.x + x as f32 * scale;
-                    let col_max_x = canvas_rect.min.x + (x + 1) as f32 * scale;
-                    let (ty0, ty1) = match e.edge {
-                        Edge::Top => (canvas_rect.min.y, canvas_rect.min.y + d * scale),
-                        Edge::Bottom => (canvas_rect.max.y - d * scale, canvas_rect.max.y),
-                        _ => unreachable!(),
-                    };
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(col_min_x, ty0),
-                            egui::pos2(col_max_x, ty1),
-                        ),
-                        0.0,
-                        bg,
-                    );
                 }
-            }
-            Edge::Left | Edge::Right => {
-                for y in 0..h {
-                    let idx = y as f32 / teeth;
-                    let tooth_n = idx.floor() as u32;
-                    let frac = idx - idx.floor();
-                    let tri = 1.0 - (2.0 * frac - 1.0).abs();
-                    let j = 1.0 + jitter(tooth_n);
-                    let d = (depth * tri * j).max(0.0);
-                    if d <= 0.0 {
-                        continue;
+                Edge::Left | Edge::Right => {
+                    for y in 0..h {
+                        let idx = y as f32 / teeth;
+                        let tooth_n = idx.floor() as u32;
+                        let frac = idx - idx.floor();
+                        let tri = 1.0 - (2.0 * frac - 1.0).abs();
+                        let j = 1.0 + jitter(tooth_n, salt);
+                        let d = (depth * tri * j).max(0.0);
+                        if d <= 0.0 { continue; }
+                        let row_min_y = canvas_rect.min.y + y as f32 * scale;
+                        let row_max_y = canvas_rect.min.y + (y + 1) as f32 * scale;
+                        let (tx0, tx1) = match edge {
+                            Edge::Left => (canvas_rect.min.x, canvas_rect.min.x + d * scale),
+                            Edge::Right => (canvas_rect.max.x - d * scale, canvas_rect.max.x),
+                            _ => unreachable!(),
+                        };
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(tx0, row_min_y),
+                                egui::pos2(tx1, row_max_y),
+                            ),
+                            0.0,
+                            bg,
+                        );
                     }
-                    let row_min_y = canvas_rect.min.y + y as f32 * scale;
-                    let row_max_y = canvas_rect.min.y + (y + 1) as f32 * scale;
-                    let (tx0, tx1) = match e.edge {
-                        Edge::Left => (canvas_rect.min.x, canvas_rect.min.x + d * scale),
-                        Edge::Right => (canvas_rect.max.x - d * scale, canvas_rect.max.x),
-                        _ => unreachable!(),
-                    };
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(tx0, row_min_y),
-                            egui::pos2(tx1, row_max_y),
-                        ),
-                        0.0,
-                        bg,
-                    );
                 }
             }
         }
@@ -3452,29 +3540,12 @@ impl eframe::App for EditorApp {
         egui::SidePanel::right("grabit-document-effects")
             .default_width(280.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.inspector_tab,
-                        InspectorTab::Document,
-                        "Document",
-                    );
-                    ui.selectable_value(
-                        &mut self.inspector_tab,
-                        InspectorTab::Presets,
-                        "Presets",
-                    );
-                    ui.selectable_value(
-                        &mut self.inspector_tab,
-                        InspectorTab::Styles,
-                        "Styles",
-                    );
-                });
-                ui.separator();
-                match self.inspector_tab {
-                    InspectorTab::Document => self.document_panel(ui),
-                    InspectorTab::Presets => self.presets_panel(ui),
-                    InspectorTab::Styles => self.styles_panel(ui),
-                }
+                // Document is now the only inspector tab — the Presets and
+                // Styles tabs were removed from the UI. `inspector_tab` is
+                // retained on the struct so older `.grabit` docs that
+                // stored the field still deserialize, but it's effectively
+                // fixed to Document.
+                self.document_panel(ui);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {

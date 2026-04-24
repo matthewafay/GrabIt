@@ -18,8 +18,12 @@ pub struct HotkeyBinding {
 
 impl Default for HotkeyBinding {
     fn default() -> Self {
-        // PrintScreen is the Windows convention for "take a screenshot".
-        Self { raw: "PrintScreen".to_string() }
+        // Default for the primary "Capture fullscreen" hotkey. Ctrl+Shift+S
+        // is the screenshot convention: two modifiers means it won't fire
+        // from incidental typing, and it works on laptops without a
+        // dedicated PrintScreen key. Only real conflict is apps' "Save As"
+        // shortcut, which gets shadowed while GrabIt is running.
+        Self { raw: "Ctrl+Shift+S".to_string() }
     }
 }
 

@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Global hotkey for `CaptureFullscreen`. Default: PrintScreen.
+    /// Global hotkey for `CaptureFullscreen`. Default: Ctrl+Shift+S.
     pub hotkey: HotkeyBinding,
-    /// Global hotkey for `CaptureAndAnnotate`. Default: Ctrl+X.
+    /// Global hotkey for `CaptureAndAnnotate`. Default: Ctrl+Shift+A.
     ///
-    /// Heads-up: global hotkeys win over focused apps, so while this is set
-    /// to Ctrl+X, that keystroke won't reach other apps (including their
-    /// own Cut shortcut). Change it in Settings or edit `settings.json`.
+    /// Heads-up: global hotkeys win over focused apps — whatever chord
+    /// you pick won't reach other apps' own bindings for the same keys.
+    /// Change it in Settings or edit `settings.json` directly.
     pub annotate_hotkey: HotkeyBinding,
     /// Persisted state of the "Launch at startup" tray checkbox.
     pub launch_at_startup: bool,
@@ -45,7 +45,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: HotkeyBinding::default(),
-            annotate_hotkey: HotkeyBinding { raw: "Ctrl+X".to_string() },
+            annotate_hotkey: HotkeyBinding { raw: "Ctrl+Shift+A".to_string() },
             launch_at_startup: true,
             include_cursor: true,
             copy_to_clipboard: true,

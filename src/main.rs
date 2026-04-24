@@ -395,6 +395,12 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
             for (name, chord, reason) in &report.failed {
                 warn!("preset {name:?} hotkey {chord:?} not bound: {reason}");
             }
+            // Update the accelerator labels on the two tray capture
+            // entries so they reflect the just-saved chords. In-place
+            // update via muda's set_accelerator + set_text — no icon
+            // flicker, works symmetrically for both fullscreen and
+            // annotate.
+            tray.refresh_hotkey_labels(&state.settings);
             info!("settings reloaded");
         }
 

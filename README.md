@@ -8,6 +8,47 @@ the system tray, launches with Windows.
 If GrabIt is useful to you, you can support development here:
 [☕ Buy me a coffee](https://buymeacoffee.com/matthewafay).
 
+## What's new in 1.3
+
+### Document effects
+- **Photo-frame matte**. Border now has a second, inner band — set
+  `Matte width` + `Matte color` and you get a classic picture-frame
+  look (thin dark outer rim + ivory matte hugging the image). Set
+  Matte width to 0 for the old single-band behaviour.
+- **Border live preview no longer clipped.** The editor canvas now
+  allocates space for the full frame (border + matte + shadow
+  spread + offset), so what you see on-screen matches the exported
+  PNG even at thick widths.
+- **Torn edge: any combination of edges.** The single-edge dropdown
+  is now four checkboxes (Top / Bottom / Left / Right). Depth and
+  Tooth sliders apply to every enabled edge; jitter is salted per
+  edge so corners aren't suspiciously symmetric.
+
+### Rendering polish
+- **Step circles now 4× supersampled** on export (same treatment as
+  arrows). Smooth circle edge + outline at any radius.
+
+### Tray + settings
+- **Hotkey labels update in place** when you rebind and save — muda's
+  `set_accelerator` + `set_text` are called on the live menu items,
+  no icon flicker.
+- **Click-to-record Ctrl detection fix.** Reading `i.modifiers` once
+  per frame instead of per-event; the Ctrl in Ctrl+Z (etc.) no
+  longer gets dropped from a race between modifier-down and key-down.
+- **Reset to defaults** button in the Settings window — preview the
+  reset then Save or Cancel to discard.
+- **New default hotkeys:** `Ctrl+Shift+S` for Capture fullscreen,
+  `Ctrl+Shift+A` for Capture & annotate. Two-modifier chords so
+  nothing accidentally fires from plain typing, and no PrintScreen
+  key required.
+
+### Editor
+- **Callout tool removed from the toolbar.** Existing callouts in
+  old `.grabit` docs still load and render; they just can't be
+  created fresh.
+- **Inspector panel slimmed to the Document tab** — Presets and
+  Styles tabs are gone from the right panel.
+
 ## What's new in 1.2
 
 ### Arrow — full style kit
@@ -119,12 +160,12 @@ window (Capture section).
 
 ## Capture
 
-- **Fullscreen** — `PrintScreen` or tray → *Capture fullscreen*. Saves PNG
+- **Fullscreen** — `Ctrl+Shift+S` or tray → *Capture fullscreen*. Saves PNG
   to the output folder and copies to clipboard.
 - **Region / window** — tray → *Capture region / window…*. Drag a rectangle
   in the overlay, or hover a window (green outline) and click to grab it.
   Multi-monitor and mixed-DPI aware.
-- **Annotate** — `Ctrl+X` or tray → *Capture & annotate…*. Drag-release a
+- **Annotate** — `Ctrl+Shift+A` or tray → *Capture & annotate…*. Drag-release a
   rectangle, then the editor opens with it.
 - **Object / menu** — tray → *Capture object…*. A UIA picker highlights the
   UI element under the cursor (button, menu item, list row); F3 commits,
@@ -194,8 +235,8 @@ as a named style and reapply later. Styles persist at
 Tray → *Settings…* opens a GUI window grouped into three sections:
 
 - **Hotkeys**
-  - Fullscreen capture (default `PrintScreen`)
-  - Annotate (default `Ctrl+X`)
+  - Fullscreen capture (default `Ctrl+Shift+S`)
+  - Annotate (default `Ctrl+Shift+A`)
 
   Click a field and press the combo you want, then Confirm. Esc cancels.
 - **Capture**
@@ -213,9 +254,11 @@ Save writes `%APPDATA%\GrabIt\settings.json` and signals the tray to
 re-register hotkeys and re-sync autostart without restart. Any open editor
 also live-reloads its arrow/shadow flags.
 
-> Global hotkeys win over focused apps — while the annotate hotkey is
-> `Ctrl+X` it intercepts Cut everywhere. Pick something unique (e.g.
-> `Ctrl+Shift+X`) if that bothers you.
+> Global hotkeys win over focused apps — whatever chord you bind is
+> intercepted everywhere. The defaults use two modifiers (`Ctrl+Shift`)
+> to minimise collisions; a single-modifier chord like `Shift+Z` would
+> also block Shift+Z from reaching the focused window. Rebind in
+> Settings if that's what you want.
 
 ## Setup
 

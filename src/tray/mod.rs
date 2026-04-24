@@ -18,6 +18,12 @@ pub struct Tray {
     icon: TrayIcon,
     ids: TrayMenuIds,
     cmd_tx: Sender<Command>,
+    /// Live handles on the two capture MenuItems so we can update their
+    /// accelerator labels in-place when settings change — avoids a full
+    /// tray reinstall (which flashes the icon) or a menu swap (which
+    /// didn't reliably update the visible chord on Windows).
+    capture_item: MenuItem,
+    capture_annotate_item: MenuItem,
 }
 
 #[derive(Clone)]
@@ -41,15 +47,11 @@ impl Tray {
     ) -> Result<Self> {
         let menu = Menu::new();
 
-        // Parse the user's bound chords into tray accelerators so the menu
-        // entries show "PrintScreen" / "Ctrl+X" on the right. If the chord
-        // can't be parsed (shouldn't happen — Settings validates), we drop
-        // the accelerator so the item still renders without a label.
         let fullscreen_accel = parse_accelerator(&settings.hotkey.raw);
         let annotate_accel = parse_accelerator(&settings.annotate_hotkey.raw);
 
-        let capture = MenuItem::new("Capture fullscreen", true, fullscreen_accel);
-        let capture_annotate = MenuItem::new(
+        let capture_item = MenuItem::new("Capture fullscreen", true, fullscreen_accel);
+        let capture_annotate_item = MenuItem::new(
             "Capture \u{0026} annotate\u{2026}",
             true,
             annotate_accel,
@@ -58,8 +60,8 @@ impl Tray {
         let settings_item = MenuItem::new("Settings\u{2026}", true, None);
         let quit = MenuItem::new("Quit GrabIt", true, None);
 
-        menu.append(&capture).context("append capture item")?;
-        menu.append(&capture_annotate).context("append annotate item")?;
+        menu.append(&capture_item).context("append capture item")?;
+        menu.append(&capture_annotate_item).context("append annotate item")?;
         menu.append(&PredefinedMenuItem::separator()).ok();
         menu.append(&open_output).context("append output item")?;
         menu.append(&settings_item).context("append settings item")?;
@@ -67,8 +69,8 @@ impl Tray {
         menu.append(&quit).context("append quit item")?;
 
         let ids = TrayMenuIds {
-            capture: capture.id().clone(),
-            capture_annotate: capture_annotate.id().clone(),
+            capture: capture_item.id().clone(),
+            capture_annotate: capture_annotate_item.id().clone(),
             open_output: open_output.id().clone(),
             settings: settings_item.id().clone(),
             quit: quit.id().clone(),
@@ -82,7 +84,42 @@ impl Tray {
             .build()
             .context("build tray icon")?;
 
-        Ok(Self { icon, ids, cmd_tx })
+        Ok(Self {
+            icon,
+            ids,
+            cmd_tx,
+            capture_item,
+            capture_annotate_item,
+        })
+    }
+
+    /// Push the latest hotkey chords onto the live menu items without
+    /// tearing down the tray icon. `set_accelerator` rewrites the visible
+    /// shortcut text (the right-aligned "Ctrl+Shift+A" you see on the menu
+    /// row); `set_text` re-renders the full item so the change takes
+    /// effect on the next tray open. Cheap and side-effect-free — no
+    /// flicker, no lost events.
+    pub fn refresh_hotkey_labels(&self, settings: &Settings) {
+        let fullscreen_accel = parse_accelerator(&settings.hotkey.raw);
+        let annotate_accel = parse_accelerator(&settings.annotate_hotkey.raw);
+
+        if let Err(e) = self.capture_item.set_accelerator(fullscreen_accel) {
+            warn!("tray: set fullscreen accelerator failed: {e}");
+        }
+        // Re-setting the item text forces muda to re-format the visible
+        // "text\t<accelerator>" string on Windows. Without this, some
+        // builds leave the previous accelerator rendered even though the
+        // internal accelerator was updated.
+        self.capture_item.set_text("Capture fullscreen");
+
+        if let Err(e) = self
+            .capture_annotate_item
+            .set_accelerator(annotate_accel)
+        {
+            warn!("tray: set annotate accelerator failed: {e}");
+        }
+        self.capture_annotate_item
+            .set_text("Capture \u{0026} annotate\u{2026}");
     }
 
     /// Kept as a no-op for API compatibility with the main-loop reload path.

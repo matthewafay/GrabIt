@@ -521,7 +521,74 @@ pub fn draw_shape(
 // Step marker
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Draw a numbered step marker. Rendered through 4× supersampling so the
+/// circle edge + outline are smooth rather than pixel-jagged. Same
+/// offscreen + downsample pattern as `draw_arrow`.
 pub fn draw_step(
+    canvas: &mut RgbaImage,
+    center: [f32; 2],
+    radius: f32,
+    number: u32,
+    fill: [u8; 4],
+    text_color: [u8; 4],
+) {
+    if radius <= 0.0 { return; }
+    let stroke = (radius * 0.08).max(1.5);
+    let pad = stroke + 2.0;
+
+    let (cw, ch) = canvas.dimensions();
+    let x0 = ((center[0] - radius - pad).floor() as i32).max(0) as u32;
+    let y0 = ((center[1] - radius - pad).floor() as i32).max(0) as u32;
+    let x1 = ((center[0] + radius + pad).ceil() as i32).min(cw as i32).max(0) as u32;
+    let y1 = ((center[1] + radius + pad).ceil() as i32).min(ch as i32).max(0) as u32;
+    if x1 <= x0 || y1 <= y0 { return; }
+
+    let sub_w = x1 - x0;
+    let sub_h = y1 - y0;
+    const SSAA: u32 = 4;
+    let mut hi = RgbaImage::new(sub_w * SSAA, sub_h * SSAA);
+    let s = SSAA as f32;
+    let shifted_center = [
+        (center[0] - x0 as f32) * s,
+        (center[1] - y0 as f32) * s,
+    ];
+    draw_step_aliased(
+        &mut hi,
+        shifted_center,
+        radius * s,
+        number,
+        fill,
+        text_color,
+    );
+
+    let n = (SSAA * SSAA) as u32;
+    for dy in 0..sub_h {
+        for dx in 0..sub_w {
+            let mut sum: [u32; 4] = [0, 0, 0, 0];
+            for oy in 0..SSAA {
+                for ox in 0..SSAA {
+                    let p = hi.get_pixel(dx * SSAA + ox, dy * SSAA + oy).0;
+                    sum[0] += p[0] as u32;
+                    sum[1] += p[1] as u32;
+                    sum[2] += p[2] as u32;
+                    sum[3] += p[3] as u32;
+                }
+            }
+            let avg = [
+                (sum[0] / n) as u8,
+                (sum[1] / n) as u8,
+                (sum[2] / n) as u8,
+                (sum[3] / n) as u8,
+            ];
+            if avg[3] > 0 {
+                blend_pixel(canvas, x0 + dx, y0 + dy, avg);
+            }
+        }
+    }
+}
+
+/// Aliased step draw (called at 4× resolution inside the SSAA sub-image).
+fn draw_step_aliased(
     canvas: &mut RgbaImage,
     center: [f32; 2],
     radius: f32,
@@ -1526,52 +1593,60 @@ pub fn apply_torn_edge(img: &RgbaImage, effect: EdgeEffect) -> RgbaImage {
     // Deterministic pseudo-random jitter so the teeth aren't perfectly
     // regular; varying by position of the tooth, not by frame, so flatten
     // results are stable.
-    let jitter = |n: u32| -> f32 {
-        let mut s = n.wrapping_mul(2654435761).wrapping_add(1);
+    let jitter = |n: u32, salt: u32| -> f32 {
+        let mut s = n.wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503));
         s ^= s >> 16;
         s = s.wrapping_mul(0x85ebca6b);
         let u = (s & 0xFFFF) as f32 / 65536.0; // 0..1
         (u - 0.5) * 0.6 // +/- 0.3
     };
 
-    match effect.edge {
-        Edge::Top | Edge::Bottom => {
-            for x in 0..w {
-                // Tooth profile: sawtooth with jitter. `local` goes 0..teeth.
-                let idx = x as f32 / teeth;
-                let tooth_n = idx.floor() as u32;
-                let frac = idx - idx.floor();
-                // Triangle wave 0..1..0 across one tooth.
-                let tri = 1.0 - (2.0 * frac - 1.0).abs();
-                let j = 1.0 + jitter(tooth_n);
-                let depth_here = depth * tri * j;
-                let d = depth_here.max(0.0) as u32;
-                for y in 0..d.min(h) {
-                    let yy = match effect.edge {
-                        Edge::Top => y,
-                        Edge::Bottom => h - 1 - y,
-                        _ => unreachable!(),
-                    };
-                    out.put_pixel(x, yy, Rgba([0, 0, 0, 0]));
+    for edge in effect.active_edges() {
+        // Salting by edge so two adjacent tears don't share the same
+        // jitter pattern — otherwise corners look suspiciously symmetric.
+        let salt = match edge {
+            Edge::Top => 1,
+            Edge::Bottom => 2,
+            Edge::Left => 3,
+            Edge::Right => 4,
+        };
+        match edge {
+            Edge::Top | Edge::Bottom => {
+                for x in 0..w {
+                    let idx = x as f32 / teeth;
+                    let tooth_n = idx.floor() as u32;
+                    let frac = idx - idx.floor();
+                    let tri = 1.0 - (2.0 * frac - 1.0).abs();
+                    let j = 1.0 + jitter(tooth_n, salt);
+                    let depth_here = depth * tri * j;
+                    let d = depth_here.max(0.0) as u32;
+                    for y in 0..d.min(h) {
+                        let yy = match edge {
+                            Edge::Top => y,
+                            Edge::Bottom => h - 1 - y,
+                            _ => unreachable!(),
+                        };
+                        out.put_pixel(x, yy, Rgba([0, 0, 0, 0]));
+                    }
                 }
             }
-        }
-        Edge::Left | Edge::Right => {
-            for y in 0..h {
-                let idx = y as f32 / teeth;
-                let tooth_n = idx.floor() as u32;
-                let frac = idx - idx.floor();
-                let tri = 1.0 - (2.0 * frac - 1.0).abs();
-                let j = 1.0 + jitter(tooth_n);
-                let depth_here = depth * tri * j;
-                let d = depth_here.max(0.0) as u32;
-                for x in 0..d.min(w) {
-                    let xx = match effect.edge {
-                        Edge::Left => x,
-                        Edge::Right => w - 1 - x,
-                        _ => unreachable!(),
-                    };
-                    out.put_pixel(xx, y, Rgba([0, 0, 0, 0]));
+            Edge::Left | Edge::Right => {
+                for y in 0..h {
+                    let idx = y as f32 / teeth;
+                    let tooth_n = idx.floor() as u32;
+                    let frac = idx - idx.floor();
+                    let tri = 1.0 - (2.0 * frac - 1.0).abs();
+                    let j = 1.0 + jitter(tooth_n, salt);
+                    let depth_here = depth * tri * j;
+                    let d = depth_here.max(0.0) as u32;
+                    for x in 0..d.min(w) {
+                        let xx = match edge {
+                            Edge::Left => x,
+                            Edge::Right => w - 1 - x,
+                            _ => unreachable!(),
+                        };
+                        out.put_pixel(xx, y, Rgba([0, 0, 0, 0]));
+                    }
                 }
             }
         }
@@ -1589,16 +1664,18 @@ pub fn apply_torn_edge(img: &RgbaImage, effect: EdgeEffect) -> RgbaImage {
 pub fn apply_border(img: &RgbaImage, border: Border) -> RgbaImage {
     let (w, h) = img.dimensions();
     let bw = border.width.max(0.0).round() as u32;
+    let mw = border.matte_width.max(0.0).round() as u32;
+    let frame = bw + mw; // total frame thickness outside the image.
     let shadow_r = border.shadow_radius.max(0.0).round() as u32;
     let sox = border.shadow_offset[0].round() as i32;
     let soy = border.shadow_offset[1].round() as i32;
 
-    // Total margins on each side account for both border and shadow spread
-    // plus offset (in whichever direction each axis is positive).
-    let pad_l = bw + shadow_r + (-sox).max(0) as u32;
-    let pad_r = bw + shadow_r + sox.max(0) as u32;
-    let pad_t = bw + shadow_r + (-soy).max(0) as u32;
-    let pad_b = bw + shadow_r + soy.max(0) as u32;
+    // Total margins on each side: frame (outer + matte) + shadow spread
+    // plus whichever-direction-positive offset.
+    let pad_l = frame + shadow_r + (-sox).max(0) as u32;
+    let pad_r = frame + shadow_r + sox.max(0) as u32;
+    let pad_t = frame + shadow_r + (-soy).max(0) as u32;
+    let pad_b = frame + shadow_r + soy.max(0) as u32;
 
     let new_w = w + pad_l + pad_r;
     let new_h = h + pad_t + pad_b;
@@ -1607,14 +1684,12 @@ pub fn apply_border(img: &RgbaImage, border: Border) -> RgbaImage {
     let content_x = pad_l as i32;
     let content_y = pad_t as i32;
 
-    // Draw drop shadow first (underneath the image + border).
+    // Draw drop shadow first (underneath the image + frame).
     if shadow_r > 0 || border.shadow_color[3] > 0 && (sox != 0 || soy != 0) {
-        // Solid shadow rect offset by (sox, soy), then gaussian-blurred.
-        let shadow_rect_x = content_x - bw as i32 + sox;
-        let shadow_rect_y = content_y - bw as i32 + soy;
-        let shadow_rect_w = w + 2 * bw;
-        let shadow_rect_h = h + 2 * bw;
-        // Stamp a solid rectangle of the shadow color.
+        let shadow_rect_x = content_x - frame as i32 + sox;
+        let shadow_rect_y = content_y - frame as i32 + soy;
+        let shadow_rect_w = w + 2 * frame;
+        let shadow_rect_h = h + 2 * frame;
         let x0 = shadow_rect_x.max(0) as u32;
         let y0 = shadow_rect_y.max(0) as u32;
         let x1 = ((shadow_rect_x + shadow_rect_w as i32).min(new_w as i32)).max(0) as u32;
@@ -1632,15 +1707,30 @@ pub fn apply_border(img: &RgbaImage, border: Border) -> RgbaImage {
         }
     }
 
-    // Draw border band.
-    if bw > 0 && border.color[3] > 0 {
-        let bx0 = (content_x - bw as i32).max(0) as u32;
-        let by0 = (content_y - bw as i32).max(0) as u32;
-        let bx1 = ((content_x + w as i32 + bw as i32).min(new_w as i32)).max(0) as u32;
-        let by1 = ((content_y + h as i32 + bw as i32).min(new_h as i32)).max(0) as u32;
+    // Outer border band — fills the entire frame area (bw + mw). The
+    // matte pass below overwrites the inner strip to produce the
+    // two-band photo-frame look.
+    if frame > 0 && border.color[3] > 0 {
+        let bx0 = (content_x - frame as i32).max(0) as u32;
+        let by0 = (content_y - frame as i32).max(0) as u32;
+        let bx1 = ((content_x + w as i32 + frame as i32).min(new_w as i32)).max(0) as u32;
+        let by1 = ((content_y + h as i32 + frame as i32).min(new_h as i32)).max(0) as u32;
         for y in by0..by1 {
             for x in bx0..bx1 {
                 blend_pixel(&mut out, x, y, border.color);
+            }
+        }
+    }
+
+    // Matte band — the inner `mw`-wide ring hugging the image.
+    if mw > 0 && border.matte_color[3] > 0 {
+        let mx0 = (content_x - mw as i32).max(0) as u32;
+        let my0 = (content_y - mw as i32).max(0) as u32;
+        let mx1 = ((content_x + w as i32 + mw as i32).min(new_w as i32)).max(0) as u32;
+        let my1 = ((content_y + h as i32 + mw as i32).min(new_h as i32)).max(0) as u32;
+        for y in my0..my1 {
+            for x in mx0..mx1 {
+                blend_pixel(&mut out, x, y, border.matte_color);
             }
         }
     }
@@ -1654,10 +1744,6 @@ pub fn apply_border(img: &RgbaImage, border: Border) -> RgbaImage {
             if dx < 0 || dy < 0 || dx >= new_w as i32 || dy >= new_h as i32 {
                 continue;
             }
-            // Force-write the image pixel — we want the original to survive
-            // over the border band exactly (no alpha-blend inside the
-            // content rect). Transparent source pixels (torn-edge holes)
-            // still reveal the border/shadow underneath, so we use blend.
             blend_pixel(&mut out, dx as u32, dy as u32, p);
         }
     }
@@ -1752,6 +1838,10 @@ mod tests {
         let base = RgbaImage::from_pixel(32, 32, Rgba([200, 100, 50, 255]));
         let torn = apply_torn_edge(&base, EdgeEffect {
             edge: Edge::Bottom,
+            top: false,
+            bottom: true,
+            left: false,
+            right: false,
             depth: 4.0,
             teeth: 8.0,
         });
@@ -1964,6 +2054,8 @@ mod tests {
             shadow_radius: 0.0,
             shadow_offset: [0.0, 0.0],
             shadow_color: [0, 0, 0, 0],
+            matte_width: 0.0,
+            matte_color: [245, 240, 230, 255],
         });
         assert_eq!(out.width(), 32 + 8);
         assert_eq!(out.height(), 32 + 8);

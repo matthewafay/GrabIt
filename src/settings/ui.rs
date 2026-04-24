@@ -81,16 +81,21 @@ impl SettingsApp {
         let mut cancel = false;
         let mut new_capture: Option<String> = None;
         ctx.input(|i| {
+            // Read the modifier state once per frame rather than trusting
+            // each `Event::Key`'s own `modifiers` field. In some egui event
+            // orderings the per-event modifiers briefly lag the real state
+            // (e.g. the Z in Ctrl+Z can arrive before the Ctrl-down event
+            // has updated the event's own snapshot), which would capture
+            // the chord as "Z" instead of "Ctrl+Z". Using the frame-level
+            // state avoids that race entirely.
+            let live_mods = i.modifiers;
             for ev in &i.events {
-                if let egui::Event::Key {
-                    key, pressed: true, modifiers, ..
-                } = ev
-                {
+                if let egui::Event::Key { key, pressed: true, .. } = ev {
                     if *key == egui::Key::Escape {
                         cancel = true;
                         continue;
                     }
-                    if let Some(chord) = format_captured_chord(*modifiers, *key) {
+                    if let Some(chord) = format_captured_chord(live_mods, *key) {
                         new_capture = Some(chord);
                     }
                 }
@@ -262,6 +267,16 @@ impl eframe::App for SettingsApp {
                 if ui.button("Cancel").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                // Put Reset at the right so it's not in the primary
+                // save/cancel flow — avoids accidental clicks.
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("Reset to defaults").clicked() {
+                            self.reset_to_defaults();
+                        }
+                    },
+                );
             });
         });
 
@@ -274,6 +289,19 @@ impl eframe::App for SettingsApp {
 }
 
 impl SettingsApp {
+    /// Wipe the in-memory form back to factory defaults. Doesn't touch
+    /// disk — user still needs to click Save to persist. Cancel reverts.
+    fn reset_to_defaults(&mut self) {
+        let fresh = Settings::default();
+        self.hotkey_buf = fresh.hotkey.raw.clone();
+        self.annotate_hotkey_buf = fresh.annotate_hotkey.raw.clone();
+        self.output_dir_buf.clear(); // empty string → use default output dir
+        self.settings = fresh;
+        self.recording = None;
+        self.captured = None;
+        self.status = "Reset — click Save to apply, Cancel to discard.".into();
+    }
+
     /// A single hotkey row. When not recording, shows the current chord as
     /// a clickable button (click = enter record mode). When recording,
     /// shows a live "Press combo\u{2026}" / "Captured: …" label plus

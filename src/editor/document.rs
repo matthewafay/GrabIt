@@ -165,10 +165,30 @@ pub enum Edge {
     Right,
 }
 
-/// Torn-edge effect applied at flatten-time.
+/// Torn-edge effect applied at flatten-time. Supports tearing any
+/// combination of the four edges simultaneously via the `top` / `bottom` /
+/// `left` / `right` booleans; the legacy `edge` field is kept for
+/// backward-compatible deserialisation of pre-1.3 documents that only
+/// allowed a single edge.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EdgeEffect {
+    /// Legacy single-edge field. Still serialised for downgrade safety;
+    /// on load, if none of the per-edge booleans are true, this value
+    /// becomes the one active edge (see [`EdgeEffect::active_edges`]).
+    #[serde(default = "default_edge")]
     pub edge: Edge,
+    /// Tear the top edge.
+    #[serde(default)]
+    pub top: bool,
+    /// Tear the bottom edge.
+    #[serde(default)]
+    pub bottom: bool,
+    /// Tear the left edge.
+    #[serde(default)]
+    pub left: bool,
+    /// Tear the right edge.
+    #[serde(default)]
+    pub right: bool,
     /// Depth (in image pixels) the jagged teeth extend INTO the image from
     /// the selected edge.
     pub depth: f32,
@@ -176,13 +196,50 @@ pub struct EdgeEffect {
     pub teeth: f32,
 }
 
+fn default_edge() -> Edge { Edge::Bottom }
+
 impl Default for EdgeEffect {
     fn default() -> Self {
-        Self { edge: Edge::Bottom, depth: 14.0, teeth: 18.0 }
+        Self {
+            edge: Edge::Bottom,
+            top: false,
+            bottom: true,
+            left: false,
+            right: false,
+            depth: 14.0,
+            teeth: 18.0,
+        }
+    }
+}
+
+impl EdgeEffect {
+    /// List of edges currently enabled for tearing. If none of the
+    /// per-edge booleans are set (legacy document), falls back to the
+    /// single `edge` field. Order is always Top → Bottom → Left → Right.
+    pub fn active_edges(&self) -> Vec<Edge> {
+        let explicit = self.top || self.bottom || self.left || self.right;
+        if explicit {
+            let mut out = Vec::with_capacity(4);
+            if self.top { out.push(Edge::Top); }
+            if self.bottom { out.push(Edge::Bottom); }
+            if self.left { out.push(Edge::Left); }
+            if self.right { out.push(Edge::Right); }
+            out
+        } else {
+            vec![self.edge]
+        }
     }
 }
 
 /// Image border + optional drop shadow applied at flatten-time.
+///
+/// Layout (outside → inside):
+///   [ shadow ] [ outer border (`color`, `width`) ] [ matte (`matte_color`,
+///   `matte_width`) ] [ image ]
+///
+/// `matte_width = 0` (default for pre-1.3 docs) is the classic single-band
+/// look. A non-zero matte turns the border into a classic photo frame —
+/// thin dark outer rim plus a lighter inner matte.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Border {
     pub color: [u8; 4],
@@ -192,7 +249,16 @@ pub struct Border {
     pub shadow_radius: f32,
     pub shadow_offset: [f32; 2],
     pub shadow_color: [u8; 4],
+    /// Width of the inner matte band in image pixels. `0.0` (default for
+    /// legacy docs) disables the matte entirely.
+    #[serde(default)]
+    pub matte_width: f32,
+    /// Matte band colour. Defaults to an off-white ivory.
+    #[serde(default = "default_matte_color")]
+    pub matte_color: [u8; 4],
 }
+
+fn default_matte_color() -> [u8; 4] { [245, 240, 230, 255] }
 
 impl Default for Border {
     fn default() -> Self {
@@ -202,6 +268,8 @@ impl Default for Border {
             shadow_radius: 0.0,
             shadow_offset: [0.0, 0.0],
             shadow_color: [0, 0, 0, 128],
+            matte_width: 0.0,
+            matte_color: default_matte_color(),
         }
     }
 }
@@ -1036,6 +1104,10 @@ mod tests {
         let mut doc = stub_doc();
         doc.edge_effect = Some(EdgeEffect {
             edge: Edge::Right,
+            top: false,
+            bottom: false,
+            left: false,
+            right: true,
             depth: 20.0,
             teeth: 24.0,
         });
@@ -1054,6 +1126,8 @@ mod tests {
             shadow_radius: 6.0,
             shadow_offset: [2.0, 3.0],
             shadow_color: [0, 0, 0, 150],
+            matte_width: 0.0,
+            matte_color: [245, 240, 230, 255],
         });
         let back = round_trip(&doc);
         let b = back.border.expect("border round-trip");
