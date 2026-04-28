@@ -6,6 +6,8 @@
 //! PNG — keeps the cursor on its own layer so the editor (M2+) can still
 //! move/resize/remove it.
 
+pub mod gif;
+
 use crate::app::paths::AppPaths;
 use crate::capture::{CaptureResult, CursorLayer};
 use anyhow::{Context, Result};
@@ -61,7 +63,7 @@ fn flatten(result: &CaptureResult) -> RgbaImage {
     out
 }
 
-fn composite_over(dst: &mut RgbaImage, cursor: &CursorLayer) {
+pub(crate) fn composite_over(dst: &mut RgbaImage, cursor: &CursorLayer) {
     let (dw, dh) = dst.dimensions();
     let (cw, ch) = cursor.image.dimensions();
     for cy in 0..ch {

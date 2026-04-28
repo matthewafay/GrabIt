@@ -6,12 +6,13 @@
 pub mod app;
 pub mod commands;
 pub mod document;
+pub mod gif_app;
 pub mod rasterize;
 pub mod tools;
 
 /// Decode the embedded logo PNG for use as an eframe window icon.
 /// Returns `None` if decoding fails — eframe then falls back to its default.
-fn load_app_icon_data() -> Option<egui::IconData> {
+pub(crate) fn load_app_icon_data() -> Option<egui::IconData> {
     const PNG: &[u8] = include_bytes!("../../assets/icons/grabit.png");
     let img = image::load_from_memory(PNG).ok()?.to_rgba8();
     let (width, height) = img.dimensions();
@@ -140,7 +141,7 @@ pub fn run_blocking(
 /// Register JetBrains Mono as the first-choice face for both of egui's
 /// built-in font families. egui keeps its default fallbacks (Ubuntu-Light,
 /// Noto Emoji, etc.) behind ours so missing glyphs still render.
-fn install_jetbrains_mono(ctx: &egui::Context) {
+pub(crate) fn install_jetbrains_mono(ctx: &egui::Context) {
     use crate::platform::fonts::{JETBRAINS_MONO_BOLD, JETBRAINS_MONO_REGULAR};
 
     let mut fonts = egui::FontDefinitions::default();

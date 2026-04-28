@@ -41,11 +41,16 @@ rmp-serde = "1.3"
 rfd = "0.15"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # M4: imageproc's gaussian_blur for non-destructive blur regions. Used at
 # flatten-time; no runtime deps added (pure Rust).
 imageproc = { version = "0.25", default-features = false }
+# Direct gif crate (image 0.25 already pulls it in transitively) so the
+# GIF exporter can run NeuQuant per-frame on every CPU core in parallel
+# instead of going through image's single-threaded GifEncoder.
+gif = "0.13"
+rayon = "1.10"
 
 tray-icon = "0.19"
 global-hotkey = "0.6"

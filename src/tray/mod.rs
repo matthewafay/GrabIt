@@ -18,18 +18,20 @@ pub struct Tray {
     icon: TrayIcon,
     ids: TrayMenuIds,
     cmd_tx: Sender<Command>,
-    /// Live handles on the two capture MenuItems so we can update their
+    /// Live handles on the capture MenuItems so we can update their
     /// accelerator labels in-place when settings change — avoids a full
     /// tray reinstall (which flashes the icon) or a menu swap (which
     /// didn't reliably update the visible chord on Windows).
     capture_item: MenuItem,
     capture_annotate_item: MenuItem,
+    record_gif_item: MenuItem,
 }
 
 #[derive(Clone)]
 pub struct TrayMenuIds {
     pub capture: tray_icon::menu::MenuId,
     pub capture_annotate: tray_icon::menu::MenuId,
+    pub record_gif: tray_icon::menu::MenuId,
     pub open_output: tray_icon::menu::MenuId,
     pub settings: tray_icon::menu::MenuId,
     pub quit: tray_icon::menu::MenuId,
@@ -49,6 +51,7 @@ impl Tray {
 
         let fullscreen_accel = parse_accelerator(&settings.hotkey.raw);
         let annotate_accel = parse_accelerator(&settings.annotate_hotkey.raw);
+        let gif_accel = parse_accelerator(&settings.gif_hotkey.raw);
 
         let capture_item = MenuItem::new("Capture fullscreen", true, fullscreen_accel);
         let capture_annotate_item = MenuItem::new(
@@ -56,12 +59,14 @@ impl Tray {
             true,
             annotate_accel,
         );
+        let record_gif_item = MenuItem::new("Record GIF\u{2026}", true, gif_accel);
         let open_output = MenuItem::new("Open output folder", true, None);
         let settings_item = MenuItem::new("Settings\u{2026}", true, None);
         let quit = MenuItem::new("Quit GrabIt", true, None);
 
         menu.append(&capture_item).context("append capture item")?;
         menu.append(&capture_annotate_item).context("append annotate item")?;
+        menu.append(&record_gif_item).context("append record gif item")?;
         menu.append(&PredefinedMenuItem::separator()).ok();
         menu.append(&open_output).context("append output item")?;
         menu.append(&settings_item).context("append settings item")?;
@@ -71,6 +76,7 @@ impl Tray {
         let ids = TrayMenuIds {
             capture: capture_item.id().clone(),
             capture_annotate: capture_annotate_item.id().clone(),
+            record_gif: record_gif_item.id().clone(),
             open_output: open_output.id().clone(),
             settings: settings_item.id().clone(),
             quit: quit.id().clone(),
@@ -90,6 +96,7 @@ impl Tray {
             cmd_tx,
             capture_item,
             capture_annotate_item,
+            record_gif_item,
         })
     }
 
@@ -102,6 +109,7 @@ impl Tray {
     pub fn refresh_hotkey_labels(&self, settings: &Settings) {
         let fullscreen_accel = parse_accelerator(&settings.hotkey.raw);
         let annotate_accel = parse_accelerator(&settings.annotate_hotkey.raw);
+        let gif_accel = parse_accelerator(&settings.gif_hotkey.raw);
 
         if let Err(e) = self.capture_item.set_accelerator(fullscreen_accel) {
             warn!("tray: set fullscreen accelerator failed: {e}");
@@ -120,6 +128,11 @@ impl Tray {
         }
         self.capture_annotate_item
             .set_text("Capture \u{0026} annotate\u{2026}");
+
+        if let Err(e) = self.record_gif_item.set_accelerator(gif_accel) {
+            warn!("tray: set record-gif accelerator failed: {e}");
+        }
+        self.record_gif_item.set_text("Record GIF\u{2026}");
     }
 
     /// Kept as a no-op for API compatibility with the main-loop reload path.
@@ -164,6 +177,8 @@ pub fn on_menu_event(ev: MenuEvent, cmd_tx: &Sender<Command>) {
         Some(Command::CaptureFullscreen)
     } else if ev.id == ids.capture_annotate {
         Some(Command::CaptureAndAnnotate)
+    } else if ev.id == ids.record_gif {
+        Some(Command::CaptureGif)
     } else if ev.id == ids.open_output {
         Some(Command::OpenOutputFolder)
     } else if ev.id == ids.settings {

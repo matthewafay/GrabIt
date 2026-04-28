@@ -65,6 +65,19 @@ impl AppPaths {
         self.output_dir.join(format!("GrabIt-{stamp}.{ext}"))
     }
 
+    /// Spool directory for in-progress GIF recordings. Created lazily on
+    /// first use; each recording gets its own UUID-named subdirectory under
+    /// here so concurrent runs (or a crash mid-recording) don't collide.
+    pub fn gif_temp_dir(&self) -> PathBuf {
+        self.data_dir.join("gif-record")
+    }
+
+    /// Default filename for an exported GIF. Timestamped like the regular
+    /// PNG output so multiple exports in the same minute don't overwrite.
+    pub fn default_gif_filename(&self) -> PathBuf {
+        self.default_capture_filename("gif")
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

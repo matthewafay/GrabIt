@@ -35,6 +35,7 @@ pub fn run_blocking(paths: AppPaths, initial: Settings) -> Result<()> {
 enum RecordTarget {
     Fullscreen,
     Annotate,
+    Gif,
 }
 
 struct SettingsApp {
@@ -42,6 +43,7 @@ struct SettingsApp {
     paths: AppPaths,
     hotkey_buf: String,
     annotate_hotkey_buf: String,
+    gif_hotkey_buf: String,
     output_dir_buf: String,
     default_output_dir: String,
     status: String,
@@ -56,6 +58,7 @@ impl SettingsApp {
     fn new(settings: Settings, paths: AppPaths) -> Self {
         let hotkey_buf = settings.hotkey.raw.clone();
         let annotate_hotkey_buf = settings.annotate_hotkey.raw.clone();
+        let gif_hotkey_buf = settings.gif_hotkey.raw.clone();
         let output_dir_buf = settings.output_dir.clone().unwrap_or_default();
         let default_output_dir = paths.output_dir.display().to_string();
         Self {
@@ -63,6 +66,7 @@ impl SettingsApp {
             paths,
             hotkey_buf,
             annotate_hotkey_buf,
+            gif_hotkey_buf,
             output_dir_buf,
             default_output_dir,
             status: String::new(),
@@ -150,6 +154,7 @@ impl eframe::App for SettingsApp {
             ui.add_space(4.0);
             self.hotkey_row(ui, "Fullscreen capture", RecordTarget::Fullscreen);
             self.hotkey_row(ui, "Annotate", RecordTarget::Annotate);
+            self.hotkey_row(ui, "Record GIF", RecordTarget::Gif);
 
             section_break(ui);
 
@@ -221,6 +226,41 @@ impl eframe::App for SettingsApp {
                 .color(egui::Color32::GRAY),
             );
 
+            section_break(ui);
+
+            // ── GIF section ───────────────────────────────────────────
+            section_header(ui, "GIF");
+            egui::Grid::new("gif-grid")
+                .num_columns(2)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Frames per second");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.gif_fps)
+                            .range(5..=60)
+                            .suffix(" fps"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Loop count (0 = infinite)");
+                    let mut loop_val = self.settings.gif_loop_count as i32;
+                    ui.add(egui::DragValue::new(&mut loop_val).range(0..=10_000));
+                    self.settings.gif_loop_count = loop_val.clamp(0, u16::MAX as i32) as u16;
+                    ui.end_row();
+
+                    ui.label("Max recording length");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.gif_max_seconds)
+                            .range(1..=600)
+                            .suffix(" s"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Include cursor in GIF frames");
+                    ui.checkbox(&mut self.settings.gif_record_cursor, "");
+                    ui.end_row();
+                });
+
             ui.add_space(14.0);
 
             if !self.status.is_empty() {
@@ -241,8 +281,16 @@ impl eframe::App for SettingsApp {
                         self.status = format!("Annotate hotkey invalid: {e}");
                         return;
                     }
+                    if let Err(e) = parse_chord(&self.gif_hotkey_buf) {
+                        self.status = format!("GIF hotkey invalid: {e}");
+                        return;
+                    }
                     self.settings.hotkey.raw = self.hotkey_buf.clone();
                     self.settings.annotate_hotkey.raw = self.annotate_hotkey_buf.clone();
+                    self.settings.gif_hotkey.raw = self.gif_hotkey_buf.clone();
+                    // Clamp FPS in case the field was edited in JSON to an
+                    // out-of-range value before this save.
+                    self.settings.gif_fps = self.settings.gif_fps.clamp(5, 60);
 
                     let trimmed = self.output_dir_buf.trim();
                     if trimmed.is_empty() {
@@ -295,6 +343,7 @@ impl SettingsApp {
         let fresh = Settings::default();
         self.hotkey_buf = fresh.hotkey.raw.clone();
         self.annotate_hotkey_buf = fresh.annotate_hotkey.raw.clone();
+        self.gif_hotkey_buf = fresh.gif_hotkey.raw.clone();
         self.output_dir_buf.clear(); // empty string → use default output dir
         self.settings = fresh;
         self.recording = None;
@@ -336,6 +385,7 @@ impl SettingsApp {
                         match target {
                             RecordTarget::Fullscreen => self.hotkey_buf = c,
                             RecordTarget::Annotate => self.annotate_hotkey_buf = c,
+                            RecordTarget::Gif => self.gif_hotkey_buf = c,
                         }
                     }
                     self.recording = None;
@@ -348,6 +398,7 @@ impl SettingsApp {
                 let current = match target {
                     RecordTarget::Fullscreen => self.hotkey_buf.clone(),
                     RecordTarget::Annotate => self.annotate_hotkey_buf.clone(),
+                    RecordTarget::Gif => self.gif_hotkey_buf.clone(),
                 };
                 if ui
                     .add_sized(

@@ -2,6 +2,7 @@ pub mod cursor;
 pub mod delay;
 pub mod exact_dims;
 pub mod gdi;
+pub mod gif_record;
 pub mod object_pick;
 pub mod region;
 pub mod wgc;

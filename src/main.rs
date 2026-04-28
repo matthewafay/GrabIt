@@ -34,6 +34,12 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--settings") {
         return run_settings_subprocess();
     }
+    if let Some(idx) = args.iter().position(|a| a == "--gif-editor") {
+        let sidecar = args.get(idx + 1)
+            .ok_or_else(|| anyhow::anyhow!("--gif-editor requires a path"))?
+            .clone();
+        return run_gif_editor_subprocess(&sidecar);
+    }
 
     let _instance_guard = match app::single_instance::acquire() {
         Ok(g) => g,
@@ -120,6 +126,20 @@ fn run_settings_subprocess() -> Result<()> {
     settings::ui::run_blocking(paths, initial)
 }
 
+fn run_gif_editor_subprocess(sidecar_path: &str) -> Result<()> {
+    let paths = app::paths::AppPaths::bootstrap().context("create app data directories")?;
+    init_logging(&paths.log_file());
+    platform::dpi::init_process_awareness();
+    platform::fonts::register_with_gdi();
+    let settings = settings::Settings::load_or_default(&paths);
+    info!("gif editor subprocess \u{2192} {sidecar_path}");
+    editor::gif_app::run_blocking(
+        std::path::PathBuf::from(sidecar_path),
+        paths,
+        settings,
+    )
+}
+
 fn run_editor_subprocess(
     grabit_path: &str,
     png_out: Option<&str>,
@@ -201,6 +221,13 @@ fn handle_hotkey_command(
                 Err(e) => warn!("annotate capture failed: {e}"),
             }
         }
+        app::Command::CaptureGif => {
+            // Same toggle semantics as the tray-driven path. Re-press of
+            // the GIF chord while a recording is in flight stops it; an
+            // idle press starts a new one.
+            let settings = settings::Settings::load_or_default(paths);
+            app::run_gif_capture(paths, &settings);
+        }
         other => {
             // Non-capture commands still need AppState access — send to
             // main's cmd channel.
@@ -261,6 +288,7 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
     let hotkey_bindings = [
         (state.settings.hotkey.clone(), app::Command::CaptureFullscreen),
         (state.settings.annotate_hotkey.clone(), app::Command::CaptureAndAnnotate),
+        (state.settings.gif_hotkey.clone(), app::Command::CaptureGif),
     ];
     let mut hotkeys = hotkeys::Registrar::install(cmd_tx.clone(), &hotkey_bindings)
         .context("register global hotkeys")?;
@@ -376,6 +404,7 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
             let bindings = [
                 (state.settings.hotkey.clone(), app::Command::CaptureFullscreen),
                 (state.settings.annotate_hotkey.clone(), app::Command::CaptureAndAnnotate),
+                (state.settings.gif_hotkey.clone(), app::Command::CaptureGif),
             ];
             drop(hotkeys);
             hotkeys = match hotkeys::Registrar::install(cmd_tx.clone(), &bindings) {

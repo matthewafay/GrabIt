@@ -199,7 +199,12 @@ mod imp {
                 LRESULT(0)
             }
             WM_DESTROY => {
-                PostQuitMessage(0);
+                // Pump uses PeekMessageW + an external `DestroyWindow`
+                // after the loop exits, so posting WM_QUIT here would
+                // queue an orphan WM_QUIT on the calling thread. For
+                // captures triggered from the tray menu that thread is
+                // the main thread, so the orphan would shut the tray
+                // down on the next iteration of its PeekMessageW loop.
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

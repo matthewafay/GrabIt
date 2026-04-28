@@ -56,6 +56,10 @@ pub enum Command {
     /// Run the UI-Automation object / menu picker and capture whatever
     /// element the user highlights.
     CaptureObject,
+    /// Begin (or stop) a GIF screen recording. Re-firing the chord while a
+    /// recording is in progress acts as a stop toggle; the actual
+    /// in-progress detection lives in `capture::gif_record`.
+    CaptureGif,
     /// Fire the preset with the given display name. Resolved against the
     /// live `PresetStore`; missing names are logged and ignored so stale
     /// tray entries can't crash the app.
@@ -139,6 +143,12 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
                     include_cursor: state.settings.include_cursor,
                 },
             )?;
+        }
+        Command::CaptureGif => {
+            info!("dispatch: CaptureGif");
+            // Tray-driven entry mirrors the hotkey path: same start/stop
+            // toggle, same recorder, same `--gif-editor` subprocess.
+            run_gif_capture(&state.paths, &state.settings);
         }
         Command::CapturePreset(name) => {
             info!("dispatch: CapturePreset {name:?}");
@@ -311,6 +321,41 @@ fn save_with_preset(
     }
     crate::export::save_png_to(result, &png_path)?;
     Ok(png_path)
+}
+
+/// Shared GIF-capture entry. Used by both the tray menu route (via
+/// `dispatch`) and the hotkey worker thread. If a recording is already in
+/// flight, signals it to stop. Otherwise runs the recorder inline (region
+/// pick + floating bar) and, on Stop, spawns a fresh
+/// `grabit.exe --gif-editor <sidecar>` subprocess.
+pub(crate) fn run_gif_capture(paths: &paths::AppPaths, settings: &Settings) {
+    if crate::capture::gif_record::is_recording() {
+        crate::capture::gif_record::request_stop();
+        info!("gif: stop requested via toggle");
+        return;
+    }
+    match crate::capture::gif_record::run(paths, settings) {
+        Ok(Some(sidecar)) => {
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("gif: resolve current exe: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = std::process::Command::new(exe)
+                .arg("--gif-editor")
+                .arg(&sidecar)
+                .spawn()
+            {
+                warn!("gif: spawn editor subprocess failed: {e}");
+            } else {
+                info!("gif: editor subprocess spawned \u{2192} {}", sidecar.display());
+            }
+        }
+        Ok(None) => info!("gif recording cancelled"),
+        Err(e) => warn!("gif recording failed: {e}"),
+    }
 }
 
 fn open_in_explorer(path: &std::path::Path) {

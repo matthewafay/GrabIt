@@ -39,6 +39,22 @@ pub struct Settings {
     /// When false (default), the Arrow tool shows an 8-swatch palette.
     /// When true, it shows a full color picker plus a hex input field.
     pub arrow_advanced_color: bool,
+
+    /// Global hotkey for `CaptureGif`. Default: Ctrl+Shift+G. Pressing the
+    /// chord while a GIF recording is in progress stops the recording.
+    pub gif_hotkey: HotkeyBinding,
+    /// Target frames-per-second for the recorder. Clamped to 5..=60 by the
+    /// settings UI; the recorder also tolerates out-of-band values.
+    pub gif_fps: u32,
+    /// GIF loop count written into the encoded file. 0 = infinite loop.
+    pub gif_loop_count: u16,
+    /// Hard cap on a single recording's wall time. The recorder posts a
+    /// quit message once elapsed exceeds this many seconds so a stuck
+    /// session doesn't fill the disk with frames.
+    pub gif_max_seconds: u32,
+    /// Composite the cursor into each frame. Separate from `include_cursor`
+    /// because users often want the cursor in screencasts but not in stills.
+    pub gif_record_cursor: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +68,11 @@ impl Default for Settings {
             output_dir: None,
             arrow_shadow: true,
             arrow_advanced_color: false,
+            gif_hotkey: HotkeyBinding { raw: "Ctrl+Shift+G".to_string() },
+            gif_fps: 15,
+            gif_loop_count: 0,
+            gif_max_seconds: 30,
+            gif_record_cursor: true,
         }
     }
 }
