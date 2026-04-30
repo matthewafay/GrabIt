@@ -231,17 +231,23 @@ select {
             #0d1015 90deg 180deg
         )
         0 0 / 24px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    /* `display: block` + minimum content centering via padding works
+       better than flex for an overflow-auto wrapper: with flex
+       align-items: center the SVG can't grow past wrapper bounds
+       even with overflow auto, so scrollbars wouldn't engage. */
     padding: 24px;
 }
 .canvas-wrap svg {
     background: #ffffff;
     box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
     cursor: crosshair;
-    max-width: 100%;
-    max-height: 100%;
+    /* No max-width / max-height: let the SVG render at its native
+       image-pixel size. Wrapper has overflow: auto so larger captures
+       scroll. This keeps `evt.element_coordinates()` 1:1 with image
+       coordinates — without this the SVG scales and pointer math
+       drifts. Zoom-to-fit could come back later via an explicit
+       transform we manage ourselves. */
+    flex-shrink: 0;
 }
 .canvas-wrap.tool-select svg {
     cursor: default;

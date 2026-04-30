@@ -650,15 +650,15 @@ fn start_export(
             match crate::export::gif::encode_to_gif(&active, lc, &out_path, progress) {
                 Ok(()) => {
                     if copy_clipboard {
-                        // Skipping CF_DIB for the GIF artefact itself —
-                        // pasting the file via CF_HDROP keeps animation;
-                        // pasting a still frame as DIB is the wrong
-                        // shape. Match `history.rs`'s behavior here.
-                        info!(
-                            "gif: copy_on_export set, but the encoded GIF \
-                             is best copied via the History viewer's \
-                             Copy button (CF_HDROP)."
-                        );
+                        // GIFs go on the clipboard as CF_HDROP (a file
+                        // drop) — that's how Slack / Discord / Outlook
+                        // preserve animation when pasting. CF_DIB
+                        // would only carry the first frame.
+                        if let Err(e) = crate::export::copy_file_to_clipboard(&out_path) {
+                            warn!("gif: copy on export failed: {e}");
+                        } else {
+                            info!("gif: copied to clipboard as file drop");
+                        }
                     }
                     if let Err(e) = std::fs::remove_dir_all(&spool_dir) {
                         warn!("gif: cleanup spool {}: {e}", spool_dir.display());

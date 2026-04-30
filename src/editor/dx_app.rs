@@ -296,9 +296,15 @@ fn editor_app() -> Element {
     let close_modal = use_signal(|| false);
 
     // Keyboard shortcuts on the document level: Delete, Ctrl+Z / Y /
-    // Shift+Z, Ctrl+S, Esc. Bound to a hidden focus-trap div.
+    // Shift+Z, Ctrl+S, Esc. Bound to a hidden focus-trap div. ctx +
+    // copy_on_save are captured by clone so the closure body never
+    // calls `use_context` (which would be a hook-rule violation).
+    let ctx_for_keys = ctx.clone();
     let on_global_keydown = move |evt: KeyboardEvent| {
-        global_keydown(evt, document, history, dirty, selected, editing_text)
+        global_keydown(
+            evt, document, history, dirty, selected, editing_text,
+            ctx_for_keys.clone(), copy_on_save,
+        )
     };
 
     rsx! {
@@ -391,13 +397,16 @@ fn do_redo(mut document: Signal<Document>, mut history: Signal<History>, mut dir
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn global_keydown(
     evt: KeyboardEvent,
     document: Signal<Document>,
     history: Signal<History>,
-    dirty: Signal<bool>,
+    mut dirty: Signal<bool>,
     mut selected: Signal<Option<Uuid>>,
     mut editing_text: Signal<Option<Uuid>>,
+    ctx: EditorContext,
+    copy_on_save: Signal<bool>,
 ) {
     let key = evt.key();
     let mods = evt.modifiers();
@@ -436,19 +445,15 @@ fn global_keydown(
                     "z" => do_undo(document, history, dirty),
                     "y" => do_redo(document, history, dirty),
                     "s" => {
-                        // Save handled at the top-bar via a closure;
-                        // keyboard variant just calls the shared fn.
-                        let ctx = use_context::<EditorContext>();
-                        if let Err(e) = save_document(
-                            &ctx,
-                            &document.read(),
-                            ctx.copy_on_save,
-                        ) {
+                        // Use the LIVE `copy_on_save` toggle, not the
+                        // initial flag from `--clipboard` — keeps Ctrl+S
+                        // and the toolbar Save button consistent.
+                        let copy = *copy_on_save.read();
+                        let snapshot = document.read().clone();
+                        if let Err(e) = save_document(&ctx, &snapshot, copy) {
                             warn!("save failed: {e}");
                         } else {
-                            // Same-frame dirty clear via shared helper.
-                            let mut d = dirty;
-                            d.set(false);
+                            dirty.set(false);
                         }
                     }
                     _ => {}
@@ -732,26 +737,6 @@ fn CloseConfirm(
 
 // ═══ Canvas + SVG rendering + tool flows ═════════════════════════════
 
-/// Convert a screen-space mouse coordinate (relative to the SVG
-/// element's top-left) to image-space coordinates. The SVG `viewBox`
-/// is set to `0 0 base_width base_height`, so the browser handles
-/// the scaling for us — but pointer events report client-coordinates,
-/// not viewBox-coordinates. We back into viewBox coords from the
-/// element's bounding rect.
-fn client_to_image(
-    client_x: f64,
-    client_y: f64,
-    svg_rect: &dioxus::desktop::tao::dpi::PhysicalSize<u32>,
-    base_w: u32,
-    base_h: u32,
-) -> [f32; 2] {
-    // Fallback path used in tests; in practice the canvas calculates
-    // from the rendered DOM element. Treat the rect as already image
-    // space if dimensions match.
-    let _ = svg_rect;
-    [client_x as f32 * base_w as f32, client_y as f32 * base_h as f32]
-}
-
 #[component]
 fn Canvas(
     document: Signal<Document>,
@@ -766,7 +751,6 @@ fn Canvas(
     let ctx = use_context::<EditorContext>();
     let base_w = document.read().base_width;
     let base_h = document.read().base_height;
-    let view_box = format!("0 0 {} {}", base_w, base_h);
     let cur_tool = *tool.read();
     let wrap_class = format!("canvas-wrap tool-{}", cur_tool.label().to_lowercase());
 
@@ -793,6 +777,22 @@ fn Canvas(
             style, editing_text,
         );
     };
+    // Double-click any annotation enters edit mode if it's a Text
+    // node. Other types ignore double-clicks.
+    let mut editing_text_dbl = editing_text;
+    let mut selected_dbl = selected;
+    let on_doubleclick = move |evt: MouseEvent| {
+        let p = mouse_to_image(&evt, base_w, base_h);
+        let hit = hit_test(&document.read(), p);
+        if let Some(id) = hit {
+            if let Some(node) = find_node(&document.read(), id) {
+                if matches!(node, AnnotationNode::Text { .. }) {
+                    selected_dbl.set(Some(id));
+                    editing_text_dbl.set(Some(id));
+                }
+            }
+        }
+    };
     let on_pointermove = move |evt: MouseEvent| {
         let p = mouse_to_image(&evt, base_w, base_h);
         canvas_pointermove(p, pending, document);
@@ -806,16 +806,22 @@ fn Canvas(
     };
 
     rsx! {
-        div { class: "{wrap_class}",
+        div {
+            class: "{wrap_class}",
+            // SVG <oncontextmenu> doesn't fire reliably in Dioxus rsx;
+            // attach to the wrapping HTML <div> instead so right-click
+            // doesn't pop the WebView2 default menu.
+            oncontextmenu: |evt| evt.prevent_default(),
             svg {
+                // Native CSS-pixel = image-pixel sizing — no viewBox.
+                // This keeps element_coordinates() in image space and
+                // sidesteps a JS-eval'd getBoundingClientRect lookup.
                 width: "{base_w}",
                 height: "{base_h}",
-                view_box: "{view_box}",
-                preserve_aspect_ratio: "xMidYMid meet",
                 onmousedown: on_pointerdown,
                 onmousemove: on_pointermove,
                 onmouseup: on_pointerup,
-                oncontextmenu: |evt| evt.prevent_default(),
+                ondoubleclick: on_doubleclick,
 
                 // SVG <defs> for filters used by Blur / frosted text.
                 {render_defs(&document.read())}
@@ -840,11 +846,10 @@ fn Canvas(
 }
 
 /// Translate a Dioxus mouse event into image-space coordinates.
-/// Uses `element_coordinates` (target-element-relative) and the
-/// rendered SVG dimensions; the SVG itself is sized via attributes
-/// so its DOM size matches its viewBox, and the browser scales the
-/// rendered element. We trust `element_coordinates` to already
-/// account for that scaling.
+/// Since we render the SVG at its native CSS-pixel = image-pixel size
+/// (no viewBox transform), `element_coordinates()` already lives in
+/// image space. The wrapper handles overflow with native scrollbars
+/// rather than scaling.
 fn mouse_to_image(evt: &MouseEvent, _base_w: u32, _base_h: u32) -> [f32; 2] {
     let p = evt.element_coordinates();
     [p.x as f32, p.y as f32]
@@ -1216,14 +1221,14 @@ fn build_node_from_drag(
 fn hit_test(doc: &Document, p: [f32; 2]) -> Option<Uuid> {
     // Iterate top-of-stack first.
     for node in doc.annotations.iter().rev() {
-        if hit_node(node, p) {
+        if hit_node(node, p, doc) {
             return Some(node.id());
         }
     }
     None
 }
 
-fn hit_node(node: &AnnotationNode, p: [f32; 2]) -> bool {
+fn hit_node(node: &AnnotationNode, p: [f32; 2], doc: &Document) -> bool {
     match node {
         AnnotationNode::Arrow { start, end, thickness, .. } => {
             distance_to_segment(p, *start, *end) < (*thickness * 0.6 + 6.0)
@@ -1239,8 +1244,47 @@ fn hit_node(node: &AnnotationNode, p: [f32; 2]) -> bool {
         }
         AnnotationNode::Magnify { target_rect, .. } => point_in_rect(p, *target_rect),
         AnnotationNode::Stamp { rect, .. } => point_in_rect(p, *rect),
-        AnnotationNode::CaptureInfo { .. } => false, // Not selectable for now
+        AnnotationNode::CaptureInfo { position, fields, style, .. } => {
+            // Recompute the same bbox that render_capture_info uses
+            // so a click on the visible banner registers as a hit.
+            if let Some(bbox) = capture_info_bbox(*position, fields, *style, doc) {
+                point_in_rect(p, bbox)
+            } else {
+                false
+            }
+        }
     }
+}
+
+fn capture_info_bbox(
+    position: CaptureInfoPosition,
+    fields: &[FieldKind],
+    style: CaptureInfoStyle,
+    doc: &Document,
+) -> Option<[f32; 4]> {
+    use crate::editor::rasterize::capture_info_lines;
+    let lines = capture_info_lines(Some(&doc.metadata), fields);
+    if lines.is_empty() {
+        return None;
+    }
+    let pad = style.padding;
+    let line_h = style.text_size * 1.25;
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() as f32 * style.text_size * 0.6)
+        .fold(0.0f32, f32::max)
+        + pad * 2.0;
+    let total_h = line_h * lines.len() as f32 + pad * 2.0;
+    let (x, y) = match position {
+        CaptureInfoPosition::TopLeft => (0.0, 0.0),
+        CaptureInfoPosition::TopRight => (doc.base_width as f32 - max_w, 0.0),
+        CaptureInfoPosition::BottomLeft => (0.0, doc.base_height as f32 - total_h),
+        CaptureInfoPosition::BottomRight => (
+            doc.base_width as f32 - max_w,
+            doc.base_height as f32 - total_h,
+        ),
+    };
+    Some([x, y, x + max_w, y + total_h])
 }
 
 fn point_in_rect(p: [f32; 2], r: [f32; 4]) -> bool {
@@ -2157,19 +2201,37 @@ fn render_selection(
 
     // If editing text and that's the selected node, render the text
     // editor in a foreignObject overlay instead of selection chrome.
+    //
+    // Edit flow:
+    // - oninput mutates the document directly (no command per
+    //   keystroke — that's what was flooding undo).
+    // - onblur produces a SINGLE coalesced UpdateAnnotation built
+    //   from `original_text` (snapshot at edit start) → current text.
+    //   That keeps undo a one-step revert no matter how many
+    //   characters were typed.
+    // - onmousedown stops propagation so canvas_pointerdown's
+    //   "click anywhere clears editing_text" branch doesn't fire
+    //   from clicks inside the textarea.
     if editing_text == Some(id) {
         if let AnnotationNode::Text { text, .. } = node {
             let initial = text.clone();
+            // Snapshot the BEFORE state so onblur can build a single
+            // UpdateAnnotation. Stored in a use_signal scoped to this
+            // edit session — created fresh on each entry into edit
+            // mode because the parent re-renders the foreignObject.
+            let original_node = node.clone();
             return rsx! {
                 foreignObject {
                     x: "{x}",
                     y: "{y}",
                     width: "{w}",
                     height: "{h}",
+                    onmousedown: |evt| evt.stop_propagation(),
                     textarea {
                         class: "text-editor",
                         autofocus: true,
                         value: "{initial}",
+                        onmousedown: |evt| evt.stop_propagation(),
                         oninput: move |evt| {
                             let v = evt.value();
                             document.with_mut(|d| {
@@ -2180,6 +2242,37 @@ fn render_selection(
                                 }
                             });
                             dirty.set(true);
+                        },
+                        onblur: move |_| {
+                            // Snapshot the after state, then revert
+                            // the live mutations so push() applies
+                            // the diff once via the command stack.
+                            let after_opt = document
+                                .read()
+                                .annotations
+                                .iter()
+                                .find(|n| n.id() == id)
+                                .cloned();
+                            if let Some(after) = after_opt {
+                                if after != original_node {
+                                    document.with_mut(|d| {
+                                        if let Some(slot) = d.annotations.iter_mut()
+                                            .find(|n| n.id() == id)
+                                        {
+                                            *slot = original_node.clone();
+                                        }
+                                    });
+                                    execute_command(
+                                        document,
+                                        history,
+                                        dirty,
+                                        Box::new(UpdateAnnotation::new(
+                                            original_node.clone(),
+                                            after,
+                                        )),
+                                    );
+                                }
+                            }
                         },
                     }
                 }
@@ -2257,6 +2350,10 @@ fn bounding_box(node: &AnnotationNode) -> Option<[f32; 4]> {
         AnnotationNode::Step { center, radius, .. } => {
             [center[0] - radius, center[1] - radius, radius * 2.0, radius * 2.0]
         }
+        // CaptureInfo's bbox depends on document dimensions; bbox-only
+        // callers don't have a Document handy, so we report None here.
+        // Selection chrome falls back to the no-handles path which is
+        // OK — Delete still works via the keyboard / inspector button.
         AnnotationNode::CaptureInfo { .. } => return None,
     })
 }
@@ -2440,33 +2537,22 @@ fn ColorPickerRow(label: String, value: Signal<[u8; 4]>) -> Element {
 
 #[component]
 fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
+    // Read straight from the bundled style each render. No nested
+    // use_signals — those would only init once and then stomp the
+    // global on later renders, which is what was breaking per-tool
+    // style memory. Mutations go through `style.with_mut` directly.
     let s = style.read().clone();
-    let mut color_sig = use_signal(|| s.arrow_color);
-    let mut thickness_sig = use_signal(|| s.arrow_thickness);
-    let mut shadow_sig = use_signal(|| s.arrow_shadow);
-    let mut line_sig = use_signal(|| s.arrow_line_style);
-    let mut head_sig = use_signal(|| s.arrow_head_style);
+    let cur_line = s.arrow_line_style;
+    let cur_head = s.arrow_head_style;
+    let shadow = s.arrow_shadow;
+    let thick = s.arrow_thickness;
+    let color = s.arrow_color;
 
-    // Reflect signal changes back into the bundled style.
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.arrow_color = *color_sig.read();
-            st.arrow_thickness = *thickness_sig.read();
-            st.arrow_shadow = *shadow_sig.read();
-            st.arrow_line_style = *line_sig.read();
-            st.arrow_head_style = *head_sig.read();
-        });
-    });
-
-    let cur_line = *line_sig.read();
-    let cur_head = *head_sig.read();
-    let shadow = *shadow_sig.read();
-    let thick = *thickness_sig.read();
+    let palette_sig = make_field_signal(style, |st| st.arrow_color, |st, v| st.arrow_color = v);
 
     rsx! {
-        ColorPalette { value: color_sig }
-        ColorPickerRow { label: "Color".to_string(), value: color_sig }
+        ColorPalette { value: palette_sig }
+        ColorPickerRow { label: "Color".to_string(), value: palette_sig }
         div { class: "field",
             label { "Thickness" }
             input {
@@ -2477,7 +2563,8 @@ fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
                 value: "{thick}",
                 oninput: move |evt| {
                     if let Ok(v) = evt.value().parse::<f32>() {
-                        thickness_sig.set(v.clamp(1.0, 32.0));
+                        let mut s = style;
+                        s.with_mut(|st| st.arrow_thickness = v.clamp(1.0, 32.0));
                     }
                 },
             }
@@ -2487,17 +2574,17 @@ fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
             div { class: "row-3",
                 button {
                     class: if cur_line == ArrowLineStyle::Solid { "ghost active" } else { "ghost" },
-                    onclick: move |_| line_sig.set(ArrowLineStyle::Solid),
+                    onclick: move |_| { let mut s = style; s.with_mut(|st| st.arrow_line_style = ArrowLineStyle::Solid); },
                     "Solid"
                 }
                 button {
                     class: if cur_line == ArrowLineStyle::Dashed { "ghost active" } else { "ghost" },
-                    onclick: move |_| line_sig.set(ArrowLineStyle::Dashed),
+                    onclick: move |_| { let mut s = style; s.with_mut(|st| st.arrow_line_style = ArrowLineStyle::Dashed); },
                     "Dashed"
                 }
                 button {
                     class: if cur_line == ArrowLineStyle::Dotted { "ghost active" } else { "ghost" },
-                    onclick: move |_| line_sig.set(ArrowLineStyle::Dotted),
+                    onclick: move |_| { let mut s = style; s.with_mut(|st| st.arrow_line_style = ArrowLineStyle::Dotted); },
                     "Dotted"
                 }
             }
@@ -2507,7 +2594,9 @@ fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
             select {
                 value: "{head_label(cur_head)}",
                 onchange: move |evt| {
-                    head_sig.set(head_from_label(&evt.value()).unwrap_or(ArrowHeadStyle::FilledTriangle));
+                    let h = head_from_label(&evt.value()).unwrap_or(ArrowHeadStyle::FilledTriangle);
+                    let mut s = style;
+                    s.with_mut(|st| st.arrow_head_style = h);
                 },
                 option { value: "Filled", "Filled triangle" }
                 option { value: "Outline", "Outline triangle" }
@@ -2520,11 +2609,45 @@ fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
             input {
                 r#type: "checkbox",
                 checked: "{shadow}",
-                onchange: move |evt| shadow_sig.set(evt.checked()),
+                onchange: move |evt| {
+                    let b = evt.checked();
+                    let mut s = style;
+                    s.with_mut(|st| st.arrow_shadow = b);
+                },
             }
             "Drop shadow"
         }
+        // suppress unused-color warning when only swatches change it
+        { let _ = color; rsx! {} }
     }
+}
+
+/// Helper that builds a transient `Signal<T>` view onto a single
+/// field of `ToolStyle`. Read returns the current field value;
+/// mutations go through `style.with_mut`. Used to pass a single-field
+/// signal into reusable components like `ColorPalette` /
+/// `ColorPickerRow` without having to write per-field component
+/// variants.
+fn make_field_signal<T: Clone + 'static + PartialEq>(
+    mut style: Signal<ToolStyle>,
+    read: impl Fn(&ToolStyle) -> T + Copy + 'static,
+    write: impl Fn(&mut ToolStyle, T) + Copy + 'static,
+) -> Signal<T> {
+    // Materialize the current field into a fresh signal per render —
+    // and on every change, mirror it back into the bundled style.
+    // The use_effect below fires whenever the inner signal mutates,
+    // which is exactly when the user moved the swatch / picker.
+    let initial = read(&style.read());
+    let mut field = use_signal(|| initial.clone());
+    // Keep field signal aligned with whatever the parent says is current.
+    if *field.read() != initial {
+        field.set(initial);
+    }
+    use_effect(move || {
+        let v = field.read().clone();
+        style.with_mut(|st| write(st, v));
+    });
+    field
 }
 
 fn head_label(h: ArrowHeadStyle) -> &'static str {
@@ -2550,31 +2673,25 @@ fn head_from_label(s: &str) -> Option<ArrowHeadStyle> {
 #[component]
 fn TextStyle(style: Signal<ToolStyle>) -> Element {
     let s = style.read().clone();
-    let mut color_sig = use_signal(|| s.text_color);
-    let mut size_sig = use_signal(|| s.text_size);
-    let mut align_sig = use_signal(|| s.text_align);
-    let mut list_sig = use_signal(|| s.text_list);
-    let mut frosted_sig = use_signal(|| s.text_frosted);
-    let mut shadow_sig = use_signal(|| s.text_shadow);
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.text_color = *color_sig.read();
-            st.text_size = *size_sig.read();
-            st.text_align = *align_sig.read();
-            st.text_list = *list_sig.read();
-            st.text_frosted = *frosted_sig.read();
-            st.text_shadow = *shadow_sig.read();
-        });
-    });
-    let size_val = *size_sig.read();
-    let cur_align = *align_sig.read();
-    let cur_list = *list_sig.read();
-    let frosted = *frosted_sig.read();
-    let shadow = *shadow_sig.read();
+    let size_val = s.text_size;
+    let cur_align = s.text_align;
+    let cur_list = s.text_list;
+    let frosted = s.text_frosted;
+    let shadow = s.text_shadow;
+    let palette_sig = make_field_signal(style, |st| st.text_color, |st, v| st.text_color = v);
+
+    let set_align = move |a: TextAlign| {
+        let mut s = style;
+        s.with_mut(|st| st.text_align = a);
+    };
+    let set_list = move |l: TextListStyle| {
+        let mut s = style;
+        s.with_mut(|st| st.text_list = l);
+    };
+
     rsx! {
-        ColorPalette { value: color_sig }
-        ColorPickerRow { label: "Color".to_string(), value: color_sig }
+        ColorPalette { value: palette_sig }
+        ColorPickerRow { label: "Color".to_string(), value: palette_sig }
         div { class: "field",
             label { "Size (px)" }
             input {
@@ -2584,7 +2701,8 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
                 value: "{size_val}",
                 oninput: move |evt| {
                     if let Ok(v) = evt.value().parse::<f32>() {
-                        size_sig.set(v.clamp(8.0, 200.0));
+                        let mut s = style;
+                        s.with_mut(|st| st.text_size = v.clamp(8.0, 200.0));
                     }
                 },
             }
@@ -2594,15 +2712,15 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
             div { class: "row-3",
                 button {
                     class: if cur_align == TextAlign::Left { "ghost active" } else { "ghost" },
-                    onclick: move |_| align_sig.set(TextAlign::Left), "Left"
+                    onclick: move |_| set_align(TextAlign::Left), "Left"
                 }
                 button {
                     class: if cur_align == TextAlign::Center { "ghost active" } else { "ghost" },
-                    onclick: move |_| align_sig.set(TextAlign::Center), "Center"
+                    onclick: move |_| set_align(TextAlign::Center), "Center"
                 }
                 button {
                     class: if cur_align == TextAlign::Right { "ghost active" } else { "ghost" },
-                    onclick: move |_| align_sig.set(TextAlign::Right), "Right"
+                    onclick: move |_| set_align(TextAlign::Right), "Right"
                 }
             }
         }
@@ -2611,24 +2729,36 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
             div { class: "row-3",
                 button {
                     class: if cur_list == TextListStyle::None { "ghost active" } else { "ghost" },
-                    onclick: move |_| list_sig.set(TextListStyle::None), "None"
+                    onclick: move |_| set_list(TextListStyle::None), "None"
                 }
                 button {
                     class: if cur_list == TextListStyle::Bullet { "ghost active" } else { "ghost" },
-                    onclick: move |_| list_sig.set(TextListStyle::Bullet), "•"
+                    onclick: move |_| set_list(TextListStyle::Bullet), "•"
                 }
                 button {
                     class: if cur_list == TextListStyle::Numbered { "ghost active" } else { "ghost" },
-                    onclick: move |_| list_sig.set(TextListStyle::Numbered), "1."
+                    onclick: move |_| set_list(TextListStyle::Numbered), "1."
                 }
             }
         }
         label { class: "toggle",
-            input { r#type: "checkbox", checked: "{frosted}", onchange: move |e| frosted_sig.set(e.checked()), }
+            input { r#type: "checkbox", checked: "{frosted}",
+                onchange: move |e| {
+                    let b = e.checked();
+                    let mut s = style;
+                    s.with_mut(|st| st.text_frosted = b);
+                },
+            }
             "Frosted backdrop"
         }
         label { class: "toggle",
-            input { r#type: "checkbox", checked: "{shadow}", onchange: move |e| shadow_sig.set(e.checked()), }
+            input { r#type: "checkbox", checked: "{shadow}",
+                onchange: move |e| {
+                    let b = e.checked();
+                    let mut s = style;
+                    s.with_mut(|st| st.text_shadow = b);
+                },
+            }
             "Drop shadow"
         }
     }
@@ -2637,23 +2767,20 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
 #[component]
 fn ShapeStyle(style: Signal<ToolStyle>) -> Element {
     let s = style.read().clone();
-    let mut stroke_sig = use_signal(|| s.shape_stroke);
-    let mut sw_sig = use_signal(|| s.shape_stroke_width);
-    let mut fill_sig = use_signal(|| s.shape_fill);
-    let mut filled_sig = use_signal(|| s.shape_fill[3] != 0);
-    use_effect(move || {
-        let mut style = style;
-        let filled = *filled_sig.read();
-        let mut f = *fill_sig.read();
-        if !filled { f[3] = 0; }
-        style.with_mut(|st| {
-            st.shape_stroke = *stroke_sig.read();
-            st.shape_stroke_width = *sw_sig.read();
-            st.shape_fill = f;
-        });
-    });
-    let sw_val = *sw_sig.read();
-    let filled = *filled_sig.read();
+    let sw_val = s.shape_stroke_width;
+    let filled = s.shape_fill[3] != 0;
+    let stroke_sig = make_field_signal(style, |st| st.shape_stroke, |st, v| st.shape_stroke = v);
+    // Fill signal preserves the alpha bit when user picks a new RGB
+    // (toggling Filled drives alpha 0/220 separately).
+    let fill_sig = make_field_signal(
+        style,
+        |st| st.shape_fill,
+        |st, v| {
+            let alpha = st.shape_fill[3];
+            st.shape_fill = [v[0], v[1], v[2], alpha];
+        },
+    );
+
     rsx! {
         ColorPalette { value: stroke_sig }
         ColorPickerRow { label: "Stroke".to_string(), value: stroke_sig }
@@ -2667,13 +2794,22 @@ fn ShapeStyle(style: Signal<ToolStyle>) -> Element {
                 value: "{sw_val}",
                 oninput: move |e| {
                     if let Ok(v) = e.value().parse::<f32>() {
-                        sw_sig.set(v.clamp(0.5, 32.0));
+                        let mut s = style;
+                        s.with_mut(|st| st.shape_stroke_width = v.clamp(0.5, 32.0));
                     }
                 }
             }
         }
         label { class: "toggle",
-            input { r#type: "checkbox", checked: "{filled}", onchange: move |e| filled_sig.set(e.checked()), }
+            input { r#type: "checkbox", checked: "{filled}",
+                onchange: move |e| {
+                    let b = e.checked();
+                    let mut s = style;
+                    s.with_mut(|st| {
+                        st.shape_fill[3] = if b { 220 } else { 0 };
+                    });
+                },
+            }
             "Filled"
         }
         if filled {
@@ -2685,21 +2821,10 @@ fn ShapeStyle(style: Signal<ToolStyle>) -> Element {
 #[component]
 fn StepStyle(style: Signal<ToolStyle>) -> Element {
     let s = style.read().clone();
-    let mut fill_sig = use_signal(|| s.step_fill);
-    let mut text_sig = use_signal(|| s.step_text_color);
-    let mut radius_sig = use_signal(|| s.step_radius);
-    let mut next_sig = use_signal(|| s.next_step_number);
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.step_fill = *fill_sig.read();
-            st.step_text_color = *text_sig.read();
-            st.step_radius = *radius_sig.read();
-            st.next_step_number = *next_sig.read();
-        });
-    });
-    let r = *radius_sig.read();
-    let n = *next_sig.read();
+    let r = s.step_radius;
+    let n = s.next_step_number;
+    let fill_sig = make_field_signal(style, |st| st.step_fill, |st, v| st.step_fill = v);
+    let text_sig = make_field_signal(style, |st| st.step_text_color, |st, v| st.step_text_color = v);
     rsx! {
         ColorPalette { value: fill_sig }
         ColorPickerRow { label: "Fill".to_string(), value: fill_sig }
@@ -2710,7 +2835,8 @@ fn StepStyle(style: Signal<ToolStyle>) -> Element {
                 r#type: "number", min: "6", max: "60", step: "1", value: "{r}",
                 oninput: move |e| {
                     if let Ok(v) = e.value().parse::<f32>() {
-                        radius_sig.set(v.clamp(6.0, 60.0));
+                        let mut s = style;
+                        s.with_mut(|st| st.step_radius = v.clamp(6.0, 60.0));
                     }
                 }
             }
@@ -2721,7 +2847,8 @@ fn StepStyle(style: Signal<ToolStyle>) -> Element {
                 r#type: "number", min: "1", max: "999", value: "{n}",
                 oninput: move |e| {
                     if let Ok(v) = e.value().parse::<u32>() {
-                        next_sig.set(v);
+                        let mut s = style;
+                        s.with_mut(|st| st.next_step_number = v);
                     }
                 }
             }
@@ -2732,38 +2859,42 @@ fn StepStyle(style: Signal<ToolStyle>) -> Element {
 #[component]
 fn MagnifyStyle(style: Signal<ToolStyle>) -> Element {
     let s = style.read().clone();
-    let mut circular_sig = use_signal(|| s.magnify_circular);
-    let mut border_sig = use_signal(|| s.magnify_border);
-    let mut bw_sig = use_signal(|| s.magnify_border_width);
-    let mut zoom_sig = use_signal(|| s.magnify_zoom);
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.magnify_circular = *circular_sig.read();
-            st.magnify_border = *border_sig.read();
-            st.magnify_border_width = *bw_sig.read();
-            st.magnify_zoom = *zoom_sig.read();
-        });
-    });
-    let circ = *circular_sig.read();
-    let bw = *bw_sig.read();
-    let z = *zoom_sig.read();
+    let circ = s.magnify_circular;
+    let bw = s.magnify_border_width;
+    let z = s.magnify_zoom;
+    let border_sig = make_field_signal(style, |st| st.magnify_border, |st, v| st.magnify_border = v);
     rsx! {
         label { class: "toggle",
-            input { r#type: "checkbox", checked: "{circ}", onchange: move |e| circular_sig.set(e.checked()), }
+            input { r#type: "checkbox", checked: "{circ}",
+                onchange: move |e| {
+                    let b = e.checked();
+                    let mut s = style;
+                    s.with_mut(|st| st.magnify_circular = b);
+                },
+            }
             "Circular"
         }
         ColorPickerRow { label: "Border".to_string(), value: border_sig }
         div { class: "field",
             label { "Border width" }
             input { r#type: "number", min: "0", max: "20", step: "0.5", value: "{bw}",
-                oninput: move |e| { if let Ok(v) = e.value().parse::<f32>() { bw_sig.set(v.clamp(0.0, 20.0)); } }
+                oninput: move |e| {
+                    if let Ok(v) = e.value().parse::<f32>() {
+                        let mut s = style;
+                        s.with_mut(|st| st.magnify_border_width = v.clamp(0.0, 20.0));
+                    }
+                }
             }
         }
         div { class: "field",
             label { "Zoom (×)" }
             input { r#type: "number", min: "1.5", max: "10", step: "0.25", value: "{z}",
-                oninput: move |e| { if let Ok(v) = e.value().parse::<f32>() { zoom_sig.set(v.clamp(1.5, 10.0)); } }
+                oninput: move |e| {
+                    if let Ok(v) = e.value().parse::<f32>() {
+                        let mut s = style;
+                        s.with_mut(|st| st.magnify_zoom = v.clamp(1.5, 10.0));
+                    }
+                }
             }
         }
     }
@@ -2771,20 +2902,17 @@ fn MagnifyStyle(style: Signal<ToolStyle>) -> Element {
 
 #[component]
 fn BlurStyle(style: Signal<ToolStyle>) -> Element {
-    let s = style.read().clone();
-    let mut radius_sig = use_signal(|| s.blur_radius);
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.blur_radius = *radius_sig.read();
-        });
-    });
-    let r = *radius_sig.read();
+    let r = style.read().blur_radius;
     rsx! {
         div { class: "field",
             label { "Blur radius (sigma)" }
             input { r#type: "number", min: "1", max: "60", step: "1", value: "{r}",
-                oninput: move |e| { if let Ok(v) = e.value().parse::<f32>() { radius_sig.set(v.clamp(1.0, 60.0)); } }
+                oninput: move |e| {
+                    if let Ok(v) = e.value().parse::<f32>() {
+                        let mut s = style;
+                        s.with_mut(|st| st.blur_radius = v.clamp(1.0, 60.0));
+                    }
+                }
             }
         }
         p { style: "font-size: 11px; color: #6c727a;",
@@ -2795,18 +2923,9 @@ fn BlurStyle(style: Signal<ToolStyle>) -> Element {
 
 #[component]
 fn CalloutStyle(style: Signal<ToolStyle>) -> Element {
-    let s = style.read().clone();
-    let mut fill_sig = use_signal(|| s.callout_fill);
-    let mut stroke_sig = use_signal(|| s.callout_stroke);
-    let mut text_sig = use_signal(|| s.callout_text_color);
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.callout_fill = *fill_sig.read();
-            st.callout_stroke = *stroke_sig.read();
-            st.callout_text_color = *text_sig.read();
-        });
-    });
+    let fill_sig = make_field_signal(style, |st| st.callout_fill, |st, v| st.callout_fill = v);
+    let stroke_sig = make_field_signal(style, |st| st.callout_stroke, |st, v| st.callout_stroke = v);
+    let text_sig = make_field_signal(style, |st| st.callout_text_color, |st, v| st.callout_text_color = v);
     rsx! {
         ColorPickerRow { label: "Fill".to_string(), value: fill_sig }
         ColorPickerRow { label: "Stroke".to_string(), value: stroke_sig }
@@ -2816,24 +2935,17 @@ fn CalloutStyle(style: Signal<ToolStyle>) -> Element {
 
 #[component]
 fn CaptureInfoStyleEditor(style: Signal<ToolStyle>) -> Element {
-    let s = style.read().clone();
-    let mut pos_sig = use_signal(|| s.capture_info_position);
-    let fields_sig = use_signal(|| s.capture_info_fields.clone());
-    use_effect(move || {
-        let mut style = style;
-        style.with_mut(|st| {
-            st.capture_info_position = *pos_sig.read();
-            st.capture_info_fields = fields_sig.read().clone();
-        });
-    });
-    let cur_pos = *pos_sig.read();
+    let cur_pos = style.read().capture_info_position;
     rsx! {
         div { class: "field",
             label { "Position" }
             select {
                 value: "{position_label(cur_pos)}",
                 onchange: move |e| {
-                    if let Some(p) = position_from_label(&e.value()) { pos_sig.set(p); }
+                    if let Some(p) = position_from_label(&e.value()) {
+                        let mut s = style;
+                        s.with_mut(|st| st.capture_info_position = p);
+                    }
                 },
                 option { value: "TopLeft", "Top left" }
                 option { value: "TopRight", "Top right" }
@@ -2841,7 +2953,55 @@ fn CaptureInfoStyleEditor(style: Signal<ToolStyle>) -> Element {
                 option { value: "BottomRight", "Bottom right" }
             }
         }
-        FieldsCheckboxes { fields: fields_sig }
+        // Mutate the fields list directly on the bundled style — no
+        // intermediate signal so the user-toggled state always
+        // reflects what's actually in `style.capture_info_fields`.
+        CaptureFieldsToggles { style: style }
+    }
+}
+
+#[component]
+fn CaptureFieldsToggles(style: Signal<ToolStyle>) -> Element {
+    let cur = style.read().capture_info_fields.clone();
+    const ALL: &[FieldKind] = &[
+        FieldKind::Timestamp,
+        FieldKind::WindowTitle,
+        FieldKind::ProcessName,
+        FieldKind::OsVersion,
+        FieldKind::MonitorInfo,
+    ];
+    rsx! {
+        div { class: "field",
+            label { "Fields" }
+            for f in ALL.iter().copied() {
+                {
+                    let checked = cur.contains(&f);
+                    let label_str = f.label();
+                    rsx! {
+                        label { class: "toggle",
+                            input {
+                                r#type: "checkbox",
+                                checked: "{checked}",
+                                onchange: move |e| {
+                                    let on = e.checked();
+                                    let mut s = style;
+                                    s.with_mut(|st| {
+                                        if on {
+                                            if !st.capture_info_fields.contains(&f) {
+                                                st.capture_info_fields.push(f);
+                                            }
+                                        } else {
+                                            st.capture_info_fields.retain(|x| *x != f);
+                                        }
+                                    });
+                                },
+                            }
+                            "{label_str}"
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2861,47 +3021,6 @@ fn position_from_label(s: &str) -> Option<CaptureInfoPosition> {
         "BottomRight" => CaptureInfoPosition::BottomRight,
         _ => return None,
     })
-}
-
-#[component]
-fn FieldsCheckboxes(fields: Signal<Vec<FieldKind>>) -> Element {
-    let cur = fields.read().clone();
-    const ALL: &[FieldKind] = &[
-        FieldKind::Timestamp,
-        FieldKind::WindowTitle,
-        FieldKind::ProcessName,
-        FieldKind::OsVersion,
-        FieldKind::MonitorInfo,
-    ];
-    rsx! {
-        div { class: "field",
-            label { "Fields" }
-            for f in ALL.iter().copied() {
-                {
-                    let checked = cur.contains(&f);
-                    let label = f.label();
-                    rsx! {
-                        label { class: "toggle",
-                            input {
-                                r#type: "checkbox",
-                                checked: "{checked}",
-                                onchange: move |e| {
-                                    let mut v = fields.read().clone();
-                                    if e.checked() {
-                                        if !v.contains(&f) { v.push(f); }
-                                    } else {
-                                        v.retain(|x| *x != f);
-                                    }
-                                    fields.set(v);
-                                },
-                            }
-                            "{label}"
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ─── Selection inspector ─────────────────────────────────────────────
@@ -2947,11 +3066,17 @@ fn SelectionSection(
         sel.set(None);
     };
 
-    let text_initial = match &node {
+    // Text content displays as a read-only preview here. Editing is
+    // routed through the on-canvas foreignObject (double-click the
+    // annotation, or it auto-opens after a fresh Text drag). Two
+    // good reasons to keep editing in one place:
+    //  1. Two textareas pointing at the same string fight each other
+    //     through the document signal.
+    //  2. The inline textarea was pushing UpdateAnnotation per
+    //     keystroke, flooding the undo stack. The on-canvas editor
+    //     coalesces via onblur into a single command.
+    let text_preview = match &node {
         AnnotationNode::Text { text, .. } => Some(text.clone()),
-        _ => None,
-    };
-    let callout_initial = match &node {
         AnnotationNode::Callout { text, .. } => Some(text.clone()),
         _ => None,
     };
@@ -2967,61 +3092,21 @@ fn SelectionSection(
                 history: history,
                 dirty: dirty,
             }
-            if let Some(initial) = text_initial {
+            if let Some(preview) = text_preview {
                 div { class: "field",
                     label { "Text" }
-                    textarea {
-                        value: "{initial}",
-                        oninput: move |evt| {
-                            let v = evt.value();
-                            let before = document
-                                .read()
-                                .annotations
-                                .iter()
-                                .find(|n| n.id() == id)
-                                .cloned();
-                            if let Some(before) = before {
-                                let mut after = before.clone();
-                                if let AnnotationNode::Text { text, .. } = &mut after {
-                                    *text = v;
-                                }
-                                execute_command(
-                                    document,
-                                    history,
-                                    dirty,
-                                    Box::new(UpdateAnnotation::new(before, after)),
-                                );
+                    div {
+                        style: "font-size: 11px; color: #c4c8cf; padding: 6px 8px; background: #14181f; border: 1px solid #2a3038; border-radius: 6px; min-height: 1.4em; white-space: pre-wrap; word-break: break-word; max-height: 80px; overflow-y: auto;",
+                        if preview.is_empty() {
+                            span { style: "color: #6c727a; font-style: italic;",
+                                "(empty)"
                             }
-                        },
+                        } else {
+                            "{preview}"
+                        }
                     }
-                }
-            }
-            if let Some(initial) = callout_initial {
-                div { class: "field",
-                    label { "Text" }
-                    textarea {
-                        value: "{initial}",
-                        oninput: move |evt| {
-                            let v = evt.value();
-                            let before = document
-                                .read()
-                                .annotations
-                                .iter()
-                                .find(|n| n.id() == id)
-                                .cloned();
-                            if let Some(before) = before {
-                                let mut after = before.clone();
-                                if let AnnotationNode::Callout { text, .. } = &mut after {
-                                    *text = v;
-                                }
-                                execute_command(
-                                    document,
-                                    history,
-                                    dirty,
-                                    Box::new(UpdateAnnotation::new(before, after)),
-                                );
-                            }
-                        },
+                    p { style: "font-size: 10px; color: #6c727a; margin-top: 4px;",
+                        "Double-click on canvas to edit"
                     }
                 }
             }

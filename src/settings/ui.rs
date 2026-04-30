@@ -558,11 +558,25 @@ fn FooterBar(
             status.set(format!("Save failed: {e}"));
             return;
         }
-        // Drop the marker; the tray picks this up on its next poll and
-        // re-registers hotkeys + refreshes the menu accelerators.
+        // Drop the marker; the tray picks this up on its next poll
+        // and re-registers hotkeys + refreshes the menu accelerators.
+        // fsync the file before closing so the tray's PeekMessageW
+        // tick doesn't race the directory entry update — bare
+        // fs::write doesn't flush on Windows, and our subprocess
+        // exits immediately after this call.
         let marker = paths_for_save.data_dir.join(".settings_refresh");
-        if let Err(e) = std::fs::write(&marker, b"") {
-            warn!("settings: write refresh marker failed: {e}");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&marker)
+        {
+            Ok(f) => {
+                if let Err(e) = f.sync_all() {
+                    warn!("settings: fsync refresh marker failed: {e}");
+                }
+            }
+            Err(e) => warn!("settings: write refresh marker failed: {e}"),
         }
         // Close via the desktop window helper.
         let window = dioxus::desktop::window();
