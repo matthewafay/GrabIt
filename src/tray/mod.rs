@@ -33,6 +33,7 @@ pub struct TrayMenuIds {
     pub capture_annotate: tray_icon::menu::MenuId,
     pub record_gif: tray_icon::menu::MenuId,
     pub open_output: tray_icon::menu::MenuId,
+    pub history: tray_icon::menu::MenuId,
     pub settings: tray_icon::menu::MenuId,
     pub quit: tray_icon::menu::MenuId,
 }
@@ -61,6 +62,7 @@ impl Tray {
         );
         let record_gif_item = MenuItem::new("Record GIF\u{2026}", true, gif_accel);
         let open_output = MenuItem::new("Open output folder", true, None);
+        let history_item = MenuItem::new("History\u{2026}", true, None);
         let settings_item = MenuItem::new("Settings\u{2026}", true, None);
         let quit = MenuItem::new("Quit GrabIt", true, None);
 
@@ -69,6 +71,7 @@ impl Tray {
         menu.append(&record_gif_item).context("append record gif item")?;
         menu.append(&PredefinedMenuItem::separator()).ok();
         menu.append(&open_output).context("append output item")?;
+        menu.append(&history_item).context("append history item")?;
         menu.append(&settings_item).context("append settings item")?;
         menu.append(&PredefinedMenuItem::separator()).ok();
         menu.append(&quit).context("append quit item")?;
@@ -78,6 +81,7 @@ impl Tray {
             capture_annotate: capture_annotate_item.id().clone(),
             record_gif: record_gif_item.id().clone(),
             open_output: open_output.id().clone(),
+            history: history_item.id().clone(),
             settings: settings_item.id().clone(),
             quit: quit.id().clone(),
         };
@@ -181,6 +185,8 @@ pub fn on_menu_event(ev: MenuEvent, cmd_tx: &Sender<Command>) {
         Some(Command::CaptureGif)
     } else if ev.id == ids.open_output {
         Some(Command::OpenOutputFolder)
+    } else if ev.id == ids.history {
+        Some(Command::OpenHistory)
     } else if ev.id == ids.settings {
         Some(Command::OpenSettings)
     } else if ev.id == ids.quit {

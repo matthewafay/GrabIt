@@ -8,6 +8,63 @@ the system tray, launches with Windows.
 If GrabIt is useful to you, you can support development here:
 [☕ Buy me a coffee](https://buymeacoffee.com/matthewafay).
 
+## What's new in 1.5
+
+### Capture history
+- **Mini history viewer** in the tray. Right-click → *History…* opens a
+  thumbnail grid of the most recent PNGs and GIFs from your output
+  folder (newest first, capped at 60 items).
+- **One-click copy actions per item.** *Copy* puts a PNG on the
+  clipboard as `CF_DIB` (paste into Office / browsers / chat) and puts
+  a GIF on as `CF_HDROP` (a file drop, so chat clients paste it as the
+  actual animated file instead of a still frame). *Copy path* drops
+  the absolute path on as `CF_UNICODETEXT`.
+- **No persistent history file.** The grid is just a directory scan of
+  the output folder, so files you delete from disk drop out of the
+  list naturally. `Refresh` button rescans on demand.
+- Each card shows a PNG/GIF type badge, filename, file size, and a
+  relative timestamp ("3m ago"). Clicking a button flashes a brief
+  "Copied!" confirmation underneath.
+
+## What's new in 1.4
+
+### GIF recording (ScreenToGif-style)
+- **Record GIF…** is now in the tray and bound to `Ctrl+Shift+G` by
+  default. Drag a region; a small floating bar (Pause / Stop / timer)
+  anchors next to it; re-pressing the chord while a recording is in
+  progress acts as a stop toggle. Esc / WM_CLOSE / a max-seconds guard
+  also stop the recording.
+- **Frame editor** opens after Stop in its own subprocess. Scroll a
+  thumbnail timeline, click frames to delete, set in/out trim markers,
+  hit "Trim to selection" to drop everything outside, then Export.
+  Playback is FPS-paced (matches what export will produce) and a
+  background decoder thread pre-loads RGBA so it stays smooth.
+- **Fast export.** Encoder runs NeuQuant palette quantization on every
+  CPU core via rayon at speed=10; roughly 10–25× faster than the
+  default `image::GifEncoder` path on a multi-core box.
+- **Small files.** Diff-bounding-box encoding (each frame after the
+  first writes only the rectangle of pixels that changed, with
+  `DisposalMethod::Keep` so prior pixels persist) plus
+  identical-frame compaction. Typical screen recordings are 3–10×
+  smaller than full-frame output.
+- New "GIF" section in the Settings window: hotkey, FPS (default 15),
+  loop count, max-seconds cap, and a separate "include cursor" toggle
+  that's independent from the still-capture cursor setting.
+
+### Reputation metadata
+- **Rich `VS_VERSION_INFO` resource** baked into the binary —
+  `CompanyName`, `FileDescription`, `LegalCopyright`, `ProductVersion`,
+  etc. all populated and driven from `Cargo.toml` at build time so
+  they can't drift. Helps Windows Defender's heuristic ML scanner
+  treat the unsigned exe more like a real application.
+
+### Fixes
+- **Tray app no longer silently closes after a tray-triggered capture
+  with a Win32 overlay.** The recorder's and countdown overlay's
+  `WM_DESTROY` handlers were posting an orphan `WM_QUIT` that the
+  main loop's `PeekMessageW` then drained. Removed the redundant
+  `PostQuitMessage(0)` from those `WM_DESTROY` arms.
+
 ## What's new in 1.3
 
 ### Document effects
@@ -110,11 +167,11 @@ If GrabIt is useful to you, you can support development here:
   `settings.json` files with the field are read and quietly upgraded.
 
 ### Slim tray menu
-The tray menu is down to 5 items: **Capture fullscreen**, **Capture &
-annotate…**, **Open output folder**, **Settings…**, **Quit GrabIt**.
-The two capture entries show their bound hotkey chord on the right
-side via a muda Accelerator. Launch-at-startup moved into the Settings
-window (Capture section).
+The tray menu is now: **Capture fullscreen**, **Capture & annotate…**,
+**Record GIF…** *(1.4)*, **Open output folder**, **History…** *(1.5)*,
+**Settings…**, **Quit GrabIt**. The three capture entries show their
+bound hotkey chord on the right side via a muda Accelerator.
+Launch-at-startup lives in the Settings window (Capture section).
 
 ### Hotkeys don't get swallowed by menus
 - **Dedicated hotkey-drain thread** — `WM_HOTKEY` events are processed
@@ -178,9 +235,16 @@ window (Capture section).
 - **Presets** — tray → *Presets*. User-defined capture profiles bundling
   target, delay, cursor, post-action, filename template. Each can bind its
   own global hotkey.
+- **Record GIF** — `Ctrl+Shift+G` or tray → *Record GIF…*. Drag a region;
+  a small floating bar (Pause / Stop / timer) appears; re-pressing the
+  chord stops the recording. After Stop, a frame editor opens for trim
+  / per-frame delete / FPS / loop tweaks before exporting an animated
+  GIF.
 
-Every capture saves both a PNG and a `.grabit` sidecar (the editable scene
-graph) next to it.
+Every still capture saves both a PNG and a `.grabit` sidecar (the editable
+scene graph) next to it; GIF recordings spool frames to
+`%APPDATA%\GrabIt\gif-record\<uuid>\` and only land in the output folder
+on Export.
 
 ## Editor
 
@@ -249,6 +313,14 @@ Tray → *Settings…* opens a GUI window grouped into three sections:
   - Arrow color — advanced mode (picker + hex)
 
   *Tip: hold Shift while dragging an arrow to snap to 15°.*
+- **GIF**
+  - Hotkey (default `Ctrl+Shift+G`) — same click-to-record flow
+  - Frames per second (5–60, default 15)
+  - Loop count (0 = infinite, default 0)
+  - Max recording length in seconds (default 30)
+  - Include cursor in GIF frames (separate from the still-capture
+    cursor toggle, so screencasts can show the cursor without
+    affecting your stills)
 
 Save writes `%APPDATA%\GrabIt\settings.json` and signals the tray to
 re-register hotkeys and re-sync autostart without restart. Any open editor
@@ -319,13 +391,15 @@ Settings / presets / styles / logs: `%APPDATA%\GrabIt\`.
 
 ```
 src/
-  main.rs              entry + subprocess dispatch (--editor, --settings);
-                       single-instance mutex; DPI + font init; event loop
+  main.rs              entry + subprocess dispatch (--editor / --settings /
+                       --gif-editor / --history); single-instance mutex;
+                       DPI + font init; event loop
   app/                 AppState, command dispatch, paths
-  tray/                tray icon + menu (capture / presets / settings / quit)
+  tray/                tray icon + menu (capture / GIF / history / settings)
   hotkeys/             global-hotkey registration, chord parser, runtime rebind
   autostart/           HKCU Run-key read/write
   platform/            DPI, monitor enumeration, JetBrains Mono font registration
+  history.rs           thumbnail-grid history viewer (--history subprocess)
   capture/
     gdi.rs             GDI BitBlt (fullscreen / region)
     window_pick.rs     PrintWindow(PW_RENDERFULLCONTENT)
@@ -335,26 +409,33 @@ src/
     object_pick.rs     IUIAutomation element picker + WinEventHook menu pin
     delay.rs           countdown overlay
     wgc.rs             Windows.Graphics.Capture hooks (GDI fallback active)
+    gif_record.rs      GIF recorder: region pick + Win32 floating bar
+                       + WM_TIMER frame loop + spool dir + sidecar JSON
   editor/
     app.rs             eframe App: toolbar + canvas + tool palette
     document.rs        Document schema (.grabit, MessagePack)
     commands.rs        command-pattern undo/redo history (bounded 200)
     rasterize.rs       flatten annotations + effects onto PNG export
+    gif_app.rs         eframe frame editor for the --gif-editor subprocess
     tools/             one module per tool
   presets/             per-preset .toml records + hotkey rebinding
   styles/              named quick-style presets per tool
   settings/
     mod.rs             settings.json load/save (legacy settings.toml auto-migrates)
     ui.rs              eframe GUI for the --settings subprocess
-  export/              PNG write + Windows clipboard (CF_DIB)
+  export/
+    mod.rs             PNG write + Windows clipboard
+                       (CF_DIB / CF_HDROP / CF_UNICODETEXT)
+    gif.rs             rayon-parallel decode + NeuQuant + diff-bbox writer
 ```
 
-Each editor and settings window runs as its own `grabit.exe` subprocess
-(`--editor <sidecar>` or `--settings`) because winit 0.30 refuses to
-recreate its event loop inside one process — the tray would deadlock after
-the first editor close otherwise. Subprocesses communicate with the tray
-via marker files under `%APPDATA%\GrabIt\` (one-shot reloads for settings,
-presets, and triggered preset captures).
+Each editor / settings / GIF-editor / history window runs as its own
+`grabit.exe` subprocess (`--editor <sidecar>`, `--settings`,
+`--gif-editor <sidecar>`, or `--history`) because winit 0.30 refuses to
+recreate its event loop inside one process — the tray would deadlock
+after the first child window closed otherwise. Subprocesses communicate
+with the tray via marker files under `%APPDATA%\GrabIt\` (one-shot
+reloads for settings, presets, and triggered preset captures).
 
 ## Credits
 
@@ -362,8 +443,8 @@ presets, and triggered preset captures).
 - **Font:** [JetBrains Mono](https://www.jetbrains.com/lp/mono/) Regular &
   Bold, SIL Open Font License 1.1. License text: `assets/fonts/OFL.txt`.
 - **Rust crates** (runtime): `windows`, `eframe` / `egui`, `tray-icon`,
-  `global-hotkey`, `image`, `imageproc`, `fast_image_resize`, `ab_glyph`,
-  `winreg`, `toml`, `serde_json`, `rmp-serde`, `serde`, `chrono`, `parking_lot`,
-  `crossbeam-channel`, `anyhow`, `thiserror`, `log` / `env_logger`,
-  `uuid`, `rfd`, `dirs`.
+  `global-hotkey`, `image`, `gif`, `imageproc`, `fast_image_resize`,
+  `rayon`, `ab_glyph`, `winreg`, `toml`, `serde_json`, `rmp-serde`,
+  `serde`, `chrono`, `parking_lot`, `crossbeam-channel`, `anyhow`,
+  `thiserror`, `log` / `env_logger`, `uuid`, `rfd`, `dirs`.
 - **Rust crates** (build): `embed-resource`, `ico`, `image`.

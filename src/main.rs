@@ -5,6 +5,7 @@ mod autostart;
 mod capture;
 mod editor;
 mod export;
+mod history;
 mod hotkeys;
 mod platform;
 mod presets;
@@ -39,6 +40,9 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--gif-editor requires a path"))?
             .clone();
         return run_gif_editor_subprocess(&sidecar);
+    }
+    if args.iter().any(|a| a == "--history") {
+        return run_history_subprocess();
     }
 
     let _instance_guard = match app::single_instance::acquire() {
@@ -124,6 +128,17 @@ fn run_settings_subprocess() -> Result<()> {
     info!("settings subprocess start");
     let initial = settings::Settings::load_or_default(&paths);
     settings::ui::run_blocking(paths, initial)
+}
+
+fn run_history_subprocess() -> Result<()> {
+    let mut paths = app::paths::AppPaths::bootstrap().context("create app data directories")?;
+    init_logging(&paths.log_file());
+    platform::dpi::init_process_awareness();
+    platform::fonts::register_with_gdi();
+    let settings = settings::Settings::load_or_default(&paths);
+    apply_output_dir_override(&mut paths, &settings);
+    info!("history subprocess start");
+    history::run_blocking(paths, settings)
 }
 
 fn run_gif_editor_subprocess(sidecar_path: &str) -> Result<()> {

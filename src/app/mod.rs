@@ -69,6 +69,8 @@ pub enum Command {
     RefreshHotkeys,
     /// Open the output folder in Explorer.
     OpenOutputFolder,
+    /// Open the capture history viewer (mini gallery of recent PNGs/GIFs).
+    OpenHistory,
     /// Toggle "Launch at startup" — flips the HKCU Run entry and persists
     /// the choice to settings.
     ToggleAutostart,
@@ -188,6 +190,15 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
         }
         Command::OpenOutputFolder => {
             open_in_explorer(&state.paths.output_dir);
+        }
+        Command::OpenHistory => {
+            // History runs as its own subprocess so it can host an
+            // eframe window without contending for the tray's main
+            // thread event loop. Same pattern as Settings + GIF editor.
+            let exe = std::env::current_exe().context("resolve current exe")?;
+            if let Err(e) = std::process::Command::new(exe).arg("--history").spawn() {
+                warn!("spawn history subprocess failed: {e}");
+            }
         }
         Command::ToggleAutostart => {
             state.settings.launch_at_startup = !state.settings.launch_at_startup;
