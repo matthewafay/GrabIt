@@ -10,8 +10,6 @@ pub struct AppPaths {
     pub data_dir: PathBuf,
     /// `%APPDATA%\GrabIt\presets`
     pub presets_dir: PathBuf,
-    /// `%APPDATA%\GrabIt\stamps`
-    pub stamps_dir: PathBuf,
     /// `%APPDATA%\GrabIt\logs`
     pub logs_dir: PathBuf,
     /// `%USERPROFILE%\Pictures\GrabIt`
@@ -25,7 +23,6 @@ impl AppPaths {
             .context("resolve %APPDATA%")?
             .join("GrabIt");
         let presets_dir = data_dir.join("presets");
-        let stamps_dir = data_dir.join("stamps");
         let logs_dir = data_dir.join("logs");
 
         let output_dir = dirs::picture_dir()
@@ -33,12 +30,12 @@ impl AppPaths {
             .context("resolve Pictures folder")?
             .join("GrabIt");
 
-        for p in [&data_dir, &presets_dir, &stamps_dir, &logs_dir, &output_dir] {
+        for p in [&data_dir, &presets_dir, &logs_dir, &output_dir] {
             std::fs::create_dir_all(p)
                 .with_context(|| format!("create {}", p.display()))?;
         }
 
-        Ok(Self { data_dir, presets_dir, stamps_dir, logs_dir, output_dir })
+        Ok(Self { data_dir, presets_dir, logs_dir, output_dir })
     }
 
     pub fn settings_file(&self) -> PathBuf {

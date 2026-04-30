@@ -8,6 +8,19 @@ the system tray, launches with Windows.
 If GrabIt is useful to you, you can support development here:
 [☕ Buy me a coffee](https://buymeacoffee.com/matthewafay).
 
+## What's new in 1.6.8
+
+### Removed: Stamp annotation type
+- The `Stamp` annotation variant (and the `StampSource` enum, the
+  `tools::stamp` module, the `assets/stamps/` PNG library, and the
+  `stamps_dir` path) are gone from the codebase entirely.
+- Stamps were never user-creatable in any released GrabIt — the Tool
+  palette never exposed a Stamp tool — so there should be no
+  `.grabit` files in the wild containing Stamp annotations.
+- Document schema bumped to v5. A v4 document containing Stamp
+  variants (only possible from a non-released build) now fails to
+  load; v4 documents without Stamps load unchanged.
+
 ## What's new in 1.6.4
 
 ### Removed: HKCU Run-key autostart
@@ -41,7 +54,7 @@ If GrabIt is useful to you, you can support development here:
 
 ### Annotation editor
 - All 9 annotation types (Arrow, Text, Shape, Step, Magnify, Blur,
-  Callout, Stamp, CaptureInfo) render as SVG primitives layered
+  Callout, CaptureInfo) render as SVG primitives layered
   over the screenshot's `<image>` element.
 - All 10 tools work: drag-to-create for shapes / arrows / text /
   blur / magnify / callout; single-click for step + capture-info.
@@ -70,7 +83,6 @@ be created/edited in the new editor yet:
 - Quick styles (per-tool named presets).
 - Cursor layer editing (move / resize / remove the captured cursor).
 - Aspect-locked Resize and 90° Rotate buttons in Document effects.
-- Stamps (existing stamps render as a dashed placeholder).
 
 These are tracked for 1.7.
 

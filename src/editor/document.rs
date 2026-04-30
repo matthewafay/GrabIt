@@ -12,11 +12,7 @@
 //! Schema versions:
 //! - v1 (M0–M2 + initial M3): only `Arrow` and `Text` annotation variants.
 //! - v2 (M3 complete): adds `Callout`, `Shape`, `Step`, `Stamp`, `Magnify`.
-//!   Because the enum is serialized with an internal `"kind"` tag via serde,
-//!   v1 files still deserialize cleanly as long as readers know the old
-//!   variant tags — which they do, since the two original variants are
-//!   unchanged. v1 files simply have `schema_version = 1` and no new
-//!   variants. We do not rewrite v1 files on load.
+//!   v1 files still deserialize cleanly across this bump.
 //! - v3 (M4): adds `Blur` and `CaptureInfo` annotation variants plus two
 //!   top-level document fields (`edge_effect`, `border`). New fields are
 //!   tagged `#[serde(default)]` so v1/v2 files still deserialize cleanly.
@@ -25,6 +21,11 @@
 //!   documents that contain any old-shape Text nodes will fail to
 //!   deserialize — that is an accepted migration cost. Documents with no
 //!   Text nodes continue to load from any prior version.
+//! - v5 (1.6.8): `AnnotationNode::Stamp` and `StampSource` removed
+//!   entirely. The Stamp tool was never exposed in any released Tool
+//!   palette so no in-the-wild `.grabit` files should contain Stamp
+//!   variants — but if one does (via a test build or hand-edited
+//!   document), it will now fail to deserialize.
 
 use crate::capture::{CaptureMetadata, CaptureResult};
 use anyhow::{Context, Result};
@@ -42,7 +43,7 @@ use uuid::Uuid;
 /// reshapes the `Text` variant (`position` → `rect`): documents with no
 /// Text nodes load fine across versions; documents that contain old-shape
 /// Text nodes will fail to deserialize (accepted migration cost).
-pub const DOCUMENT_SCHEMA_VERSION: u32 = 4;
+pub const DOCUMENT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -274,18 +275,6 @@ impl Default for Border {
     }
 }
 
-/// Which built-in stamp (or a user-supplied PNG blob).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StampSource {
-    /// References a stamp shipped in the binary. Name must match one of the
-    /// identifiers returned by `tools::stamp::builtin_names`.
-    Builtin { name: String },
-    /// Inlined PNG bytes — for user-imported stamps (M5) or stamps from
-    /// round-tripped `.grabit` files whose original builtin is missing.
-    Inline { png: Vec<u8> },
-}
-
 /// Horizontal text alignment inside a `Text` annotation's wrap-width box.
 /// Applied per visual line at rasterize-time and to the live preview's
 /// `LayoutJob`, so the two paths match. Serialized kebab-case so the wire
@@ -460,14 +449,6 @@ pub enum AnnotationNode {
         fill: [u8; 4],
         text_color: [u8; 4],
     },
-    /// PNG sticker. Rendered with aspect-preserving fit into `rect`.
-    Stamp {
-        id: Uuid,
-        source: StampSource,
-        /// `[min_x, min_y, max_x, max_y]` — the bounding box into which the
-        /// stamp is drawn with alpha blending.
-        rect: [f32; 4],
-    },
     /// Loupe / magnifier: copies the pixels in `source_rect` and draws them
     /// scaled into `target_rect`, with an optional border.
     Magnify {
@@ -513,7 +494,6 @@ impl AnnotationNode {
             AnnotationNode::Callout { id, .. } => *id,
             AnnotationNode::Shape { id, .. } => *id,
             AnnotationNode::Step { id, .. } => *id,
-            AnnotationNode::Stamp { id, .. } => *id,
             AnnotationNode::Magnify { id, .. } => *id,
             AnnotationNode::Blur { id, .. } => *id,
             AnnotationNode::CaptureInfo { id, .. } => *id,
@@ -976,44 +956,6 @@ mod tests {
         let back = round_trip(&doc);
         if let AnnotationNode::Step { number, .. } = &back.annotations[0] {
             assert_eq!(*number, 3);
-        } else {
-            panic!("wrong variant");
-        }
-    }
-
-    #[test]
-    fn round_trip_stamp_builtin() {
-        let mut doc = stub_doc();
-        doc.annotations.push(AnnotationNode::Stamp {
-            id: Uuid::new_v4(),
-            source: StampSource::Builtin { name: "check".into() },
-            rect: [0.0, 0.0, 64.0, 64.0],
-        });
-        let back = round_trip(&doc);
-        if let AnnotationNode::Stamp {
-            source: StampSource::Builtin { name }, ..
-        } = &back.annotations[0]
-        {
-            assert_eq!(name, "check");
-        } else {
-            panic!("wrong variant");
-        }
-    }
-
-    #[test]
-    fn round_trip_stamp_inline() {
-        let mut doc = stub_doc();
-        doc.annotations.push(AnnotationNode::Stamp {
-            id: Uuid::new_v4(),
-            source: StampSource::Inline { png: vec![0x89, b'P', b'N', b'G'] },
-            rect: [0.0, 0.0, 64.0, 64.0],
-        });
-        let back = round_trip(&doc);
-        if let AnnotationNode::Stamp {
-            source: StampSource::Inline { png }, ..
-        } = &back.annotations[0]
-        {
-            assert_eq!(png.len(), 4);
         } else {
             panic!("wrong variant");
         }

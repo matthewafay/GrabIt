@@ -22,7 +22,6 @@ pub mod cursor_edit;
 pub mod magnify;
 pub mod selection;
 pub mod shape;
-pub mod stamp;
 pub mod step;
 pub mod text;
 

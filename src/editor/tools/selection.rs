@@ -74,7 +74,6 @@ pub fn bounds_of_node(node: &AnnotationNode) -> Option<BBox> {
             Some([center[0] - radius, center[1] - radius,
                   center[0] + radius, center[1] + radius])
         }
-        AnnotationNode::Stamp { rect, .. } => Some(*rect),
         AnnotationNode::Magnify { target_rect, .. } => Some(*target_rect),
         AnnotationNode::Blur { rect, .. } => Some(*rect),
         // CaptureInfo's on-canvas extent depends on the runtime banner

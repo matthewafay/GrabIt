@@ -7,11 +7,10 @@
 use crate::capture::CaptureMetadata;
 use crate::editor::document::{
     AnnotationNode, ArrowHeadStyle, ArrowLineStyle, Border, CaptureInfoPosition,
-    CaptureInfoStyle, Edge, EdgeEffect, FieldKind, ShapeKind, StampSource,
+    CaptureInfoStyle, Edge, EdgeEffect, FieldKind, ShapeKind,
     TextAlign, TextListStyle,
 };
 use crate::editor::tools::selection::sample_bezier;
-use crate::editor::tools::stamp;
 use crate::platform::fonts::JETBRAINS_MONO_REGULAR;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{Rgba, RgbaImage};
@@ -79,9 +78,6 @@ pub fn flatten(
             }
             AnnotationNode::Step { center, radius, number, fill, text_color, .. } => {
                 draw_step(&mut out, *center, *radius, *number, *fill, *text_color);
-            }
-            AnnotationNode::Stamp { source, rect, .. } => {
-                draw_stamp(&mut out, source, *rect);
             }
             AnnotationNode::Magnify {
                 source_rect, target_rect, border, border_width, circular, ..
@@ -667,15 +663,6 @@ pub fn draw_callout(
         text_size,
         text_color,
     );
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Stamp
-// ───────────────────────────────────────────────────────────────────────────
-
-pub fn draw_stamp(canvas: &mut RgbaImage, source: &StampSource, rect: [f32; 4]) {
-    let Ok(img) = stamp::resolve(source) else { return };
-    blit_scaled(canvas, &img, rect);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1287,33 +1274,6 @@ fn fill_convex_polygon(canvas: &mut RgbaImage, points: &[[f32; 2]], color: [u8; 
         let x1 = (rx.round() as i32).min(w - 1);
         for x in x0..=x1 {
             blend_pixel(canvas, x as u32, y as u32, color);
-        }
-    }
-}
-
-/// Alpha-blend a scaled RGBA image into `dst` at the specified rect.
-/// Uses nearest-neighbour sampling — stamps are small and this keeps the
-/// dep graph off `fast_image_resize` until M4.
-fn blit_scaled(dst: &mut RgbaImage, src: &RgbaImage, rect: [f32; 4]) {
-    let r = normalise(rect);
-    let dw = r[2] - r[0];
-    let dh = r[3] - r[1];
-    if dw < 1.0 || dh < 1.0 { return; }
-    let (sw, sh) = src.dimensions();
-    let (dst_w, dst_h) = dst.dimensions();
-    let x0 = (r[0].floor() as i32).max(0);
-    let y0 = (r[1].floor() as i32).max(0);
-    let x1 = (r[2].ceil() as i32).min(dst_w as i32);
-    let y1 = (r[3].ceil() as i32).min(dst_h as i32);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let u = (x as f32 + 0.5 - r[0]) / dw;
-            let v = (y as f32 + 0.5 - r[1]) / dh;
-            let sx = (u * sw as f32) as i32;
-            let sy = (v * sh as f32) as i32;
-            if sx < 0 || sy < 0 || sx >= sw as i32 || sy >= sh as i32 { continue; }
-            let p = src.get_pixel(sx as u32, sy as u32).0;
-            blend_pixel(dst, x as u32, y as u32, p);
         }
     }
 }

@@ -1311,7 +1311,6 @@ fn hit_node(node: &AnnotationNode, p: [f32; 2], doc: &Document) -> bool {
             (dx * dx + dy * dy).sqrt() <= *radius
         }
         AnnotationNode::Magnify { target_rect, .. } => point_in_rect(p, *target_rect),
-        AnnotationNode::Stamp { rect, .. } => point_in_rect(p, *rect),
         AnnotationNode::CaptureInfo { position, fields, style, .. } => {
             // Recompute the same bbox that render_capture_info uses
             // so a click on the visible banner registers as a hit.
@@ -1397,8 +1396,7 @@ fn handle_at(p: [f32; 2], node: &AnnotationNode) -> Option<ResizeHandle> {
         AnnotationNode::Text { rect, .. }
         | AnnotationNode::Shape { rect, .. }
         | AnnotationNode::Blur { rect, .. }
-        | AnnotationNode::Callout { rect, .. }
-        | AnnotationNode::Stamp { rect, .. } => *rect,
+        | AnnotationNode::Callout { rect, .. } => *rect,
         AnnotationNode::Magnify { target_rect, .. } => *target_rect,
         AnnotationNode::Step { center, radius, .. } => {
             // Single radius-handle to the east.
@@ -1439,8 +1437,7 @@ fn translate_node(node: &mut AnnotationNode, dx: f32, dy: f32, base: &Annotation
         }
         (AnnotationNode::Text { rect, .. }, AnnotationNode::Text { rect: br, .. })
         | (AnnotationNode::Shape { rect, .. }, AnnotationNode::Shape { rect: br, .. })
-        | (AnnotationNode::Blur { rect, .. }, AnnotationNode::Blur { rect: br, .. })
-        | (AnnotationNode::Stamp { rect, .. }, AnnotationNode::Stamp { rect: br, .. }) => {
+        | (AnnotationNode::Blur { rect, .. }, AnnotationNode::Blur { rect: br, .. }) => {
             *rect = [br[0] + dx, br[1] + dy, br[2] + dx, br[3] + dy];
         }
         (
@@ -1509,8 +1506,7 @@ fn resize_node(
         AnnotationNode::Text { rect, .. }
         | AnnotationNode::Shape { rect, .. }
         | AnnotationNode::Blur { rect, .. }
-        | AnnotationNode::Callout { rect, .. }
-        | AnnotationNode::Stamp { rect, .. } => *rect,
+        | AnnotationNode::Callout { rect, .. } => *rect,
         AnnotationNode::Magnify { target_rect, .. } => *target_rect,
         _ => return,
     };
@@ -1520,8 +1516,7 @@ fn resize_node(
         AnnotationNode::Text { rect, .. }
         | AnnotationNode::Shape { rect, .. }
         | AnnotationNode::Blur { rect, .. }
-        | AnnotationNode::Callout { rect, .. }
-        | AnnotationNode::Stamp { rect, .. } => {
+        | AnnotationNode::Callout { rect, .. } => {
             *rect = new_rect;
         }
         AnnotationNode::Magnify { target_rect, .. } => {
@@ -1671,7 +1666,6 @@ fn render_node(node: &AnnotationNode, doc: &Document) -> Element {
                 &ctx.base_uri,
             )
         }
-        AnnotationNode::Stamp { id, rect, .. } => render_stamp_placeholder(*id, *rect),
         AnnotationNode::CaptureInfo { id, position, fields, style } => {
             render_capture_info(*id, *position, fields, *style, doc)
         }
@@ -1698,23 +1692,34 @@ fn render_arrow(
     };
 
     let head_len = (thickness * 4.0).max(14.0);
-    // At high thickness the shaft's `stroke-linecap: round` produces
-    // a half-disc cap of radius `thickness/2` that protrudes past the
-    // triangle tip — visible as a bulge poking out the front of the
-    // arrow. Pull the shaft endpoint back so the cap sits hidden
-    // inside the head triangle. 0.85 × head_len is the sweet spot:
-    // round cap is fully covered, but the shaft still overlaps the
-    // base far enough to avoid sub-pixel hairline gaps. LineOnly /
-    // None keep the full length since there's no triangle covering
-    // the cap.
-    let needs_end_setback = matches!(
-        head_style,
-        ArrowHeadStyle::FilledTriangle
-            | ArrowHeadStyle::OutlineTriangle
-            | ArrowHeadStyle::DoubleEnded
-    );
-    let needs_start_setback = matches!(head_style, ArrowHeadStyle::DoubleEnded);
-    let setback = head_len * 0.85;
+    // Setback per head style — how far to pull the shaft back from
+    // each end so the line doesn't visibly poke through the head.
+    //
+    // Filled / DoubleEnded: shaft end sits *inside* the triangle at
+    //   ~85 % of head_len. The triangle's solid fill covers the
+    //   round cap; setback shorter than head_len keeps the shaft
+    //   overlapping the base by a few pixels so there's no
+    //   sub-pixel hairline gap.
+    // OutlineTriangle / LineOnly: the head is hollow / open, so a
+    //   shaft endpoint inside the triangle would be visible
+    //   through it. Pull the shaft all the way back to the head's
+    //   *base*, where it merges with the triangle's back edge.
+    //   Slight overshoot of head_len so the round cap sits
+    //   tucked behind the visible triangle stroke.
+    // None: no head, no setback.
+    let (needs_end_setback, end_setback) = match head_style {
+        ArrowHeadStyle::FilledTriangle | ArrowHeadStyle::DoubleEnded => {
+            (true, head_len * 0.85)
+        }
+        ArrowHeadStyle::OutlineTriangle | ArrowHeadStyle::LineOnly => {
+            (true, head_len + thickness * 0.5)
+        }
+        ArrowHeadStyle::None => (false, 0.0),
+    };
+    let (needs_start_setback, start_setback) = match head_style {
+        ArrowHeadStyle::DoubleEnded => (true, head_len * 0.85),
+        _ => (false, 0.0),
+    };
 
     let path_d = match control {
         Some(c) => {
@@ -1735,12 +1740,12 @@ fn render_arrow(
             let ux = dx / len;
             let uy = dy / len;
             let (sx, sy) = if needs_start_setback {
-                (start[0] + ux * setback, start[1] + uy * setback)
+                (start[0] + ux * start_setback, start[1] + uy * start_setback)
             } else {
                 (start[0], start[1])
             };
             let (ex, ey) = if needs_end_setback {
-                (end[0] - ux * setback, end[1] - uy * setback)
+                (end[0] - ux * end_setback, end[1] - uy * end_setback)
             } else {
                 (end[0], end[1])
             };
@@ -2294,38 +2299,6 @@ fn render_magnify(
     }
 }
 
-fn render_stamp_placeholder(id: Uuid, rect: [f32; 4]) -> Element {
-    // Stamps render correctly on export via rasterize::draw_stamp;
-    // for live preview we draw a placeholder rect with a small label.
-    let x = rect[0];
-    let y = rect[1];
-    let w = (rect[2] - rect[0]).max(10.0);
-    let h = (rect[3] - rect[1]).max(10.0);
-    rsx! {
-        g {
-            rect {
-                key: "stamp-{id}",
-                x: "{x}",
-                y: "{y}",
-                width: "{w}",
-                height: "{h}",
-                fill: "rgba(255,255,255,0.7)",
-                stroke: "rgba(0,0,0,0.5)",
-                "stroke-width": "1.5",
-                "stroke-dasharray": "3 3",
-            }
-            text {
-                x: "{x + w * 0.5}",
-                y: "{y + h * 0.5 + 4.0}",
-                "text-anchor": "middle",
-                fill: "rgba(0,0,0,0.65)",
-                "font-size": "12",
-                "stamp"
-            }
-        }
-    }
-}
-
 fn render_capture_info(
     id: Uuid,
     position: CaptureInfoPosition,
@@ -2555,8 +2528,7 @@ fn bounding_box(node: &AnnotationNode) -> Option<[f32; 4]> {
         AnnotationNode::Text { rect, .. }
         | AnnotationNode::Shape { rect, .. }
         | AnnotationNode::Blur { rect, .. }
-        | AnnotationNode::Callout { rect, .. }
-        | AnnotationNode::Stamp { rect, .. } => {
+        | AnnotationNode::Callout { rect, .. } => {
             [rect[0], rect[1], (rect[2] - rect[0]).max(0.0), (rect[3] - rect[1]).max(0.0)]
         }
         AnnotationNode::Magnify { target_rect, .. } => [
@@ -3308,7 +3280,6 @@ fn SelectionSection(
         AnnotationNode::Magnify { .. } => "Magnifier",
         AnnotationNode::Blur { .. } => "Blur",
         AnnotationNode::Callout { .. } => "Callout",
-        AnnotationNode::Stamp { .. } => "Stamp",
         AnnotationNode::CaptureInfo { .. } => "Capture info",
     };
 
