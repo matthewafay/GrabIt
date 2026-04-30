@@ -99,12 +99,14 @@ pub fn run_blocking(paths: AppPaths, _settings: Settings) -> Result<()> {
         output_dir: paths.output_dir.clone(),
     };
 
-    let cfg = Config::new().with_window(
-        WindowBuilder::new()
-            .with_title("GrabIt — History")
-            .with_inner_size(LogicalSize::new(900.0, 660.0))
-            .with_min_inner_size(LogicalSize::new(620.0, 420.0)),
-    );
+    let mut window = WindowBuilder::new()
+        .with_title("GrabIt — History")
+        .with_inner_size(LogicalSize::new(900.0, 660.0))
+        .with_min_inner_size(LogicalSize::new(620.0, 420.0));
+    if let Some(icon) = crate::platform::icon::load_window_icon() {
+        window = window.with_window_icon(Some(icon));
+    }
+    let cfg = Config::new().with_window(window);
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(cfg)

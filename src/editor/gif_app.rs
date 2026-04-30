@@ -79,12 +79,14 @@ pub fn run_blocking(sidecar_path: PathBuf, paths: AppPaths, settings: Settings) 
     let sidecar: GifSidecar = serde_json::from_str(&body)
         .with_context(|| format!("parse sidecar {}", sidecar_path.display()))?;
 
-    let cfg = Config::new().with_window(
-        WindowBuilder::new()
-            .with_title("GrabIt — GIF editor")
-            .with_inner_size(LogicalSize::new(1100.0, 720.0))
-            .with_min_inner_size(LogicalSize::new(820.0, 520.0)),
-    );
+    let mut window = WindowBuilder::new()
+        .with_title("GrabIt — GIF editor")
+        .with_inner_size(LogicalSize::new(1100.0, 720.0))
+        .with_min_inner_size(LogicalSize::new(820.0, 520.0));
+    if let Some(icon) = crate::platform::icon::load_window_icon() {
+        window = window.with_window_icon(Some(icon));
+    }
+    let cfg = Config::new().with_window(window);
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(cfg)

@@ -45,12 +45,14 @@ struct InitialState {
 }
 
 pub fn run_blocking(paths: AppPaths, initial: Settings) -> Result<()> {
-    let cfg = Config::new().with_window(
-        WindowBuilder::new()
-            .with_title("GrabIt — Settings")
-            .with_inner_size(LogicalSize::new(640.0, 620.0))
-            .with_min_inner_size(LogicalSize::new(560.0, 480.0)),
-    );
+    let mut window = WindowBuilder::new()
+        .with_title("GrabIt — Settings")
+        .with_inner_size(LogicalSize::new(640.0, 620.0))
+        .with_min_inner_size(LogicalSize::new(560.0, 480.0));
+    if let Some(icon) = crate::platform::icon::load_window_icon() {
+        window = window.with_window_icon(Some(icon));
+    }
+    let cfg = Config::new().with_window(window);
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(cfg)

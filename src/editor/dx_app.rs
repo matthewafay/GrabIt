@@ -246,12 +246,14 @@ pub fn run_blocking(
     let want_w = ((document.base_width as f32 + 320.0).max(MIN_W)).min(MAX_W);
     let want_h = ((document.base_height as f32 + 140.0).max(MIN_H)).min(MAX_H);
 
-    let cfg = Config::new().with_window(
-        WindowBuilder::new()
-            .with_title("GrabIt — Editor")
-            .with_inner_size(LogicalSize::new(want_w, want_h))
-            .with_min_inner_size(LogicalSize::new(820.0, 560.0)),
-    );
+    let mut window = WindowBuilder::new()
+        .with_title("GrabIt — Editor")
+        .with_inner_size(LogicalSize::new(want_w, want_h))
+        .with_min_inner_size(LogicalSize::new(820.0, 560.0));
+    if let Some(icon) = crate::platform::icon::load_window_icon() {
+        window = window.with_window_icon(Some(icon));
+    }
+    let cfg = Config::new().with_window(window);
 
     let initial_doc = document;
 

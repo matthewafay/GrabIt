@@ -4,4 +4,5 @@
 
 pub mod dpi;
 pub mod fonts;
+pub mod icon;
 pub mod monitors;
