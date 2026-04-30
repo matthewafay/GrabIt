@@ -1,0 +1,283 @@
+/* History window styling for the Dioxus POC. Modern dark theme,
+   roughly matching the visual language at https://dioxuslabs.com/components
+   so the user can see how that aesthetic transfers into a real grabit
+   window. All custom — no external CSS framework. */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    background: #0e1116;
+    color: #e6e8eb;
+    height: 100%;
+    overflow: hidden;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+}
+
+button {
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 6px 12px;
+    transition: background 0.15s ease, border-color 0.15s ease,
+        color 0.15s ease, transform 0.05s ease;
+    font-family: inherit;
+}
+
+button:active {
+    transform: translateY(1px);
+}
+
+button.ghost {
+    background: transparent;
+    border-color: #2a3038;
+    color: #c4c8cf;
+}
+
+button.ghost:hover {
+    background: #1c2026;
+    border-color: #3a414c;
+    color: #fff;
+}
+
+button.primary {
+    background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+    color: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+button.primary:hover {
+    background: linear-gradient(180deg, #4f8ff9 0%, #2c6ef0 100%);
+}
+
+button.secondary {
+    background: #1c2026;
+    color: #c4c8cf;
+    border-color: #2a3038;
+}
+
+button.secondary:hover {
+    background: #252a32;
+    color: #fff;
+    border-color: #3a414c;
+}
+
+.app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+.toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    padding: 14px 22px 12px;
+    border-bottom: 1px solid #1f242c;
+    flex-shrink: 0;
+    background: linear-gradient(180deg, #131820 0%, #0e1116 100%);
+}
+
+.title h1 {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: #fff;
+}
+
+.title .path {
+    font-size: 11px;
+    color: #6c727a;
+    margin-top: 3px;
+    font-family: "JetBrains Mono", "Cascadia Mono", "Consolas", monospace;
+    letter-spacing: 0;
+}
+
+.actions {
+    display: flex;
+    gap: 8px;
+}
+
+.main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 22px;
+    scrollbar-width: thin;
+    scrollbar-color: #2a3038 transparent;
+}
+
+.main::-webkit-scrollbar {
+    width: 10px;
+}
+
+.main::-webkit-scrollbar-thumb {
+    background: #2a3038;
+    border-radius: 5px;
+    border: 2px solid #0e1116;
+}
+
+.main::-webkit-scrollbar-thumb:hover {
+    background: #3a414c;
+}
+
+.empty {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #6c727a;
+    font-size: 14px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+    gap: 14px;
+}
+
+.card {
+    background: #14181f;
+    border: 1px solid #1f242c;
+    border-radius: 10px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: border-color 0.15s ease, transform 0.15s ease,
+        box-shadow 0.15s ease;
+}
+
+.card:hover {
+    border-color: #3a414c;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+}
+
+.thumb {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: repeating-conic-gradient(
+            #0a0c10 0deg 90deg,
+            #0d1015 90deg 180deg
+        )
+        0 0 / 14px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.thumb img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    display: block;
+}
+
+.badge {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: #fff;
+    background: rgba(10, 12, 16, 0.75);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    text-transform: uppercase;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.badge.png {
+    background: rgba(37, 99, 235, 0.85);
+}
+
+.badge.gif {
+    background: rgba(217, 119, 6, 0.85);
+}
+
+.meta {
+    padding: 10px 12px 4px;
+}
+
+.meta .name {
+    font-size: 13px;
+    font-weight: 500;
+    color: #e6e8eb;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.meta .sub {
+    font-size: 11px;
+    color: #6c727a;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+
+.row {
+    display: flex;
+    gap: 6px;
+    padding: 8px 12px 12px;
+}
+
+.row button {
+    flex: 1;
+    padding: 6px 8px;
+    font-size: 12px;
+}
+
+.flash {
+    padding: 4px 12px 10px;
+    font-size: 11px;
+    color: #4ade80;
+    animation: flash-in 0.15s ease-out;
+}
+
+@keyframes flash-in {
+    from {
+        opacity: 0;
+        transform: translateY(-2px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.footer {
+    padding: 8px 22px;
+    border-top: 1px solid #1f242c;
+    color: #6c727a;
+    font-size: 11px;
+    flex-shrink: 0;
+    background: #0a0c10;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.footer .pill {
+    background: rgba(37, 99, 235, 0.15);
+    color: #93c5fd;
+    border: 1px solid rgba(37, 99, 235, 0.3);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}

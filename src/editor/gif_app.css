@@ -1,0 +1,439 @@
+/* GIF frame editor — three-region layout (top bar, main area split into
+   right inspector + center preview, bottom timeline) over the same dark
+   theme used by Settings and History. */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    background: #0a0c10;
+    color: #e6e8eb;
+    height: 100%;
+    overflow: hidden;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+}
+
+button {
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 12px;
+    transition: background 0.15s ease, border-color 0.15s ease,
+        color 0.15s ease, transform 0.05s ease;
+    font-family: inherit;
+}
+
+button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+button:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+button.ghost {
+    background: transparent;
+    border-color: #2a3038;
+    color: #c4c8cf;
+}
+
+button.ghost:hover:not(:disabled) {
+    background: #1c2026;
+    border-color: #3a414c;
+    color: #fff;
+}
+
+button.primary {
+    background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+    color: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+button.primary:hover:not(:disabled) {
+    background: linear-gradient(180deg, #4f8ff9 0%, #2c6ef0 100%);
+}
+
+button.danger {
+    background: transparent;
+    color: #f87171;
+    border-color: #3a1a1a;
+}
+
+button.danger:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.08);
+    color: #fca5a5;
+}
+
+input[type="number"] {
+    background: #14181f;
+    border: 1px solid #2a3038;
+    color: #e6e8eb;
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s ease;
+    width: 80px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+input[type="number"]:focus {
+    border-color: #2563eb;
+}
+
+.app {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    grid-template-columns: 1fr 220px;
+    grid-template-areas:
+        "topbar topbar"
+        "preview inspector"
+        "timeline timeline";
+    height: 100vh;
+    background: #0e1116;
+}
+
+.topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    border-bottom: 1px solid #1f242c;
+    background: linear-gradient(180deg, #131820 0%, #0e1116 100%);
+}
+
+.topbar .title {
+    flex: 1;
+    min-width: 0;
+}
+
+.topbar .title h1 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.topbar .title p {
+    font-size: 11px;
+    color: #6c727a;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+
+.topbar .actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.topbar .toggle-mini {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: #c4c8cf;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.topbar .toggle-mini input {
+    accent-color: #2563eb;
+}
+
+.preview {
+    grid-area: preview;
+    background: repeating-conic-gradient(
+            #0a0c10 0deg 90deg,
+            #0d1015 90deg 180deg
+        )
+        0 0 / 18px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    position: relative;
+}
+
+.preview img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+.preview .empty {
+    color: #6c727a;
+    font-size: 13px;
+}
+
+.preview .progress-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(10, 12, 16, 0.85);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 12px;
+    z-index: 10;
+}
+
+.preview .progress-overlay .card {
+    background: #14181f;
+    border: 1px solid #2a3038;
+    border-radius: 10px;
+    padding: 18px 22px;
+    min-width: 280px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.preview .progress-overlay h3 {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #fff;
+}
+
+.preview .progress-overlay .bar {
+    width: 100%;
+    height: 8px;
+    background: #1c2026;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 8px;
+}
+
+.preview .progress-overlay .bar .fill {
+    height: 100%;
+    background: linear-gradient(90deg, #3b82f6, #60a5fa);
+    border-radius: 4px;
+    transition: width 0.1s ease;
+}
+
+.preview .progress-overlay .meta {
+    font-size: 11px;
+    color: #6c727a;
+    font-variant-numeric: tabular-nums;
+}
+
+.preview .progress-overlay code {
+    display: block;
+    margin-top: 8px;
+    padding: 6px 10px;
+    background: #0a0c10;
+    border-radius: 4px;
+    font-size: 11px;
+    color: #93c5fd;
+    word-break: break-all;
+    font-family: "JetBrains Mono", "Cascadia Mono", "Consolas", monospace;
+}
+
+.preview .progress-overlay .row-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.inspector {
+    grid-area: inspector;
+    background: #0a0c10;
+    border-left: 1px solid #1f242c;
+    padding: 14px 14px 18px;
+    overflow-y: auto;
+}
+
+.inspector h2 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #93c5fd;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #1f242c;
+}
+
+.inspector .field {
+    margin-bottom: 10px;
+}
+
+.inspector .field label {
+    display: block;
+    font-size: 11px;
+    color: #6c727a;
+    margin-bottom: 4px;
+}
+
+.inspector .trim-row {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.inspector .trim-row button {
+    flex: 1;
+    padding: 4px 6px;
+    font-size: 11px;
+}
+
+.inspector .trim-status {
+    font-size: 11px;
+    color: #6c727a;
+    margin: 6px 0;
+    font-variant-numeric: tabular-nums;
+}
+
+.inspector .trim-apply {
+    width: 100%;
+}
+
+.inspector .stats {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid #1f242c;
+    font-size: 11px;
+    color: #6c727a;
+}
+
+.inspector .stats div {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 4px;
+    font-variant-numeric: tabular-nums;
+}
+
+.inspector .stats div span:last-child {
+    color: #c4c8cf;
+}
+
+.timeline {
+    grid-area: timeline;
+    background: #0a0c10;
+    border-top: 1px solid #1f242c;
+    padding: 8px 18px 12px;
+}
+
+.timeline .controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.timeline .controls .spacer {
+    flex: 1;
+}
+
+.timeline .controls .position {
+    font-size: 11px;
+    color: #6c727a;
+    font-variant-numeric: tabular-nums;
+}
+
+.timeline .strip {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 4px 0 6px;
+    scrollbar-width: thin;
+    scrollbar-color: #2a3038 transparent;
+}
+
+.timeline .strip::-webkit-scrollbar {
+    height: 6px;
+}
+
+.timeline .strip::-webkit-scrollbar-thumb {
+    background: #2a3038;
+    border-radius: 3px;
+}
+
+.timeline .frame {
+    flex-shrink: 0;
+    width: 78px;
+    height: 56px;
+    background: #14181f;
+    border: 1.5px solid #1f242c;
+    border-radius: 4px;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.1s ease, opacity 0.15s ease;
+}
+
+.timeline .frame:hover {
+    border-color: #3a414c;
+}
+
+.timeline .frame.current {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 1px #3b82f6;
+}
+
+.timeline .frame.deleted {
+    opacity: 0.35;
+}
+
+.timeline .frame.deleted::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        135deg,
+        transparent 47%,
+        rgba(220, 80, 80, 0.85) 47%,
+        rgba(220, 80, 80, 0.85) 53%,
+        transparent 53%
+    );
+    pointer-events: none;
+}
+
+.timeline .frame.in-mark {
+    border-color: #4ade80;
+}
+
+.timeline .frame.out-mark {
+    border-color: #f59e0b;
+}
+
+.timeline .frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    pointer-events: none;
+}
+
+.timeline .frame .idx {
+    position: absolute;
+    top: 1px;
+    left: 2px;
+    font-size: 9px;
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(10, 12, 16, 0.6);
+    padding: 0 3px;
+    border-radius: 2px;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+}

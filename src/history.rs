@@ -1,4 +1,4 @@
-//! Mini capture history viewer.
+//! Capture-history viewer rendered with Dioxus desktop.
 //!
 //! Tray → "History…" spawns `grabit.exe --history`, which scans the
 //! configured `output_dir` for the most recent PNGs and GIFs and shows
@@ -12,426 +12,272 @@
 //!
 //! No persistent history file is maintained — we just walk the output
 //! directory on each open. Files the user deletes from disk drop out of
-//! the list naturally.
+//! the list naturally. The whole window is one process with the rest of
+//! grabit, so clipboard helpers in `crate::export` are called directly
+//! from event handlers — no IPC.
 
 use crate::app::paths::AppPaths;
 use crate::settings::Settings;
 use anyhow::Result;
-use eframe::egui;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use dioxus::desktop::{tao::window::WindowBuilder, Config, LogicalSize};
+use dioxus::prelude::*;
 use log::{info, warn};
+use rayon::prelude::*;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Maximum number of entries shown in the history grid. Loading
-/// thumbnails is lazy, but capping the entry count keeps the directory
-/// scan + initial sort cheap on output folders that have accumulated
-/// thousands of captures.
+/// Cap on how many history items the window loads. Each thumbnail is
+/// downscaled + base64-encoded into the DOM, so the cost grows linearly.
+/// 60 keeps the initial paint well under a second on a fast machine.
 const MAX_ENTRIES: usize = 60;
 
-/// Subprocess entry. Mirrors `editor::run_blocking` and
-/// `editor::gif_app::run_blocking`.
-pub fn run_blocking(paths: AppPaths, _settings: Settings) -> Result<()> {
-    let viewport = {
-        let mut vb = egui::ViewportBuilder::default()
-            .with_title("GrabIt — History")
-            .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([520.0, 360.0]);
-        if let Some(icon) = crate::editor::load_app_icon_data() {
-            vb = vb.with_icon(Arc::new(icon));
-        }
-        vb
-    };
+/// Thumbnail target size in physical pixels. Aspect ratio is preserved
+/// by `image::imageops::thumbnail`, so this is just a bounding box.
+const THUMB_W: u32 = 320;
+const THUMB_H: u32 = 180;
 
-    let options = eframe::NativeOptions {
-        viewport,
-        // We're a fresh `--history` subprocess so we own the main
-        // thread; `with_any_thread(true)` mirrors the gif/editor
-        // subprocesses for consistency.
-        event_loop_builder: Some(Box::new(|builder| {
-            #[cfg(windows)]
-            {
-                use winit::platform::windows::EventLoopBuilderExtWindows;
-                builder.with_any_thread(true);
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = builder;
-            }
-        })),
-        ..Default::default()
-    };
+/// CSS embedded at compile time — see `history.css` for the actual
+/// styling. Inlined into the document via a `<style>` tag.
+const STYLES: &str = include_str!("history.css");
 
-    eframe::run_native(
-        "GrabIt — History",
-        options,
-        Box::new(move |cc| {
-            crate::editor::install_jetbrains_mono(&cc.egui_ctx);
-            Ok(Box::new(HistoryApp::new(paths)))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Png,
     Gif,
 }
 
-#[derive(Debug, Clone)]
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Png => "PNG",
+            Kind::Gif => "GIF",
+        }
+    }
+    fn class(self) -> &'static str {
+        match self {
+            Kind::Png => "png",
+            Kind::Gif => "gif",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct Entry {
     path: PathBuf,
     kind: Kind,
-    /// Cached file size for the label. None until first stat.
     size_bytes: u64,
     modified: Option<SystemTime>,
-    /// Set once a `Copy` / `Copy path` button has been clicked, so the
-    /// row can flash a brief confirmation label.
-    flash: Option<(String, std::time::Instant)>,
+    /// Pre-built `data:image/png;base64,…` URI ready to drop into
+    /// `<img src=…>`. Built once during the directory scan to avoid
+    /// re-encoding on every repaint.
+    thumb_data_uri: String,
 }
 
-struct HistoryApp {
-    paths: AppPaths,
+/// Held in Dioxus's context registry so the root component can pull
+/// the initial scan + the output_dir without prop-drilling.
+#[derive(Clone)]
+struct InitialState {
     entries: Vec<Entry>,
-    /// Lazily-populated thumbnail textures, keyed by entry index.
-    thumbs: std::collections::HashMap<usize, egui::TextureHandle>,
-    status: String,
+    output_dir: PathBuf,
 }
 
-impl HistoryApp {
-    fn new(paths: AppPaths) -> Self {
-        let entries = scan(&paths.output_dir);
-        let status = if entries.is_empty() {
-            "No captures yet — your saved screenshots will appear here.".into()
-        } else {
-            String::new()
-        };
-        Self {
-            paths,
-            entries,
-            thumbs: std::collections::HashMap::new(),
-            status,
-        }
-    }
+/// Subprocess entry. Mirrors `history::run_blocking` in shape so the
+/// two are interchangeable from `main.rs`'s perspective.
+pub fn run_blocking(paths: AppPaths, _settings: Settings) -> Result<()> {
+    info!(
+        "history: scanning {} (cap {} entries)",
+        paths.output_dir.display(),
+        MAX_ENTRIES
+    );
+    let entries = scan_and_load(&paths.output_dir);
+    info!("history: loaded {} entries", entries.len());
 
-    fn refresh(&mut self) {
-        self.entries = scan(&self.paths.output_dir);
-        self.thumbs.clear();
-        self.status = if self.entries.is_empty() {
-            "No captures yet.".into()
-        } else {
-            format!("Found {} item(s).", self.entries.len())
-        };
-    }
+    let initial = InitialState {
+        entries,
+        output_dir: paths.output_dir.clone(),
+    };
 
-    fn ensure_thumb(&mut self, ctx: &egui::Context, idx: usize) {
-        if self.thumbs.contains_key(&idx) {
-            return;
-        }
-        let Some(entry) = self.entries.get(idx) else {
-            return;
-        };
-        // For both PNG and GIF, `image::open` gives us the first frame.
-        // That's what we want — a thumbnail is just a still preview.
-        match image::open(&entry.path) {
-            Ok(img) => {
-                let rgba = img.to_rgba8();
-                let (w, h) = rgba.dimensions();
-                let tex = ctx.load_texture(
-                    format!("history-thumb-{idx}"),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        rgba.as_raw(),
-                    ),
-                    egui::TextureOptions::LINEAR,
-                );
-                self.thumbs.insert(idx, tex);
-            }
-            Err(e) => warn!("history: load {} failed: {e}", entry.path.display()),
-        }
-    }
-}
+    let cfg = Config::new().with_window(
+        WindowBuilder::new()
+            .with_title("GrabIt — History")
+            .with_inner_size(LogicalSize::new(900.0, 660.0))
+            .with_min_inner_size(LogicalSize::new(620.0, 420.0)),
+    );
 
-impl eframe::App for HistoryApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Top bar.
-        egui::TopBottomPanel::top("history-top").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("Capture history");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Refresh").clicked() {
-                        self.refresh();
-                    }
-                    if ui.button("Open folder").clicked() {
-                        show_in_explorer(&self.paths.output_dir);
-                    }
-                });
-            });
-            ui.label(
-                egui::RichText::new(self.paths.output_dir.display().to_string())
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
-            ui.add_space(4.0);
-        });
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(cfg)
+        .with_context(initial)
+        .launch(history_app);
 
-        // Status bar.
-        egui::TopBottomPanel::bottom("history-status").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(if self.status.is_empty() {
-                    format!("{} item(s)", self.entries.len())
-                } else {
-                    self.status.clone()
-                })
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-            ui.add_space(2.0);
-        });
-
-        // Grid of cards.
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.entries.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new(&self.status)
-                            .color(egui::Color32::GRAY),
-                    );
-                });
-                return;
-            }
-
-            const CARD_W: f32 = 220.0;
-            const CARD_H: f32 = 200.0;
-            const THUMB_W: f32 = 200.0;
-            const THUMB_H: f32 = 112.0; // 16:9-ish
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    let avail_w = ui.available_width();
-                    let cols = ((avail_w / CARD_W).floor() as usize).max(1);
-                    let total = self.entries.len();
-                    let mut i = 0;
-                    while i < total {
-                        ui.horizontal(|ui| {
-                            for _ in 0..cols {
-                                if i >= total {
-                                    break;
-                                }
-                                self.ensure_thumb(ctx, i);
-                                self.draw_card(ui, i, CARD_W, CARD_H, THUMB_W, THUMB_H);
-                                i += 1;
-                            }
-                        });
-                        ui.add_space(6.0);
-                    }
-                });
-        });
-
-        // Repaint while any flash badge is still on screen so it can
-        // expire on its own clock.
-        if self.entries.iter().any(|e| e.flash.is_some()) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(120));
-        }
-    }
-}
-
-impl HistoryApp {
-    fn draw_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        idx: usize,
-        card_w: f32,
-        card_h: f32,
-        thumb_w: f32,
-        thumb_h: f32,
-    ) {
-        let frame = egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(6.0))
-            .rounding(egui::Rounding::same(6.0));
-        frame.show(ui, |ui| {
-            ui.set_width(card_w - 12.0);
-            ui.set_height(card_h - 12.0);
-
-            // Thumbnail area — fixed-size box centered horizontally, with
-            // the underlying image drawn via paint_at into the centered
-            // sub-rect. Same trick as the GIF preview; avoids any image
-            // size feeding back into ui layout.
-            let (thumb_rect, _) = ui.allocate_exact_size(
-                egui::vec2(thumb_w, thumb_h),
-                egui::Sense::hover(),
-            );
-            ui.painter().rect_filled(
-                thumb_rect,
-                egui::Rounding::same(4.0),
-                egui::Color32::from_gray(28),
-            );
-            if let Some(tex) = self.thumbs.get(&idx) {
-                let img_size = tex.size_vec2();
-                let scale = (thumb_rect.width() / img_size.x.max(1.0))
-                    .min(thumb_rect.height() / img_size.y.max(1.0))
-                    .min(1.0);
-                let target = img_size * scale;
-                let centered =
-                    egui::Rect::from_center_size(thumb_rect.center(), target);
-                egui::Image::new(tex).paint_at(ui, centered);
-            } else {
-                ui.painter().text(
-                    thumb_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "loading…",
-                    egui::TextStyle::Body.resolve(ui.style()),
-                    egui::Color32::from_gray(140),
-                );
-            }
-
-            // Type badge (PNG / GIF) painted over the top-left.
-            let (badge_text, badge_color) = match self.entries[idx].kind {
-                Kind::Png => ("PNG", egui::Color32::from_rgb(0, 120, 200)),
-                Kind::Gif => ("GIF", egui::Color32::from_rgb(180, 100, 0)),
-            };
-            let badge_rect = egui::Rect::from_min_size(
-                thumb_rect.min + egui::vec2(4.0, 4.0),
-                egui::vec2(36.0, 16.0),
-            );
-            ui.painter().rect_filled(
-                badge_rect,
-                egui::Rounding::same(3.0),
-                badge_color.linear_multiply(0.85),
-            );
-            ui.painter().text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                badge_text,
-                egui::TextStyle::Small.resolve(ui.style()),
-                egui::Color32::WHITE,
-            );
-
-            // Filename (single line, truncated).
-            let fname = self.entries[idx]
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "(unnamed)".into());
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(fname).strong())
-                    .truncate(),
-            );
-
-            // Size + relative-mtime label.
-            let size_label = human_size(self.entries[idx].size_bytes);
-            let rel = self.entries[idx]
-                .modified
-                .map(|t| relative_time(t))
-                .unwrap_or_else(|| String::new());
-            ui.label(
-                egui::RichText::new(format!("{size_label}  •  {rel}"))
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
-
-            ui.add_space(2.0);
-
-            // Action row.
-            ui.horizontal(|ui| {
-                let path = self.entries[idx].path.clone();
-                if ui.button("Copy").clicked() {
-                    self.do_copy_image(idx, &path);
-                }
-                if ui.button("Copy path").clicked() {
-                    self.do_copy_path(idx, &path);
-                }
-            });
-
-            // Flash (brief "Copied!" badge after a click).
-            if let Some((msg, when)) = &self.entries[idx].flash {
-                let elapsed = when.elapsed();
-                if elapsed < std::time::Duration::from_millis(1600) {
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .small()
-                            .color(egui::Color32::from_rgb(120, 200, 120)),
-                    );
-                } else {
-                    self.entries[idx].flash = None;
-                }
-            }
-        });
-    }
-
-    fn do_copy_image(&mut self, idx: usize, path: &std::path::Path) {
-        match copy_image(path) {
-            Ok(()) => {
-                let kind = self.entries[idx].kind;
-                let msg = match kind {
-                    Kind::Png => "Copied image to clipboard",
-                    Kind::Gif => "Copied GIF (file drop) to clipboard",
-                };
-                self.entries[idx].flash =
-                    Some((msg.into(), std::time::Instant::now()));
-                info!("history: copy image {} ({:?})", path.display(), kind);
-            }
-            Err(e) => {
-                self.entries[idx].flash =
-                    Some((format!("Copy failed: {e}"), std::time::Instant::now()));
-                warn!("history: copy image {}: {e}", path.display());
-            }
-        }
-    }
-
-    fn do_copy_path(&mut self, idx: usize, path: &std::path::Path) {
-        let abs = std::fs::canonicalize(path)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| path.display().to_string());
-        // Strip the kernel's `\\?\` UNC prefix so the pasted path looks
-        // like a normal Windows path. Same sanitization as the HDROP
-        // helper does internally.
-        let clean = abs.strip_prefix(r"\\?\").unwrap_or(&abs).to_string();
-        match crate::export::copy_text_to_clipboard(&clean) {
-            Ok(()) => {
-                self.entries[idx].flash = Some((
-                    "Copied path to clipboard".into(),
-                    std::time::Instant::now(),
-                ));
-                info!("history: copy path {}", clean);
-            }
-            Err(e) => {
-                self.entries[idx].flash =
-                    Some((format!("Copy failed: {e}"), std::time::Instant::now()));
-                warn!("history: copy path {}: {e}", clean);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn copy_image(path: &std::path::Path) -> Result<()> {
-    crate::export::copy_file_to_clipboard(path)
-}
-
-#[cfg(not(windows))]
-fn copy_image(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Walk `dir` for `*.png` / `*.gif`, sorted by modification time
-/// (newest first), capped at `MAX_ENTRIES`. Errors are logged and
-/// produce an empty list — the UI handles the empty case gracefully.
-fn scan(dir: &std::path::Path) -> Vec<Entry> {
-    let mut out: Vec<Entry> = Vec::new();
+#[component]
+fn history_app() -> Element {
+    let initial = use_context::<InitialState>();
+    let mut entries = use_signal(|| initial.entries.clone());
+    let output_dir = initial.output_dir.clone();
+    let output_dir_label = output_dir.display().to_string();
+
+    let dir_for_open = output_dir.clone();
+    let dir_for_refresh = output_dir.clone();
+
+    rsx! {
+        style { "{STYLES}" }
+        div { class: "app",
+            header { class: "toolbar",
+                div { class: "title",
+                    h1 { "Capture history" }
+                    p { class: "path", "{output_dir_label}" }
+                }
+                div { class: "actions",
+                    button {
+                        class: "ghost",
+                        onclick: move |_| open_in_explorer(&dir_for_open),
+                        "Open folder"
+                    }
+                    button {
+                        class: "ghost",
+                        onclick: move |_| {
+                            entries.set(scan_and_load(&dir_for_refresh));
+                        },
+                        "Refresh"
+                    }
+                }
+            }
+
+            main { class: "main",
+                if entries.read().is_empty() {
+                    div { class: "empty",
+                        p { "No captures yet — your saved screenshots will appear here." }
+                    }
+                } else {
+                    div { class: "grid",
+                        for entry in entries.read().iter().cloned() {
+                            EntryCard {
+                                key: "{entry.path.display()}",
+                                entry: entry.clone(),
+                            }
+                        }
+                    }
+                }
+            }
+
+            footer { class: "footer",
+                span { "{entries.read().len()} item(s)" }
+            }
+        }
+    }
+}
+
+#[component]
+fn EntryCard(entry: Entry) -> Element {
+    // Per-card flash: shows briefly under the action row after a click.
+    // Carries an `Instant` so the message expires on its own clock; we
+    // schedule a delayed re-render via `spawn` to clear it.
+    let mut flash = use_signal(|| Option::<String>::None);
+
+    // Each closure captures its own clone of the path so the
+    // borrow-checker is happy with two onclicks each consuming a
+    // separate move. PathBuf is cheap to clone.
+    let path_for_image = entry.path.clone();
+    let path_for_text = entry.path.clone();
+    let kind = entry.kind;
+
+    let do_copy_image = move |_| {
+        let path = path_for_image.clone();
+        let result = crate::export::copy_file_to_clipboard(&path);
+        let msg = match result {
+            Ok(()) => match kind {
+                Kind::Png => "Copied image to clipboard".to_string(),
+                Kind::Gif => "Copied GIF (file drop) to clipboard".to_string(),
+            },
+            Err(e) => {
+                warn!("history: copy image {}: {e}", path.display());
+                format!("Copy failed: {e}")
+            }
+        };
+        flash.set(Some(msg));
+        // Auto-clear after ~1.6s. `spawn` schedules a Dioxus task on
+        // the runtime; setting the signal triggers a re-render that
+        // hides the flash.
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+            flash.set(None);
+        });
+    };
+
+    let do_copy_path = move |_| {
+        let path = path_for_text.clone();
+        let abs = std::fs::canonicalize(&path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        let clean = abs.strip_prefix(r"\\?\").unwrap_or(&abs).to_string();
+        let msg = match crate::export::copy_text_to_clipboard(&clean) {
+            Ok(()) => "Copied path to clipboard".to_string(),
+            Err(e) => {
+                warn!("history: copy path {}: {e}", clean);
+                format!("Copy failed: {e}")
+            }
+        };
+        flash.set(Some(msg));
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+            flash.set(None);
+        });
+    };
+
+    let badge_class = format!("badge {}", entry.kind.class());
+    let filename = entry
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unnamed)".into());
+    let sub = format!(
+        "{} • {}",
+        human_size(entry.size_bytes),
+        entry
+            .modified
+            .map(relative_time)
+            .unwrap_or_else(|| "—".into())
+    );
+
+    rsx! {
+        div { class: "card",
+            div { class: "thumb",
+                img { src: "{entry.thumb_data_uri}", alt: "thumbnail" }
+                span { class: "{badge_class}", "{entry.kind.label()}" }
+            }
+            div { class: "meta",
+                div { class: "name", "{filename}" }
+                div { class: "sub", "{sub}" }
+            }
+            div { class: "row",
+                button { class: "primary", onclick: do_copy_image, "Copy" }
+                button { class: "secondary", onclick: do_copy_path, "Copy path" }
+            }
+            if let Some(msg) = flash.read().clone() {
+                div { class: "flash", "{msg}" }
+            }
+        }
+    }
+}
+
+/// Walk `dir` for *.png/*.gif, sort newest first, cap at MAX_ENTRIES,
+/// then build base64 thumbnails for each in parallel. The parallel
+/// thumbnail step is rayon-driven so a large output folder still
+/// populates quickly on a multi-core box.
+fn scan_and_load(dir: &std::path::Path) -> Vec<Entry> {
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) => {
             warn!("history: read_dir {}: {e}", dir.display());
-            return out;
+            return Vec::new();
         }
     };
+    let mut metas: Vec<(PathBuf, Kind, u64, Option<SystemTime>)> = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -450,18 +296,42 @@ fn scan(dir: &std::path::Path) -> Vec<Entry> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        out.push(Entry {
-            path,
-            kind,
-            size_bytes: meta.len(),
-            modified: meta.modified().ok(),
-            flash: None,
-        });
+        metas.push((path, kind, meta.len(), meta.modified().ok()));
     }
-    // Newest first.
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
-    out.truncate(MAX_ENTRIES);
-    out
+    metas.sort_by(|a, b| b.3.cmp(&a.3));
+    metas.truncate(MAX_ENTRIES);
+
+    metas
+        .into_par_iter()
+        .filter_map(|(path, kind, size, modified)| {
+            let thumb = build_thumb(&path)?;
+            Some(Entry {
+                path,
+                kind,
+                size_bytes: size,
+                modified,
+                thumb_data_uri: thumb,
+            })
+        })
+        .collect()
+}
+
+/// Decode `path`, downscale to a THUMB_W × THUMB_H bounding box (aspect
+/// preserved), re-encode as PNG, then base64-encode into a data URI
+/// suitable for `<img src=…>`. Returns `None` on any decode failure;
+/// the caller drops the entry rather than rendering a broken card.
+fn build_thumb(path: &std::path::Path) -> Option<String> {
+    let img = image::open(path).ok()?;
+    let resized = img.thumbnail(THUMB_W, THUMB_H);
+    let mut bytes: Vec<u8> = Vec::new();
+    resized
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .ok()?;
+    let b64 = STANDARD.encode(&bytes);
+    Some(format!("data:image/png;base64,{}", b64))
 }
 
 fn human_size(bytes: u64) -> String {
@@ -493,14 +363,12 @@ fn relative_time(t: SystemTime) -> String {
                 format!("{}d ago", secs / 86_400)
             }
         }
-        // If `modified` is in the future (clock skew), don't error —
-        // just fall back to a neutral label.
         Err(_) => "recently".to_string(),
     }
 }
 
 #[cfg(windows)]
-fn show_in_explorer(path: &std::path::Path) {
+fn open_in_explorer(path: &std::path::Path) {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -520,4 +388,4 @@ fn show_in_explorer(path: &std::path::Path) {
 }
 
 #[cfg(not(windows))]
-fn show_in_explorer(_path: &std::path::Path) {}
+fn open_in_explorer(_path: &std::path::Path) {}

@@ -51,6 +51,16 @@ imageproc = { version = "0.25", default-features = false }
 # instead of going through image's single-threaded GifEncoder.
 gif = "0.13"
 rayon = "1.10"
+# Dioxus desktop renders the History / Settings / GIF-editor windows
+# through Wry/WebView2 with HTML+CSS. The annotation editor still uses
+# eframe (it's a custom canvas surface — large port deferred).
+dioxus = { version = "0.6", features = ["desktop"] }
+# Embeds thumbnail PNGs as `data:image/png;base64,...` URIs in the DOM.
+base64 = "0.22"
+# Dioxus desktop already runs on tokio; we depend on it directly only
+# for `tokio::time::sleep` so the flash badge in EntryCard can
+# auto-clear. `time` is the only feature we need.
+tokio = { version = "1", features = ["time"] }
 
 tray-icon = "0.19"
 global-hotkey = "0.6"

@@ -1,36 +1,36 @@
-//! Settings window — eframe form that edits `%APPDATA%\GrabIt\settings.json`
-//! and signals the tray to reload via a `.settings_refresh` marker file.
+//! Settings window — Dioxus port of the form that edits
+//! `%APPDATA%\GrabIt\settings.json` and signals the tray to reload via a
+//! `.settings_refresh` marker file.
 //!
-//! Hotkey fields use a click-to-record flow: click the field, press the
-//! desired combo, then Confirm (or Esc to cancel). The captured chord is
-//! formatted the same way `parse_chord` expects, so there's no divergence
-//! between what the UI shows and what the tray registers.
+//! Sections (matches `Settings` field order so the form is easy to scan
+//! against the struct):
+//!
+//! - **Hotkeys** — three click-to-record fields for the global capture
+//!   chords (fullscreen / annotate / GIF). The capture flow uses a
+//!   real keyboard listener via `onkeydown` on the chord button while
+//!   recording is active; Esc cancels, any other key + the live
+//!   modifier state commits a chord string in `parse_chord`'s format.
+//! - **Capture** — launch_at_startup, include_cursor, copy_to_clipboard,
+//!   output_dir (with Browse + Reset).
+//! - **Arrows** — the two arrow defaults.
+//! - **GIF** — fps / loop / max-seconds / gif_record_cursor.
+//!
+//! Save validates every chord, persists the settings, drops the
+//! `.settings_refresh` marker, and closes the window. The tray's main
+//! loop picks up the marker on its next poll and re-registers hotkeys
+//! plus refreshes the menu accelerators in place.
 
 use crate::app::paths::AppPaths;
 use crate::hotkeys::bindings::parse_chord;
 use crate::settings::Settings;
 use anyhow::Result;
-use eframe::egui;
+use dioxus::desktop::{tao::window::WindowBuilder, Config, LogicalSize};
+use dioxus::events::{Key, Modifiers};
+use dioxus::prelude::*;
+use log::warn;
 
-pub fn run_blocking(paths: AppPaths, initial: Settings) -> Result<()> {
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("GrabIt settings")
-        .with_inner_size([620.0, 520.0])
-        .with_min_inner_size([560.0, 460.0])
-        .with_resizable(true);
+const STYLES: &str = include_str!("ui.css");
 
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-
-    eframe::run_native(
-        "GrabIt settings",
-        options,
-        Box::new(move |_cc| Ok(Box::new(SettingsApp::new(initial, paths)))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
-    Ok(())
-}
-
-/// Which hotkey field is currently in "press a combo" capture mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordTarget {
     Fullscreen,
@@ -38,441 +38,647 @@ enum RecordTarget {
     Gif,
 }
 
-struct SettingsApp {
-    settings: Settings,
+#[derive(Clone)]
+struct InitialState {
     paths: AppPaths,
-    hotkey_buf: String,
-    annotate_hotkey_buf: String,
-    gif_hotkey_buf: String,
-    output_dir_buf: String,
-    default_output_dir: String,
-    status: String,
-    /// Hotkey field currently in capture mode, if any.
-    recording: Option<RecordTarget>,
-    /// Last captured chord string while in capture mode. Updates on every
-    /// new key press; Confirm commits it into the underlying buffer.
-    captured: Option<String>,
+    settings: Settings,
 }
 
-impl SettingsApp {
-    fn new(settings: Settings, paths: AppPaths) -> Self {
-        let hotkey_buf = settings.hotkey.raw.clone();
-        let annotate_hotkey_buf = settings.annotate_hotkey.raw.clone();
-        let gif_hotkey_buf = settings.gif_hotkey.raw.clone();
-        let output_dir_buf = settings.output_dir.clone().unwrap_or_default();
-        let default_output_dir = paths.output_dir.display().to_string();
-        Self {
-            settings,
+pub fn run_blocking(paths: AppPaths, initial: Settings) -> Result<()> {
+    let cfg = Config::new().with_window(
+        WindowBuilder::new()
+            .with_title("GrabIt — Settings")
+            .with_inner_size(LogicalSize::new(640.0, 620.0))
+            .with_min_inner_size(LogicalSize::new(560.0, 480.0)),
+    );
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(cfg)
+        .with_context(InitialState {
             paths,
-            hotkey_buf,
-            annotate_hotkey_buf,
-            gif_hotkey_buf,
-            output_dir_buf,
-            default_output_dir,
-            status: String::new(),
-            recording: None,
-            captured: None,
+            settings: initial,
+        })
+        .launch(settings_app);
+
+    Ok(())
+}
+
+#[component]
+fn settings_app() -> Element {
+    let initial = use_context::<InitialState>();
+
+    // Per-field signals — finer-grained reactivity than holding the
+    // whole `Settings` struct in one signal, and Save only has to
+    // assemble a fresh Settings from the current values.
+    let hotkey_buf = use_signal(|| initial.settings.hotkey.raw.clone());
+    let annotate_hotkey_buf = use_signal(|| initial.settings.annotate_hotkey.raw.clone());
+    let gif_hotkey_buf = use_signal(|| initial.settings.gif_hotkey.raw.clone());
+
+    let launch_at_startup = use_signal(|| initial.settings.launch_at_startup);
+    let include_cursor = use_signal(|| initial.settings.include_cursor);
+    let copy_to_clipboard = use_signal(|| initial.settings.copy_to_clipboard);
+    let output_dir_buf = use_signal(|| initial.settings.output_dir.clone().unwrap_or_default());
+
+    let arrow_shadow = use_signal(|| initial.settings.arrow_shadow);
+    let arrow_advanced_color = use_signal(|| initial.settings.arrow_advanced_color);
+
+    let gif_fps = use_signal(|| initial.settings.gif_fps);
+    let gif_loop_count = use_signal(|| initial.settings.gif_loop_count);
+    let gif_max_seconds = use_signal(|| initial.settings.gif_max_seconds);
+    let gif_record_cursor = use_signal(|| initial.settings.gif_record_cursor);
+
+    let recording = use_signal(|| Option::<RecordTarget>::None);
+    let captured = use_signal(|| Option::<String>::None);
+    let status = use_signal(|| String::new());
+
+    let default_output_dir = initial.paths.output_dir.display().to_string();
+
+    rsx! {
+        style { "{STYLES}" }
+        div { class: "app",
+            header { class: "toolbar",
+                h1 { "Settings" }
+                p { "Hotkeys, capture defaults, output location, GIF recording" }
+            }
+
+            main { class: "main",
+                Hotkeys {
+                    hotkey_buf: hotkey_buf,
+                    annotate_hotkey_buf: annotate_hotkey_buf,
+                    gif_hotkey_buf: gif_hotkey_buf,
+                    recording: recording,
+                    captured: captured,
+                }
+                CaptureSection {
+                    launch_at_startup: launch_at_startup,
+                    include_cursor: include_cursor,
+                    copy_to_clipboard: copy_to_clipboard,
+                    output_dir_buf: output_dir_buf,
+                    default_output_dir: default_output_dir.clone(),
+                }
+                ArrowsSection {
+                    arrow_shadow: arrow_shadow,
+                    arrow_advanced_color: arrow_advanced_color,
+                }
+                GifSection {
+                    gif_fps: gif_fps,
+                    gif_loop_count: gif_loop_count,
+                    gif_max_seconds: gif_max_seconds,
+                    gif_record_cursor: gif_record_cursor,
+                }
+            }
+
+            FooterBar {
+                hotkey_buf: hotkey_buf,
+                annotate_hotkey_buf: annotate_hotkey_buf,
+                gif_hotkey_buf: gif_hotkey_buf,
+                launch_at_startup: launch_at_startup,
+                include_cursor: include_cursor,
+                copy_to_clipboard: copy_to_clipboard,
+                output_dir_buf: output_dir_buf,
+                arrow_shadow: arrow_shadow,
+                arrow_advanced_color: arrow_advanced_color,
+                gif_fps: gif_fps,
+                gif_loop_count: gif_loop_count,
+                gif_max_seconds: gif_max_seconds,
+                gif_record_cursor: gif_record_cursor,
+                status: status,
+            }
         }
     }
+}
 
-    /// Poll egui's per-frame input events while in capture mode and pull
-    /// out the most recent non-Escape key press. Returns `true` if the
-    /// caller should treat the recording as cancelled (Esc pressed).
-    fn pump_capture(&mut self, ctx: &egui::Context) -> bool {
-        if self.recording.is_none() {
-            return false;
+#[component]
+fn Hotkeys(
+    hotkey_buf: Signal<String>,
+    annotate_hotkey_buf: Signal<String>,
+    gif_hotkey_buf: Signal<String>,
+    recording: Signal<Option<RecordTarget>>,
+    captured: Signal<Option<String>>,
+) -> Element {
+    rsx! {
+        section { class: "section",
+            h2 { "Hotkeys" }
+            p { class: "section-hint",
+                "Click a field and press the combo you want, then Confirm. Esc cancels."
+            }
+            HotkeyRow {
+                label: "Fullscreen capture".to_string(),
+                target: RecordTarget::Fullscreen,
+                buf: hotkey_buf,
+                recording: recording,
+                captured: captured,
+            }
+            HotkeyRow {
+                label: "Annotate".to_string(),
+                target: RecordTarget::Annotate,
+                buf: annotate_hotkey_buf,
+                recording: recording,
+                captured: captured,
+            }
+            HotkeyRow {
+                label: "Record GIF".to_string(),
+                target: RecordTarget::Gif,
+                buf: gif_hotkey_buf,
+                recording: recording,
+                captured: captured,
+            }
         }
-        let mut cancel = false;
-        let mut new_capture: Option<String> = None;
-        ctx.input(|i| {
-            // Read the modifier state once per frame rather than trusting
-            // each `Event::Key`'s own `modifiers` field. In some egui event
-            // orderings the per-event modifiers briefly lag the real state
-            // (e.g. the Z in Ctrl+Z can arrive before the Ctrl-down event
-            // has updated the event's own snapshot), which would capture
-            // the chord as "Z" instead of "Ctrl+Z". Using the frame-level
-            // state avoids that race entirely.
-            let live_mods = i.modifiers;
-            for ev in &i.events {
-                if let egui::Event::Key { key, pressed: true, .. } = ev {
-                    if *key == egui::Key::Escape {
-                        cancel = true;
-                        continue;
+    }
+}
+
+#[component]
+fn HotkeyRow(
+    label: String,
+    target: RecordTarget,
+    buf: Signal<String>,
+    recording: Signal<Option<RecordTarget>>,
+    captured: Signal<Option<String>>,
+) -> Element {
+    let is_recording = *recording.read() == Some(target);
+
+    let on_record_click = move |_| {
+        recording.set(Some(target));
+        captured.set(None);
+    };
+
+    // The capture handler reads the live modifier state from the event
+    // (Dioxus exposes both a Key enum and a Modifiers struct). Esc
+    // cancels; any other key + the current modifier set commits a chord
+    // string in `parse_chord`'s expected format.
+    let on_keydown = move |evt: KeyboardEvent| {
+        if *recording.read() != Some(target) {
+            return;
+        }
+        let key = evt.key();
+        if matches!(key, Key::Escape) {
+            recording.set(None);
+            captured.set(None);
+            return;
+        }
+        if let Some(chord) = format_chord(&key, &evt.modifiers()) {
+            captured.set(Some(chord));
+        }
+    };
+
+    let on_confirm = move |_| {
+        if let Some(c) = captured.read().clone() {
+            buf.set(c);
+        }
+        recording.set(None);
+        captured.set(None);
+    };
+
+    let on_cancel = move |_| {
+        recording.set(None);
+        captured.set(None);
+    };
+
+    let chord_text = buf.read().clone();
+    let captured_display = captured.read().clone();
+
+    rsx! {
+        div { class: "row",
+            div { class: "label", "{label}" }
+            div { class: "control",
+                if is_recording {
+                    div {
+                        class: if captured_display.is_some() { "chord-recording captured" } else { "chord-recording" },
+                        // tabindex + autofocus so this div actually
+                        // receives keydown events while recording.
+                        tabindex: "0",
+                        autofocus: true,
+                        onkeydown: on_keydown,
+                        span { class: "text",
+                            {if let Some(ref c) = captured_display { format!("Captured: {c}") } else { "Press combo…".to_string() }}
+                        }
+                        button {
+                            class: "primary",
+                            disabled: captured_display.is_none(),
+                            onclick: on_confirm,
+                            "Confirm"
+                        }
+                        button {
+                            class: "ghost",
+                            onclick: on_cancel,
+                            "Cancel"
+                        }
                     }
-                    if let Some(chord) = format_captured_chord(live_mods, *key) {
-                        new_capture = Some(chord);
+                } else {
+                    button {
+                        class: "chord-button",
+                        onclick: on_record_click,
+                        "{chord_text}"
                     }
                 }
             }
-        });
-        if let Some(c) = new_capture {
-            self.captured = Some(c);
         }
-        cancel
     }
 }
 
-impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Listen for key events while recording. If Esc, cancel.
-        if self.pump_capture(ctx) {
-            self.recording = None;
-            self.captured = None;
-        }
-
-        // Credit footer pinned to the bottom-right.
-        egui::TopBottomPanel::bottom("settings-footer")
-            .resizable(false)
-            .show_separator_line(false)
-            .show(ctx, |ui| {
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("GrabIt 2026 - Matthew Fay")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    },
-                );
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Settings");
-            ui.add_space(10.0);
-
-            // ── Hotkeys section ────────────────────────────────────────
-            section_header(ui, "Hotkeys");
-            ui.label(
-                egui::RichText::new(
-                    "Click a field and press the key combo you want, then Confirm.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-            ui.add_space(4.0);
-            self.hotkey_row(ui, "Fullscreen capture", RecordTarget::Fullscreen);
-            self.hotkey_row(ui, "Annotate", RecordTarget::Annotate);
-            self.hotkey_row(ui, "Record GIF", RecordTarget::Gif);
-
-            section_break(ui);
-
-            // ── Capture section ────────────────────────────────────────
-            section_header(ui, "Capture");
-            egui::Grid::new("capture-grid")
-                .num_columns(2)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Launch at startup");
-                    ui.checkbox(&mut self.settings.launch_at_startup, "");
-                    ui.end_row();
-
-                    ui.label("Include cursor in captures");
-                    ui.checkbox(&mut self.settings.include_cursor, "");
-                    ui.end_row();
-
-                    ui.label("Copy every capture to clipboard");
-                    ui.checkbox(&mut self.settings.copy_to_clipboard, "");
-                    ui.end_row();
-
-                    ui.label("Output folder");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.output_dir_buf)
-                                .hint_text(format!(
-                                    "default: {}",
-                                    self.default_output_dir
-                                ))
-                                .desired_width(260.0),
-                        );
-                        if ui.button("Browse\u{2026}").clicked() {
+#[component]
+fn CaptureSection(
+    launch_at_startup: Signal<bool>,
+    include_cursor: Signal<bool>,
+    copy_to_clipboard: Signal<bool>,
+    output_dir_buf: Signal<String>,
+    default_output_dir: String,
+) -> Element {
+    rsx! {
+        section { class: "section",
+            h2 { "Capture" }
+            ToggleRow {
+                label: "Launch at startup".to_string(),
+                value: launch_at_startup,
+            }
+            ToggleRow {
+                label: "Include cursor in captures".to_string(),
+                value: include_cursor,
+            }
+            ToggleRow {
+                label: "Copy every capture to clipboard".to_string(),
+                value: copy_to_clipboard,
+            }
+            div { class: "row",
+                div { class: "label", "Output folder" }
+                div { class: "control path-row",
+                    input {
+                        r#type: "text",
+                        value: "{output_dir_buf}",
+                        placeholder: "default: {default_output_dir}",
+                        oninput: move |evt| output_dir_buf.set(evt.value()),
+                    }
+                    button {
+                        class: "ghost",
+                        onclick: move |_| {
+                            // rfd::pick_folder is blocking; the brief
+                            // freeze is the same behavior as the old
+                            // eframe path. Picks open at the current
+                            // path if set, otherwise OS default.
                             let mut dlg = rfd::FileDialog::new();
-                            if !self.output_dir_buf.trim().is_empty() {
-                                dlg = dlg.set_directory(self.output_dir_buf.trim());
+                            let cur = output_dir_buf.read().trim().to_string();
+                            if !cur.is_empty() {
+                                dlg = dlg.set_directory(&cur);
                             }
                             if let Some(folder) = dlg.pick_folder() {
-                                self.output_dir_buf = folder.display().to_string();
+                                output_dir_buf.set(folder.display().to_string());
                             }
-                        }
-                        if ui.button("Reset").clicked() {
-                            self.output_dir_buf.clear();
-                        }
-                    });
-                    ui.end_row();
-                });
-
-            section_break(ui);
-
-            // ── Arrows section ─────────────────────────────────────────
-            section_header(ui, "Arrows");
-            egui::Grid::new("arrows-grid")
-                .num_columns(2)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Default new arrows to drop shadow");
-                    ui.checkbox(&mut self.settings.arrow_shadow, "");
-                    ui.end_row();
-
-                    ui.label("Advanced color mode (picker + hex)");
-                    ui.checkbox(&mut self.settings.arrow_advanced_color, "");
-                    ui.end_row();
-                });
-            ui.label(
-                egui::RichText::new(
-                    "Tip: hold Shift while dragging an arrow to snap its angle to 15\u{00B0}.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-
-            section_break(ui);
-
-            // ── GIF section ───────────────────────────────────────────
-            section_header(ui, "GIF");
-            egui::Grid::new("gif-grid")
-                .num_columns(2)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Frames per second");
-                    ui.add(
-                        egui::DragValue::new(&mut self.settings.gif_fps)
-                            .range(5..=60)
-                            .suffix(" fps"),
-                    );
-                    ui.end_row();
-
-                    ui.label("Loop count (0 = infinite)");
-                    let mut loop_val = self.settings.gif_loop_count as i32;
-                    ui.add(egui::DragValue::new(&mut loop_val).range(0..=10_000));
-                    self.settings.gif_loop_count = loop_val.clamp(0, u16::MAX as i32) as u16;
-                    ui.end_row();
-
-                    ui.label("Max recording length");
-                    ui.add(
-                        egui::DragValue::new(&mut self.settings.gif_max_seconds)
-                            .range(1..=600)
-                            .suffix(" s"),
-                    );
-                    ui.end_row();
-
-                    ui.label("Include cursor in GIF frames");
-                    ui.checkbox(&mut self.settings.gif_record_cursor, "");
-                    ui.end_row();
-                });
-
-            ui.add_space(14.0);
-
-            if !self.status.is_empty() {
-                ui.label(
-                    egui::RichText::new(&self.status)
-                        .color(egui::Color32::from_rgb(220, 80, 80)),
-                );
-                ui.add_space(4.0);
+                        },
+                        "Browse…"
+                    }
+                    button {
+                        class: "ghost",
+                        onclick: move |_| output_dir_buf.set(String::new()),
+                        "Reset"
+                    }
+                }
             }
-
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    if let Err(e) = parse_chord(&self.hotkey_buf) {
-                        self.status = format!("Fullscreen hotkey invalid: {e}");
-                        return;
-                    }
-                    if let Err(e) = parse_chord(&self.annotate_hotkey_buf) {
-                        self.status = format!("Annotate hotkey invalid: {e}");
-                        return;
-                    }
-                    if let Err(e) = parse_chord(&self.gif_hotkey_buf) {
-                        self.status = format!("GIF hotkey invalid: {e}");
-                        return;
-                    }
-                    self.settings.hotkey.raw = self.hotkey_buf.clone();
-                    self.settings.annotate_hotkey.raw = self.annotate_hotkey_buf.clone();
-                    self.settings.gif_hotkey.raw = self.gif_hotkey_buf.clone();
-                    // Clamp FPS in case the field was edited in JSON to an
-                    // out-of-range value before this save.
-                    self.settings.gif_fps = self.settings.gif_fps.clamp(5, 60);
-
-                    let trimmed = self.output_dir_buf.trim();
-                    if trimmed.is_empty() {
-                        self.settings.output_dir = None;
-                    } else {
-                        let candidate = std::path::PathBuf::from(trimmed);
-                        if let Err(e) = std::fs::create_dir_all(&candidate) {
-                            self.status = format!("Output folder unusable: {e}");
-                            return;
-                        }
-                        self.settings.output_dir = Some(trimmed.to_string());
-                    }
-
-                    if let Err(e) = self.settings.save(&self.paths) {
-                        self.status = format!("Save failed: {e}");
-                        return;
-                    }
-                    let marker = self.paths.data_dir.join(".settings_refresh");
-                    let _ = std::fs::write(&marker, "");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.button("Cancel").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                // Put Reset at the right so it's not in the primary
-                // save/cancel flow — avoids accidental clicks.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.button("Reset to defaults").clicked() {
-                            self.reset_to_defaults();
-                        }
-                    },
-                );
-            });
-        });
-
-        // While recording, force continuous repaint so newly pressed keys
-        // show up in the capture label without user-driven repaints.
-        if self.recording.is_some() {
-            ctx.request_repaint();
         }
     }
 }
 
-impl SettingsApp {
-    /// Wipe the in-memory form back to factory defaults. Doesn't touch
-    /// disk — user still needs to click Save to persist. Cancel reverts.
-    fn reset_to_defaults(&mut self) {
-        let fresh = Settings::default();
-        self.hotkey_buf = fresh.hotkey.raw.clone();
-        self.annotate_hotkey_buf = fresh.annotate_hotkey.raw.clone();
-        self.gif_hotkey_buf = fresh.gif_hotkey.raw.clone();
-        self.output_dir_buf.clear(); // empty string → use default output dir
-        self.settings = fresh;
-        self.recording = None;
-        self.captured = None;
-        self.status = "Reset — click Save to apply, Cancel to discard.".into();
+#[component]
+fn ArrowsSection(arrow_shadow: Signal<bool>, arrow_advanced_color: Signal<bool>) -> Element {
+    rsx! {
+        section { class: "section",
+            h2 { "Arrows" }
+            ToggleRow {
+                label: "Default new arrows to drop shadow".to_string(),
+                value: arrow_shadow,
+            }
+            ToggleRow {
+                label: "Advanced color mode (picker + hex)".to_string(),
+                value: arrow_advanced_color,
+            }
+            p { class: "section-hint",
+                "Tip: hold Shift while dragging an arrow to snap its angle to 15°."
+            }
+        }
     }
+}
 
-    /// A single hotkey row. When not recording, shows the current chord as
-    /// a clickable button (click = enter record mode). When recording,
-    /// shows a live "Press combo\u{2026}" / "Captured: …" label plus
-    /// Confirm / Cancel buttons. Esc at any point cancels.
-    fn hotkey_row(&mut self, ui: &mut egui::Ui, label: &str, target: RecordTarget) {
-        let is_recording = self.recording == Some(target);
-        ui.horizontal(|ui| {
-            ui.add_sized([200.0, 24.0], egui::Label::new(label));
-            if is_recording {
-                let display = match &self.captured {
-                    Some(c) => format!("Captured: {c}"),
-                    None => "Press combo\u{2026}".to_string(),
-                };
-                let color = if self.captured.is_some() {
-                    egui::Color32::from_rgb(90, 200, 120)
-                } else {
-                    egui::Color32::from_rgb(220, 180, 60)
-                };
-                ui.add_sized(
-                    [220.0, 24.0],
-                    egui::Label::new(egui::RichText::new(display).color(color)),
-                );
-                let confirm_enabled = self.captured.is_some();
-                if ui
-                    .add_enabled(
-                        confirm_enabled,
-                        egui::Button::new("Confirm"),
-                    )
-                    .clicked()
-                {
-                    if let Some(c) = self.captured.take() {
-                        match target {
-                            RecordTarget::Fullscreen => self.hotkey_buf = c,
-                            RecordTarget::Annotate => self.annotate_hotkey_buf = c,
-                            RecordTarget::Gif => self.gif_hotkey_buf = c,
-                        }
+#[component]
+fn GifSection(
+    gif_fps: Signal<u32>,
+    gif_loop_count: Signal<u16>,
+    gif_max_seconds: Signal<u32>,
+    gif_record_cursor: Signal<bool>,
+) -> Element {
+    rsx! {
+        section { class: "section",
+            h2 { "GIF" }
+            NumberRow {
+                label: "Frames per second".to_string(),
+                suffix: "fps".to_string(),
+                value: gif_fps,
+                min: 5,
+                max: 60,
+            }
+            U16NumberRow {
+                label: "Loop count (0 = infinite)".to_string(),
+                suffix: String::new(),
+                value: gif_loop_count,
+                min: 0,
+                max: 10_000,
+            }
+            NumberRow {
+                label: "Max recording length".to_string(),
+                suffix: "s".to_string(),
+                value: gif_max_seconds,
+                min: 1,
+                max: 600,
+            }
+            ToggleRow {
+                label: "Include cursor in GIF frames".to_string(),
+                value: gif_record_cursor,
+            }
+        }
+    }
+}
+
+/// Standard label + boolean toggle row.
+#[component]
+fn ToggleRow(label: String, value: Signal<bool>) -> Element {
+    let checked = *value.read();
+    rsx! {
+        div { class: "row",
+            div { class: "label", "{label}" }
+            div { class: "control",
+                label { class: "toggle",
+                    input {
+                        r#type: "checkbox",
+                        checked: "{checked}",
+                        onchange: move |evt| value.set(evt.checked()),
                     }
-                    self.recording = None;
-                }
-                if ui.button("Cancel").clicked() {
-                    self.recording = None;
-                    self.captured = None;
-                }
-            } else {
-                let current = match target {
-                    RecordTarget::Fullscreen => self.hotkey_buf.clone(),
-                    RecordTarget::Annotate => self.annotate_hotkey_buf.clone(),
-                    RecordTarget::Gif => self.gif_hotkey_buf.clone(),
-                };
-                if ui
-                    .add_sized(
-                        [220.0, 24.0],
-                        egui::Button::new(egui::RichText::new(current).monospace()),
-                    )
-                    .clicked()
-                {
-                    self.recording = Some(target);
-                    self.captured = None;
-                    // Drop any keyboard focus so the next keystroke lands
-                    // in our capture loop rather than a text edit.
-                    ui.ctx().memory_mut(|m| m.stop_text_input());
+                    span { class: "toggle-thumb" }
                 }
             }
-        });
+        }
     }
 }
 
-fn section_header(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).strong().size(15.0));
-    ui.add_space(4.0);
+/// Bounded `u32` number input.
+#[component]
+fn NumberRow(
+    label: String,
+    suffix: String,
+    value: Signal<u32>,
+    min: u32,
+    max: u32,
+) -> Element {
+    let v = *value.read();
+    rsx! {
+        div { class: "row",
+            div { class: "label", "{label}" }
+            div { class: "control",
+                input {
+                    class: "number",
+                    r#type: "number",
+                    min: "{min}",
+                    max: "{max}",
+                    value: "{v}",
+                    oninput: move |evt| {
+                        if let Ok(parsed) = evt.value().parse::<u32>() {
+                            value.set(parsed.clamp(min, max));
+                        }
+                    },
+                }
+                if !suffix.is_empty() {
+                    span { class: "number-suffix", "{suffix}" }
+                }
+            }
+        }
+    }
 }
 
-fn section_break(ui: &mut egui::Ui) {
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
+/// Bounded `u16` number input — separate component because the signal
+/// type matters for `oninput`'s parse.
+#[component]
+fn U16NumberRow(
+    label: String,
+    suffix: String,
+    value: Signal<u16>,
+    min: u16,
+    max: u16,
+) -> Element {
+    let v = *value.read();
+    rsx! {
+        div { class: "row",
+            div { class: "label", "{label}" }
+            div { class: "control",
+                input {
+                    class: "number",
+                    r#type: "number",
+                    min: "{min}",
+                    max: "{max}",
+                    value: "{v}",
+                    oninput: move |evt| {
+                        if let Ok(parsed) = evt.value().parse::<u16>() {
+                            value.set(parsed.clamp(min, max));
+                        }
+                    },
+                }
+                if !suffix.is_empty() {
+                    span { class: "number-suffix", "{suffix}" }
+                }
+            }
+        }
+    }
 }
 
-/// Translate an egui key press (with modifiers) into the chord-string
-/// format that `parse_chord` expects (e.g. `"Ctrl+Shift+X"`). Returns
-/// `None` for keys we don't bind (modifiers-only presses, media keys, etc.).
-fn format_captured_chord(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
-    let token = egui_key_token(key)?;
+#[component]
+#[allow(clippy::too_many_arguments)]
+fn FooterBar(
+    hotkey_buf: Signal<String>,
+    annotate_hotkey_buf: Signal<String>,
+    gif_hotkey_buf: Signal<String>,
+    launch_at_startup: Signal<bool>,
+    include_cursor: Signal<bool>,
+    copy_to_clipboard: Signal<bool>,
+    output_dir_buf: Signal<String>,
+    arrow_shadow: Signal<bool>,
+    arrow_advanced_color: Signal<bool>,
+    gif_fps: Signal<u32>,
+    gif_loop_count: Signal<u16>,
+    gif_max_seconds: Signal<u32>,
+    gif_record_cursor: Signal<bool>,
+    status: Signal<String>,
+) -> Element {
+    let status_text = status.read().clone();
+    let is_error = !status_text.is_empty() && !status_text.starts_with("Reset");
+
+    // Pull paths from context rather than a prop — `AppPaths` doesn't
+    // implement `PartialEq`, which Dioxus requires for prop memo
+    // comparison. Context bypasses that check entirely.
+    let paths_for_save = use_context::<InitialState>().paths;
+    let on_save = move |_| {
+        // Validate every chord first.
+        if let Err(e) = parse_chord(hotkey_buf.read().as_str()) {
+            status.set(format!("Fullscreen hotkey invalid: {e}"));
+            return;
+        }
+        if let Err(e) = parse_chord(annotate_hotkey_buf.read().as_str()) {
+            status.set(format!("Annotate hotkey invalid: {e}"));
+            return;
+        }
+        if let Err(e) = parse_chord(gif_hotkey_buf.read().as_str()) {
+            status.set(format!("GIF hotkey invalid: {e}"));
+            return;
+        }
+
+        // Resolve output_dir; create the directory before persisting so
+        // a typo can't leave the user with an unusable override.
+        let trimmed = output_dir_buf.read().trim().to_string();
+        let output_dir = if trimmed.is_empty() {
+            None
+        } else {
+            if let Err(e) = std::fs::create_dir_all(&trimmed) {
+                status.set(format!("Output folder unusable: {e}"));
+                return;
+            }
+            Some(trimmed)
+        };
+
+        let mut s = Settings::default();
+        s.hotkey.raw = hotkey_buf.read().clone();
+        s.annotate_hotkey.raw = annotate_hotkey_buf.read().clone();
+        s.gif_hotkey.raw = gif_hotkey_buf.read().clone();
+        s.launch_at_startup = *launch_at_startup.read();
+        s.include_cursor = *include_cursor.read();
+        s.copy_to_clipboard = *copy_to_clipboard.read();
+        s.output_dir = output_dir;
+        s.arrow_shadow = *arrow_shadow.read();
+        s.arrow_advanced_color = *arrow_advanced_color.read();
+        s.gif_fps = (*gif_fps.read()).clamp(5, 60);
+        s.gif_loop_count = *gif_loop_count.read();
+        s.gif_max_seconds = (*gif_max_seconds.read()).max(1);
+        s.gif_record_cursor = *gif_record_cursor.read();
+
+        if let Err(e) = s.save(&paths_for_save) {
+            status.set(format!("Save failed: {e}"));
+            return;
+        }
+        // Drop the marker; the tray picks this up on its next poll and
+        // re-registers hotkeys + refreshes the menu accelerators.
+        let marker = paths_for_save.data_dir.join(".settings_refresh");
+        if let Err(e) = std::fs::write(&marker, b"") {
+            warn!("settings: write refresh marker failed: {e}");
+        }
+        // Close via the desktop window helper.
+        let window = dioxus::desktop::window();
+        window.close();
+    };
+
+    let on_cancel = move |_| {
+        let window = dioxus::desktop::window();
+        window.close();
+    };
+
+    let on_reset = move |_| {
+        let fresh = Settings::default();
+        hotkey_buf.set(fresh.hotkey.raw.clone());
+        annotate_hotkey_buf.set(fresh.annotate_hotkey.raw.clone());
+        gif_hotkey_buf.set(fresh.gif_hotkey.raw.clone());
+        launch_at_startup.set(fresh.launch_at_startup);
+        include_cursor.set(fresh.include_cursor);
+        copy_to_clipboard.set(fresh.copy_to_clipboard);
+        output_dir_buf.set(String::new());
+        arrow_shadow.set(fresh.arrow_shadow);
+        arrow_advanced_color.set(fresh.arrow_advanced_color);
+        gif_fps.set(fresh.gif_fps);
+        gif_loop_count.set(fresh.gif_loop_count);
+        gif_max_seconds.set(fresh.gif_max_seconds);
+        gif_record_cursor.set(fresh.gif_record_cursor);
+        status.set("Reset — click Save to apply, Cancel to discard.".to_string());
+    };
+
+    rsx! {
+        footer { class: "footer",
+            div {
+                class: if is_error { "status" } else { "status ok" },
+                "{status_text}"
+            }
+            div { class: "actions",
+                button { class: "danger", onclick: on_reset, "Reset to defaults" }
+                button { class: "ghost", onclick: on_cancel, "Cancel" }
+                button { class: "primary", onclick: on_save, "Save" }
+            }
+        }
+    }
+}
+
+/// Translate a Dioxus `Key` + the live modifier state into a chord
+/// string in the format `parse_chord` expects (e.g. "Ctrl+Shift+X").
+/// Returns `None` for keys we don't bind (modifiers-only presses,
+/// media keys, etc.).
+fn format_chord(key: &Key, mods: &Modifiers) -> Option<String> {
+    let token = key_token(key)?;
     let mut out = String::new();
-    if mods.ctrl { out.push_str("Ctrl+"); }
-    if mods.shift { out.push_str("Shift+"); }
-    if mods.alt { out.push_str("Alt+"); }
-    out.push_str(token);
+    if mods.ctrl() {
+        out.push_str("Ctrl+");
+    }
+    if mods.shift() {
+        out.push_str("Shift+");
+    }
+    if mods.alt() {
+        out.push_str("Alt+");
+    }
+    if mods.meta() {
+        out.push_str("Win+");
+    }
+    out.push_str(token.as_str());
     Some(out)
 }
 
-fn egui_key_token(k: egui::Key) -> Option<&'static str> {
-    use egui::Key;
+/// Map a Dioxus `Key` to the canonical chord-token string our parser
+/// understands. Returns `None` for modifier-only presses and media
+/// keys.
+fn key_token(k: &Key) -> Option<String> {
     Some(match k {
-        Key::A => "A", Key::B => "B", Key::C => "C", Key::D => "D",
-        Key::E => "E", Key::F => "F", Key::G => "G", Key::H => "H",
-        Key::I => "I", Key::J => "J", Key::K => "K", Key::L => "L",
-        Key::M => "M", Key::N => "N", Key::O => "O", Key::P => "P",
-        Key::Q => "Q", Key::R => "R", Key::S => "S", Key::T => "T",
-        Key::U => "U", Key::V => "V", Key::W => "W", Key::X => "X",
-        Key::Y => "Y", Key::Z => "Z",
-        Key::Num0 => "0", Key::Num1 => "1", Key::Num2 => "2",
-        Key::Num3 => "3", Key::Num4 => "4", Key::Num5 => "5",
-        Key::Num6 => "6", Key::Num7 => "7", Key::Num8 => "8",
-        Key::Num9 => "9",
-        Key::F1 => "F1", Key::F2 => "F2", Key::F3 => "F3", Key::F4 => "F4",
-        Key::F5 => "F5", Key::F6 => "F6", Key::F7 => "F7", Key::F8 => "F8",
-        Key::F9 => "F9", Key::F10 => "F10", Key::F11 => "F11", Key::F12 => "F12",
-        Key::Space => "Space",
-        Key::Enter => "Enter",
-        Key::Tab => "Tab",
-        Key::Backspace => "Backspace",
-        Key::Delete => "Delete",
-        Key::Insert => "Insert",
-        Key::Home => "Home",
-        Key::End => "End",
-        Key::PageUp => "PageUp",
-        Key::PageDown => "PageDown",
-        Key::ArrowUp => "Up",
-        Key::ArrowDown => "Down",
-        Key::ArrowLeft => "Left",
-        Key::ArrowRight => "Right",
+        Key::Character(s) => {
+            let trimmed = s.trim();
+            if trimmed.len() == 1 {
+                let c = trimmed.chars().next().unwrap();
+                if c.is_ascii_alphabetic() {
+                    c.to_ascii_uppercase().to_string()
+                } else if c.is_ascii_digit() {
+                    c.to_string()
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        Key::F1 => "F1".into(),
+        Key::F2 => "F2".into(),
+        Key::F3 => "F3".into(),
+        Key::F4 => "F4".into(),
+        Key::F5 => "F5".into(),
+        Key::F6 => "F6".into(),
+        Key::F7 => "F7".into(),
+        Key::F8 => "F8".into(),
+        Key::F9 => "F9".into(),
+        Key::F10 => "F10".into(),
+        Key::F11 => "F11".into(),
+        Key::F12 => "F12".into(),
+        Key::Enter => "Enter".into(),
+        Key::Tab => "Tab".into(),
+        Key::Backspace => "Backspace".into(),
+        Key::Delete => "Delete".into(),
+        Key::Insert => "Insert".into(),
+        Key::Home => "Home".into(),
+        Key::End => "End".into(),
+        Key::PageUp => "PageUp".into(),
+        Key::PageDown => "PageDown".into(),
+        Key::ArrowUp => "Up".into(),
+        Key::ArrowDown => "Down".into(),
+        Key::ArrowLeft => "Left".into(),
+        Key::ArrowRight => "Right".into(),
+        Key::PrintScreen => "PrintScreen".into(),
+        // Space character arrives as Key::Character(" "); the
+        // arm above returns None for it. Match here as a fallback
+        // for the named variant some platforms emit instead.
         _ => return None,
     })
 }
