@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "grabit"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "ab_glyph",
  "anyhow",

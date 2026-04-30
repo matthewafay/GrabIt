@@ -1,6 +1,6 @@
 [package]
 name = "grabit"
-version = "1.6.8"
+version = "1.6.9"
 edition = "2021"
 rust-version = "1.78"
 description = "Lightweight Windows screenshot and annotation tool"
@@ -12,11 +12,17 @@ name = "grabit"
 path = "src/main.rs"
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
-strip = "symbols"
-panic = "abort"
-opt-level = "z"
+# Relaxed from `lto = "fat"` + `strip = "symbols"` + `panic = "abort"`
+# + `opt-level = "z"`. That combination reads as "packed / obfuscated
+# binary" to AV / SafeBrowsing heuristic scanners — symbol-stripped,
+# size-aggressive LTO output looks much more like packer output than
+# a typical Rust release. Trade ~3-4 MB binary size for output that
+# looks like a normal compiler artifact. Code signing is the only
+# real fix; this is a heuristic-score reduction attempt.
+lto = "thin"
+codegen-units = 16
+opt-level = 3
+panic = "unwind"
 incremental = false
 
 [profile.dev]
