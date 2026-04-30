@@ -2955,10 +2955,18 @@ fn SelectionSection(
         AnnotationNode::Callout { text, .. } => Some(text.clone()),
         _ => None,
     };
+    let node_for_props = node.clone();
 
     rsx! {
         section {
             h2 { "Selection: {kind_label}" }
+            SelectionProperties {
+                id: id,
+                node: node_for_props,
+                document: document,
+                history: history,
+                dirty: dirty,
+            }
             if let Some(initial) = text_initial {
                 div { class: "field",
                     label { "Text" }
@@ -3022,6 +3030,509 @@ fn SelectionSection(
                 "Delete (Del)"
             }
         }
+    }
+}
+
+// ─── Properties of the currently-selected annotation ────────────────
+
+/// Edit color / thickness / style fields of the selected annotation.
+/// Each change builds an UpdateAnnotation command so undo/redo stays
+/// consistent. The component re-renders whenever the document changes
+/// because `node` is captured by value from a freshly-cloned snapshot
+/// in the parent.
+#[component]
+fn SelectionProperties(
+    id: Uuid,
+    node: AnnotationNode,
+    document: Signal<Document>,
+    history: Signal<History>,
+    dirty: Signal<bool>,
+) -> Element {
+    // Helper: produce an UpdateAnnotation command given a mutator.
+    // The mutator takes a clone of the current node and returns the
+    // mutated version; we capture the unchanged version as `before`
+    // so revert restores the original.
+    let push_update = move |mutate: Box<dyn FnOnce(&mut AnnotationNode)>| {
+        let before_opt = document
+            .read()
+            .annotations
+            .iter()
+            .find(|n| n.id() == id)
+            .cloned();
+        if let Some(before) = before_opt {
+            let mut after = before.clone();
+            mutate(&mut after);
+            execute_command(
+                document,
+                history,
+                dirty,
+                Box::new(UpdateAnnotation::new(before, after)),
+            );
+        }
+    };
+
+    match node {
+        AnnotationNode::Arrow {
+            color,
+            thickness,
+            shadow,
+            line_style,
+            head_style,
+            ..
+        } => rsx! {
+            ColorRow {
+                label: "Color".to_string(),
+                value: color,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Arrow { color, .. } = n { *color = c; }
+                    }));
+                }),
+            }
+            NumberFieldF32 {
+                label: "Thickness".to_string(),
+                value: thickness,
+                min: 1.0,
+                max: 32.0,
+                step: 0.5,
+                on_change: EventHandler::new(move |v: f32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Arrow { thickness, .. } = n { *thickness = v; }
+                    }));
+                }),
+            }
+            ToggleFieldRow {
+                label: "Drop shadow".to_string(),
+                value: shadow,
+                on_change: EventHandler::new(move |b: bool| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Arrow { shadow, .. } = n { *shadow = b; }
+                    }));
+                }),
+            }
+            EnumRow {
+                label: "Line".to_string(),
+                value: arrow_line_label(line_style).to_string(),
+                options: vec!["Solid".into(), "Dashed".into(), "Dotted".into()],
+                on_change: EventHandler::new(move |s: String| {
+                    let new_style = match s.as_str() {
+                        "Dashed" => ArrowLineStyle::Dashed,
+                        "Dotted" => ArrowLineStyle::Dotted,
+                        _ => ArrowLineStyle::Solid,
+                    };
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Arrow { line_style, .. } = n {
+                            *line_style = new_style;
+                        }
+                    }));
+                }),
+            }
+            EnumRow {
+                label: "Head".to_string(),
+                value: head_label(head_style).to_string(),
+                options: vec![
+                    "Filled".into(), "Outline".into(), "Line".into(),
+                    "None".into(), "Double".into(),
+                ],
+                on_change: EventHandler::new(move |s: String| {
+                    let new_head = head_from_label(&s).unwrap_or(ArrowHeadStyle::FilledTriangle);
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Arrow { head_style, .. } = n {
+                            *head_style = new_head;
+                        }
+                    }));
+                }),
+            }
+        },
+        AnnotationNode::Text { color, size_px, frosted, shadow, align, list, .. } => rsx! {
+            ColorRow {
+                label: "Color".to_string(),
+                value: color,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Text { color, .. } = n { *color = c; }
+                    }));
+                }),
+            }
+            NumberFieldF32 {
+                label: "Size".to_string(),
+                value: size_px,
+                min: 8.0,
+                max: 200.0,
+                step: 1.0,
+                on_change: EventHandler::new(move |v: f32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Text { size_px, .. } = n { *size_px = v; }
+                    }));
+                }),
+            }
+            ToggleFieldRow {
+                label: "Frosted".to_string(),
+                value: frosted,
+                on_change: EventHandler::new(move |b: bool| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Text { frosted, .. } = n { *frosted = b; }
+                    }));
+                }),
+            }
+            ToggleFieldRow {
+                label: "Drop shadow".to_string(),
+                value: shadow,
+                on_change: EventHandler::new(move |b: bool| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Text { shadow, .. } = n { *shadow = b; }
+                    }));
+                }),
+            }
+            EnumRow {
+                label: "Align".to_string(),
+                value: text_align_label(align).to_string(),
+                options: vec!["Left".into(), "Center".into(), "Right".into()],
+                on_change: EventHandler::new(move |s: String| {
+                    let new = match s.as_str() {
+                        "Center" => TextAlign::Center,
+                        "Right" => TextAlign::Right,
+                        _ => TextAlign::Left,
+                    };
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Text { align, .. } = n { *align = new; }
+                    }));
+                }),
+            }
+            EnumRow {
+                label: "List".to_string(),
+                value: list_label(list).to_string(),
+                options: vec!["None".into(), "Bullet".into(), "Numbered".into()],
+                on_change: EventHandler::new(move |s: String| {
+                    let new = match s.as_str() {
+                        "Bullet" => TextListStyle::Bullet,
+                        "Numbered" => TextListStyle::Numbered,
+                        _ => TextListStyle::None,
+                    };
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Text { list, .. } = n { *list = new; }
+                    }));
+                }),
+            }
+        },
+        AnnotationNode::Shape { stroke, stroke_width, fill, .. } => rsx! {
+            ColorRow {
+                label: "Stroke".to_string(),
+                value: stroke,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Shape { stroke, .. } = n { *stroke = c; }
+                    }));
+                }),
+            }
+            NumberFieldF32 {
+                label: "Stroke width".to_string(),
+                value: stroke_width,
+                min: 0.5,
+                max: 32.0,
+                step: 0.5,
+                on_change: EventHandler::new(move |v: f32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Shape { stroke_width, .. } = n {
+                            *stroke_width = v;
+                        }
+                    }));
+                }),
+            }
+            ColorRow {
+                label: "Fill".to_string(),
+                value: fill,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Shape { fill, .. } = n {
+                            // Preserve the existing alpha — Filled
+                            // toggle drives that separately.
+                            let mut nv = c;
+                            nv[3] = fill[3];
+                            *fill = nv;
+                        }
+                    }));
+                }),
+            }
+            ToggleFieldRow {
+                label: "Filled".to_string(),
+                value: fill[3] != 0,
+                on_change: EventHandler::new(move |b: bool| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Shape { fill, .. } = n {
+                            fill[3] = if b { 220 } else { 0 };
+                        }
+                    }));
+                }),
+            }
+        },
+        AnnotationNode::Step { fill, text_color, radius, number, .. } => rsx! {
+            ColorRow {
+                label: "Fill".to_string(),
+                value: fill,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Step { fill, .. } = n { *fill = c; }
+                    }));
+                }),
+            }
+            ColorRow {
+                label: "Text".to_string(),
+                value: text_color,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Step { text_color, .. } = n { *text_color = c; }
+                    }));
+                }),
+            }
+            NumberFieldF32 {
+                label: "Radius".to_string(),
+                value: radius,
+                min: 6.0,
+                max: 80.0,
+                step: 1.0,
+                on_change: EventHandler::new(move |v: f32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Step { radius, .. } = n { *radius = v; }
+                    }));
+                }),
+            }
+            NumberFieldU32 {
+                label: "Number".to_string(),
+                value: number,
+                min: 1,
+                max: 999,
+                on_change: EventHandler::new(move |v: u32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Step { number, .. } = n { *number = v; }
+                    }));
+                }),
+            }
+        },
+        AnnotationNode::Blur { radius_px, .. } => rsx! {
+            NumberFieldF32 {
+                label: "Radius (sigma)".to_string(),
+                value: radius_px,
+                min: 1.0,
+                max: 60.0,
+                step: 1.0,
+                on_change: EventHandler::new(move |v: f32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Blur { radius_px, .. } = n { *radius_px = v; }
+                    }));
+                }),
+            }
+        },
+        AnnotationNode::Magnify { border, border_width, circular, .. } => rsx! {
+            ToggleFieldRow {
+                label: "Circular".to_string(),
+                value: circular,
+                on_change: EventHandler::new(move |b: bool| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Magnify { circular, .. } = n { *circular = b; }
+                    }));
+                }),
+            }
+            ColorRow {
+                label: "Border".to_string(),
+                value: border,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Magnify { border, .. } = n { *border = c; }
+                    }));
+                }),
+            }
+            NumberFieldF32 {
+                label: "Border width".to_string(),
+                value: border_width,
+                min: 0.0,
+                max: 20.0,
+                step: 0.5,
+                on_change: EventHandler::new(move |v: f32| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Magnify { border_width, .. } = n {
+                            *border_width = v;
+                        }
+                    }));
+                }),
+            }
+        },
+        AnnotationNode::Callout { fill, stroke, text_color, .. } => rsx! {
+            ColorRow {
+                label: "Fill".to_string(),
+                value: fill,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Callout { fill, .. } = n { *fill = c; }
+                    }));
+                }),
+            }
+            ColorRow {
+                label: "Stroke".to_string(),
+                value: stroke,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Callout { stroke, .. } = n { *stroke = c; }
+                    }));
+                }),
+            }
+            ColorRow {
+                label: "Text".to_string(),
+                value: text_color,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    push_update(Box::new(move |n| {
+                        if let AnnotationNode::Callout { text_color, .. } = n { *text_color = c; }
+                    }));
+                }),
+            }
+        },
+        _ => rsx! {},
+    }
+}
+
+#[component]
+fn ColorRow(label: String, value: [u8; 4], on_change: EventHandler<[u8; 4]>) -> Element {
+    let hex = color_to_hex(value);
+    let alpha = value[3];
+    rsx! {
+        div { class: "field",
+            label { "{label}" }
+            div { class: "row-pair",
+                input {
+                    r#type: "color",
+                    value: "{hex}",
+                    oninput: move |evt| {
+                        if let Some(c) = hex_to_color(&evt.value(), alpha) {
+                            on_change.call(c);
+                        }
+                    },
+                }
+                input {
+                    r#type: "text",
+                    value: "{hex}",
+                    oninput: move |evt| {
+                        if let Some(c) = hex_to_color(&evt.value(), alpha) {
+                            on_change.call(c);
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn NumberFieldF32(
+    label: String,
+    value: f32,
+    min: f32,
+    max: f32,
+    step: f32,
+    on_change: EventHandler<f32>,
+) -> Element {
+    rsx! {
+        div { class: "field",
+            label { "{label}" }
+            input {
+                r#type: "number",
+                min: "{min}",
+                max: "{max}",
+                step: "{step}",
+                value: "{value}",
+                oninput: move |evt| {
+                    if let Ok(v) = evt.value().parse::<f32>() {
+                        on_change.call(v.clamp(min, max));
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn NumberFieldU32(
+    label: String,
+    value: u32,
+    min: u32,
+    max: u32,
+    on_change: EventHandler<u32>,
+) -> Element {
+    rsx! {
+        div { class: "field",
+            label { "{label}" }
+            input {
+                r#type: "number",
+                min: "{min}",
+                max: "{max}",
+                value: "{value}",
+                oninput: move |evt| {
+                    if let Ok(v) = evt.value().parse::<u32>() {
+                        on_change.call(v.clamp(min, max));
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn ToggleFieldRow(label: String, value: bool, on_change: EventHandler<bool>) -> Element {
+    rsx! {
+        label { class: "toggle",
+            input {
+                r#type: "checkbox",
+                checked: "{value}",
+                onchange: move |evt| on_change.call(evt.checked()),
+            }
+            "{label}"
+        }
+    }
+}
+
+#[component]
+fn EnumRow(
+    label: String,
+    value: String,
+    options: Vec<String>,
+    on_change: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div { class: "field",
+            label { "{label}" }
+            select {
+                value: "{value}",
+                onchange: move |evt| on_change.call(evt.value()),
+                for opt in options.iter() {
+                    option {
+                        key: "{opt}",
+                        value: "{opt}",
+                        "{opt}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn arrow_line_label(s: ArrowLineStyle) -> &'static str {
+    match s {
+        ArrowLineStyle::Solid => "Solid",
+        ArrowLineStyle::Dashed => "Dashed",
+        ArrowLineStyle::Dotted => "Dotted",
+    }
+}
+fn text_align_label(a: TextAlign) -> &'static str {
+    match a {
+        TextAlign::Left => "Left",
+        TextAlign::Center => "Center",
+        TextAlign::Right => "Right",
+    }
+}
+fn list_label(l: TextListStyle) -> &'static str {
+    match l {
+        TextListStyle::None => "None",
+        TextListStyle::Bullet => "Bullet",
+        TextListStyle::Numbered => "Numbered",
     }
 }
 

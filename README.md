@@ -8,6 +8,57 @@ the system tray, launches with Windows.
 If GrabIt is useful to you, you can support development here:
 [☕ Buy me a coffee](https://buymeacoffee.com/matthewafay).
 
+## What's new in 1.6
+
+### Full UI port to Dioxus desktop
+- **Every window is now Dioxus.** History (1.5), Settings, GIF frame
+  editor, and the annotation editor all render through Wry +
+  WebView2 with HTML/CSS instead of eframe/egui. Same Rust core
+  underneath — capture, recorder, encoder, document model,
+  rasterize, undo/redo command pattern — only the view layer
+  changed.
+- **eframe / egui / winit dropped from deps.** The release binary
+  is actually a touch smaller (~5.5 MB) than the eframe-only build
+  (~5.7 MB) despite gaining the entire Dioxus desktop stack.
+- **Consistent visual language across the app.** Dark theme, same
+  button styles, same hover/active treatments, same color palette
+  shared between tools.
+
+### Annotation editor
+- All 9 annotation types (Arrow, Text, Shape, Step, Magnify, Blur,
+  Callout, Stamp, CaptureInfo) render as SVG primitives layered
+  over the screenshot's `<image>` element.
+- All 10 tools work: drag-to-create for shapes / arrows / text /
+  blur / magnify / callout; single-click for step + capture-info.
+- Selection chrome with 8 resize handles for shapes; 2 endpoint
+  handles for arrows; radius handle for step. Drag-to-move,
+  drag-to-resize, all routed through `UpdateAnnotation` commands so
+  undo/redo (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z) is intact.
+- Inspector grew a per-selection properties panel: edit color,
+  thickness, line/head style, alignment, list, fill, etc. of the
+  selected annotation in place.
+- Tool-style palette is fully wired: 8-color swatches, hex picker,
+  every tool's defaults bind back into the inspector.
+- Document effects panel: torn edge (per-edge toggles + depth +
+  teeth), border (width + matte + colour + shadow). Backed by the
+  existing `SetEdgeEffect` / `SetBorder` commands.
+- Save (Ctrl+S) runs `rasterize::flatten` →
+  `apply_document_effects` → PNG + .grabit. Optional copy-on-save.
+- Save-on-close confirmation modal when there are unsaved edits.
+
+### Known regressions vs the eframe editor
+A few features didn't make this round of the port — they round-trip
+through `.grabit` correctly (so existing files are safe) but can't
+be created/edited in the new editor yet:
+- Curved arrows (control-point mid-handle) — straight arrows only
+  for now; loaded curves render correctly.
+- Quick styles (per-tool named presets).
+- Cursor layer editing (move / resize / remove the captured cursor).
+- Aspect-locked Resize and 90° Rotate buttons in Document effects.
+- Stamps (existing stamps render as a dashed placeholder).
+
+These are tracked for 1.7.
+
 ## What's new in 1.5
 
 ### Capture history
@@ -412,12 +463,13 @@ src/
     gif_record.rs      GIF recorder: region pick + Win32 floating bar
                        + WM_TIMER frame loop + spool dir + sidecar JSON
   editor/
-    app.rs             eframe App: toolbar + canvas + tool palette
+    dx_app.rs          Dioxus annotation editor: SVG canvas, tool
+                       palette, inspector. Drives the --editor subprocess.
     document.rs        Document schema (.grabit, MessagePack)
     commands.rs        command-pattern undo/redo history (bounded 200)
     rasterize.rs       flatten annotations + effects onto PNG export
-    gif_app.rs         eframe frame editor for the --gif-editor subprocess
-    tools/             one module per tool
+    gif_app.rs         Dioxus GIF frame editor (--gif-editor subprocess)
+    tools/             tool enum + tool-specific helpers
   presets/             per-preset .toml records + hotkey rebinding
   styles/              named quick-style presets per tool
   settings/
@@ -431,20 +483,24 @@ src/
 
 Each editor / settings / GIF-editor / history window runs as its own
 `grabit.exe` subprocess (`--editor <sidecar>`, `--settings`,
-`--gif-editor <sidecar>`, or `--history`) because winit 0.30 refuses to
-recreate its event loop inside one process — the tray would deadlock
-after the first child window closed otherwise. Subprocesses communicate
-with the tray via marker files under `%APPDATA%\GrabIt\` (one-shot
-reloads for settings, presets, and triggered preset captures).
+`--gif-editor <sidecar>`, or `--history`). The original constraint
+was winit refusing to recreate its event loop in one process; the
+Dioxus desktop ports (1.5 + 1.6) inherit the same per-window
+subprocess pattern because Wry/WebView2 has the same restriction.
+Subprocesses communicate with the tray via marker files under
+`%APPDATA%\GrabIt\` (one-shot reloads for settings, presets, and
+triggered preset captures).
 
 ## Credits
 
 - **Logo:** pixel-art TV by the project owner.
 - **Font:** [JetBrains Mono](https://www.jetbrains.com/lp/mono/) Regular &
   Bold, SIL Open Font License 1.1. License text: `assets/fonts/OFL.txt`.
-- **Rust crates** (runtime): `windows`, `eframe` / `egui`, `tray-icon`,
-  `global-hotkey`, `image`, `gif`, `imageproc`, `fast_image_resize`,
-  `rayon`, `ab_glyph`, `winreg`, `toml`, `serde_json`, `rmp-serde`,
-  `serde`, `chrono`, `parking_lot`, `crossbeam-channel`, `anyhow`,
-  `thiserror`, `log` / `env_logger`, `uuid`, `rfd`, `dirs`.
+- **Rust crates** (runtime): `windows`, `dioxus` (desktop, Wry +
+  WebView2), `tray-icon`, `global-hotkey`, `image`, `gif`,
+  `imageproc`, `fast_image_resize`, `rayon`, `tokio` (time only),
+  `base64`, `ab_glyph`, `winreg`, `toml`, `serde_json`,
+  `rmp-serde`, `serde`, `chrono`, `parking_lot`,
+  `crossbeam-channel`, `anyhow`, `thiserror`, `log` / `env_logger`,
+  `uuid`, `rfd`, `dirs`.
 - **Rust crates** (build): `embed-resource`, `ico`, `image`.
