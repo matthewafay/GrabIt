@@ -1516,15 +1516,49 @@ fn rgba_to_css(c: [u8; 4]) -> String {
     )
 }
 
-fn render_defs(_doc: &Document) -> Element {
-    // SVG filter primitives like <feGaussianBlur> aren't first-class in
-    // Dioxus's rsx (the macro can't take quoted hyphenated tags), and
-    // building them via raw HTML is messy. The export rasterizer
-    // (`crate::editor::rasterize`) already does the real shadow / blur
-    // / frosted work at flatten-time; in the editor preview we approx
-    // them with cheaper styling (alpha / dashed overlays / etc.).
+fn render_defs(doc: &Document) -> Element {
+    // One <filter> + <clipPath> per Blur node so the blur-preview
+    // rect can render the underlying screenshot through a gaussian
+    // filter clipped to the rect's bounds. This mirrors what
+    // rasterize::draw_blur produces at export time, so what you see
+    // in the editor is what you'll get in the saved PNG.
     rsx! {
-        defs {}
+        defs {
+            for node in doc.annotations.iter() {
+                if let AnnotationNode::Blur { id, rect, radius_px, .. } = node {
+                    {
+                        let fid = format!("blur-{}", id);
+                        let cid = format!("blur-clip-{}", id);
+                        let std = format!("{:.2}", radius_px);
+                        let x = rect[0];
+                        let y = rect[1];
+                        let w = (rect[2] - rect[0]).max(1.0);
+                        let h = (rect[3] - rect[1]).max(1.0);
+                        rsx! {
+                            filter {
+                                id: "{fid}",
+                                x: "-20%",
+                                y: "-20%",
+                                width: "140%",
+                                height: "140%",
+                                feGaussianBlur {
+                                    std_deviation: "{std}",
+                                }
+                            }
+                            clipPath {
+                                id: "{cid}",
+                                rect {
+                                    x: "{x}",
+                                    y: "{y}",
+                                    width: "{w}",
+                                    height: "{h}",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1550,7 +1584,10 @@ fn render_node(node: &AnnotationNode, doc: &Document) -> Element {
         AnnotationNode::Step { id, center, radius, number, fill, text_color } => {
             render_step(*id, *center, *radius, *number, *fill, *text_color)
         }
-        AnnotationNode::Blur { id, rect, .. } => render_blur(*id, *rect),
+        AnnotationNode::Blur { id, rect, .. } => {
+            let ctx = use_context::<EditorContext>();
+            render_blur(*id, *rect, doc, &ctx.base_uri)
+        }
         AnnotationNode::Callout { id, rect, tail, text, fill, stroke, stroke_width, text_color, text_size } => {
             render_callout(*id, *rect, *tail, text, *fill, *stroke, *stroke_width, *text_color, *text_size)
         }
@@ -1593,21 +1630,76 @@ fn render_arrow(
         ArrowLineStyle::Dashed => format!("{:.1} {:.1}", thickness * 2.5, thickness * 1.5),
         ArrowLineStyle::Dotted => format!("0 {:.1}", thickness * 1.5),
     };
+
+    let head_len = (thickness * 4.0).max(14.0);
+    // At high thickness the shaft's `stroke-linecap: round` produces
+    // a half-disc cap of radius `thickness/2` that protrudes past the
+    // triangle tip — visible as a bulge poking out the front of the
+    // arrow. Pull the shaft endpoint back so the cap sits hidden
+    // inside the head triangle. 0.85 × head_len is the sweet spot:
+    // round cap is fully covered, but the shaft still overlaps the
+    // base far enough to avoid sub-pixel hairline gaps. LineOnly /
+    // None keep the full length since there's no triangle covering
+    // the cap.
+    let needs_end_setback = matches!(
+        head_style,
+        ArrowHeadStyle::FilledTriangle
+            | ArrowHeadStyle::OutlineTriangle
+            | ArrowHeadStyle::DoubleEnded
+    );
+    let needs_start_setback = matches!(head_style, ArrowHeadStyle::DoubleEnded);
+    let setback = head_len * 0.85;
+
     let path_d = match control {
-        Some(c) => format!(
-            "M {} {} Q {} {} {} {}",
-            start[0], start[1], c[0], c[1], end[0], end[1]
-        ),
-        None => format!("M {} {} L {} {}", start[0], start[1], end[0], end[1]),
+        Some(c) => {
+            // Curved arrows: pulling back a quadratic Bezier endpoint
+            // requires solving for the parameter t at a desired arc
+            // length. Skipped for now — the slight cap bulge on very
+            // thick curves is an accepted trade-off; the triangle
+            // still covers most of it.
+            format!(
+                "M {} {} Q {} {} {} {}",
+                start[0], start[1], c[0], c[1], end[0], end[1]
+            )
+        }
+        None => {
+            let dx = end[0] - start[0];
+            let dy = end[1] - start[1];
+            let len = (dx * dx + dy * dy).sqrt().max(1.0);
+            let ux = dx / len;
+            let uy = dy / len;
+            let (sx, sy) = if needs_start_setback {
+                (start[0] + ux * setback, start[1] + uy * setback)
+            } else {
+                (start[0], start[1])
+            };
+            let (ex, ey) = if needs_end_setback {
+                (end[0] - ux * setback, end[1] - uy * setback)
+            } else {
+                (end[0], end[1])
+            };
+            format!("M {} {} L {} {}", sx, sy, ex, ey)
+        }
     };
+
     let head_polys = compute_arrow_heads(start, end, thickness, head_style, control);
-    // Real shadow lives in rasterize::draw_arrow / draw_text_shadow at
-    // export time; preview just renders without the effect.
+    // Real shadow lives in rasterize::draw_arrow / draw_text_shadow
+    // at export time; preview just renders without the effect.
     let filter = if shadow { "" } else { "" };
     let hit_id = format!("hit-{}", id);
+    // Outline triangles stroke without fill; line chevron is an open
+    // polyline (stroke-only). Filled / DoubleEnded stay solid.
+    let head_filled = matches!(
+        head_style,
+        ArrowHeadStyle::FilledTriangle | ArrowHeadStyle::DoubleEnded
+    );
+    let head_stroked_only = matches!(head_style, ArrowHeadStyle::OutlineTriangle);
+    let head_chevron = matches!(head_style, ArrowHeadStyle::LineOnly);
+    let head_stroke_w = (thickness * 0.5).clamp(2.0, thickness);
+
     rsx! {
         g {
-            // Visible shaft + head
+            // Shaft
             path {
                 d: "{path_d}",
                 stroke: "{stroke_color}",
@@ -1617,24 +1709,55 @@ fn render_arrow(
                 fill: "none",
                 filter: "{filter}",
             }
+            // Head(s)
             for (i, poly) in head_polys.iter().enumerate() {
                 {
                     let pts = poly_to_string(poly);
                     let key = format!("ah-{}-{}", id, i);
-                    rsx! {
-                        polygon {
-                            key: "{key}",
-                            points: "{pts}",
-                            fill: "{stroke_color}",
-                            stroke: "{stroke_color}",
-                            "stroke-width": "1",
-                            filter: "{filter}",
+                    if head_chevron {
+                        rsx! {
+                            polyline {
+                                key: "{key}",
+                                points: "{pts}",
+                                fill: "none",
+                                stroke: "{stroke_color}",
+                                "stroke-width": "{thickness}",
+                                "stroke-linecap": "round",
+                                "stroke-linejoin": "round",
+                                filter: "{filter}",
+                            }
                         }
+                    } else if head_stroked_only {
+                        rsx! {
+                            polygon {
+                                key: "{key}",
+                                points: "{pts}",
+                                fill: "none",
+                                stroke: "{stroke_color}",
+                                "stroke-width": "{head_stroke_w}",
+                                "stroke-linejoin": "round",
+                                filter: "{filter}",
+                            }
+                        }
+                    } else if head_filled {
+                        rsx! {
+                            polygon {
+                                key: "{key}",
+                                points: "{pts}",
+                                fill: "{stroke_color}",
+                                stroke: "{stroke_color}",
+                                "stroke-width": "1",
+                                "stroke-linejoin": "round",
+                                filter: "{filter}",
+                            }
+                        }
+                    } else {
+                        rsx! {}
                     }
                 }
             }
-            // Wide invisible hit target (path-stroke based) so thin
-            // arrows are still selectable.
+            // Wide invisible hit target so thin arrows are still
+            // selectable.
             path {
                 id: "{hit_id}",
                 class: "annotation-hit",
@@ -1898,24 +2021,43 @@ fn render_step(
     }
 }
 
-fn render_blur(id: Uuid, rect: [f32; 4]) -> Element {
-    // Preview-only stippled overlay. The real gaussian blur lives in
-    // rasterize.rs and only fires at flatten/export time.
+fn render_blur(id: Uuid, rect: [f32; 4], doc: &Document, base_uri: &str) -> Element {
+    // Live blur preview: render a copy of the base image at full
+    // canvas size with the gaussian filter applied (via the per-node
+    // <filter> registered in render_defs) and clip the result to the
+    // blur rect. Visually matches what rasterize::draw_blur produces
+    // on export. The dashed outline is kept so an empty-ish rect is
+    // still selectable / visible.
     let x = rect[0];
     let y = rect[1];
     let w = (rect[2] - rect[0]).max(1.0);
     let h = (rect[3] - rect[1]).max(1.0);
+    let filter_id = format!("blur-{}", id);
+    let clip_id = format!("blur-clip-{}", id);
     rsx! {
-        rect {
-            key: "blur-{id}",
-            x: "{x}",
-            y: "{y}",
-            width: "{w}",
-            height: "{h}",
-            fill: "rgba(120,120,140,0.45)",
-            stroke: "rgba(120,120,180,0.85)",
-            "stroke-width": "1.5",
-            "stroke-dasharray": "4 3",
+        g {
+            image {
+                key: "blur-img-{id}",
+                href: "{base_uri}",
+                x: "0",
+                y: "0",
+                width: "{doc.base_width}",
+                height: "{doc.base_height}",
+                filter: "url(#{filter_id})",
+                "clip-path": "url(#{clip_id})",
+                preserve_aspect_ratio: "none",
+            }
+            rect {
+                key: "blur-edge-{id}",
+                x: "{x}",
+                y: "{y}",
+                width: "{w}",
+                height: "{h}",
+                fill: "none",
+                stroke: "rgba(120,120,180,0.65)",
+                "stroke-width": "1",
+                "stroke-dasharray": "4 3",
+            }
         }
     }
 }
@@ -2823,14 +2965,55 @@ fn ShapeStyle(style: Signal<ToolStyle>) -> Element {
 #[component]
 fn StepStyle(style: Signal<ToolStyle>) -> Element {
     let s = style.read().clone();
+    let fill = s.step_fill;
+    let text_color = s.step_text_color;
     let r = s.step_radius;
     let n = s.next_step_number;
-    let fill_sig = make_field_signal(style, |st| st.step_fill, |st, v| st.step_fill = v);
-    let text_sig = make_field_signal(style, |st| st.step_text_color, |st, v| st.step_text_color = v);
+
     rsx! {
-        ColorPalette { value: fill_sig }
-        ColorPickerRow { label: "Fill".to_string(), value: fill_sig }
-        ColorPickerRow { label: "Text color".to_string(), value: text_sig }
+        // Two clearly-labeled colour sections so it's obvious the
+        // step has two independent colours: the circle background
+        // and the text inside.
+        div { class: "field",
+            label { style: "color: #c4c8cf; font-weight: 600;",
+                "Circle color"
+            }
+            ColorPaletteRow {
+                value: fill,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    let mut s = style;
+                    s.with_mut(|st| st.step_fill = c);
+                }),
+            }
+            ColorRow {
+                label: "Hex".to_string(),
+                value: fill,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    let mut s = style;
+                    s.with_mut(|st| st.step_fill = c);
+                }),
+            }
+        }
+        div { class: "field",
+            label { style: "color: #c4c8cf; font-weight: 600; margin-top: 6px;",
+                "Number color"
+            }
+            ColorPaletteRow {
+                value: text_color,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    let mut s = style;
+                    s.with_mut(|st| st.step_text_color = c);
+                }),
+            }
+            ColorRow {
+                label: "Hex".to_string(),
+                value: text_color,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    let mut s = style;
+                    s.with_mut(|st| st.step_text_color = c);
+                }),
+            }
+        }
         div { class: "field",
             label { "Radius" }
             input {
@@ -3474,6 +3657,33 @@ fn SelectionProperties(
             }
         },
         _ => rsx! {},
+    }
+}
+
+/// Same 8-color swatch row as `ColorPalette`, but takes an explicit
+/// `EventHandler` instead of a `Signal` so it can be wired into the
+/// per-tool style inspectors without the leaky `make_field_signal`
+/// helper. Uses the project's standard `PALETTE` colours.
+#[component]
+fn ColorPaletteRow(value: [u8; 4], on_change: EventHandler<[u8; 4]>) -> Element {
+    rsx! {
+        div { class: "palette",
+            for c in PALETTE.iter().copied() {
+                {
+                    let active = c == value;
+                    let bg = rgba_to_css(c);
+                    let cls = if active { "swatch active" } else { "swatch" };
+                    rsx! {
+                        button {
+                            key: "{c[0]}-{c[1]}-{c[2]}",
+                            class: "{cls}",
+                            style: "background: {bg};",
+                            onclick: move |_| on_change.call(c),
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
