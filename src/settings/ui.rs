@@ -609,19 +609,57 @@ fn FooterBar(
     };
 
     rsx! {
-        footer { class: "footer",
-            div {
-                class: if is_error { "status" } else { "status ok" },
-                "{status_text}"
+        footer { class: "footer-wrap",
+            div { class: "footer",
+                div {
+                    class: if is_error { "status" } else { "status ok" },
+                    "{status_text}"
+                }
+                div { class: "actions",
+                    button { class: "danger", onclick: on_reset, "Reset to defaults" }
+                    button { class: "ghost", onclick: on_cancel, "Cancel" }
+                    button { class: "primary", onclick: on_save, "Save" }
+                }
             }
-            div { class: "actions",
-                button { class: "danger", onclick: on_reset, "Reset to defaults" }
-                button { class: "ghost", onclick: on_cancel, "Cancel" }
-                button { class: "primary", onclick: on_save, "Save" }
+            div { class: "credit-row",
+                span { class: "credit", "GrabIt 2026 — Matthew Fay" }
+                span { class: "credit-sep", "•" }
+                button {
+                    class: "credit-link",
+                    onclick: move |_| open_url("https://buymeacoffee.com/matthewafay"),
+                    "☕ Buy me a coffee"
+                }
             }
         }
     }
 }
+
+/// Open `url` in the user's default browser via Win32 `ShellExecuteW`.
+/// WebView2 won't follow `<a target="_blank">` to a new external
+/// window — anchors either navigate the embedded view or no-op — so
+/// the proper way to open an external URL is to ask the shell.
+#[cfg(windows)]
+fn open_url(url: &str) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let op = HSTRING::from("open");
+    let target = HSTRING::from(url);
+    unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            &op,
+            &target,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_url(_url: &str) {}
 
 /// Translate a Dioxus `Key` + the live modifier state into a chord
 /// string in the format `parse_chord` expects (e.g. "Ctrl+Shift+X").

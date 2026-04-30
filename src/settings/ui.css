@@ -300,15 +300,55 @@ input[type="number"]:focus {
     font-size: 12px;
 }
 
-.footer {
-    padding: 12px 22px;
+.footer-wrap {
     border-top: 1px solid #1f242c;
     background: #0a0c10;
+    flex-shrink: 0;
+}
+
+.footer {
+    padding: 12px 22px 8px;
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 10px;
-    flex-shrink: 0;
+}
+
+.credit-row {
+    padding: 6px 22px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border-top: 1px solid rgba(31, 36, 44, 0.5);
+}
+
+.credit {
+    color: #6c727a;
+    font-size: 11px;
+}
+
+.credit-sep {
+    color: #3a414c;
+    font-size: 11px;
+}
+
+.credit-link {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #93c5fd;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: inherit;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.credit-link:hover {
+    background: rgba(37, 99, 235, 0.1);
+    color: #bfdbfe;
+    border-color: rgba(37, 99, 235, 0.3);
 }
 
 .footer .actions {
