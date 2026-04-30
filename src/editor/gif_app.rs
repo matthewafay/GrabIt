@@ -34,7 +34,9 @@ use dioxus::desktop::{tao::window::WindowBuilder, Config, LogicalSize};
 use dioxus::prelude::*;
 use log::{info, warn};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 const STYLES: &str = include_str!("gif_app.css");
 
@@ -72,6 +74,11 @@ struct InitialState {
     paths: AppPaths,
     settings: Settings,
 }
+
+/// Newtype around the editor's `alive` cancellation flag so it can ride
+/// through Dioxus's typed context lookup.
+#[derive(Clone)]
+struct AliveFlag(Arc<AtomicBool>);
 
 pub fn run_blocking(sidecar_path: PathBuf, paths: AppPaths, settings: Settings) -> Result<()> {
     let body = std::fs::read_to_string(&sidecar_path)
@@ -131,10 +138,21 @@ fn gif_editor_app() -> Element {
     // it from anywhere without bounds checks.
     let decoded = use_signal(|| vec![Option::<String>::None; frames_count]);
 
-    // Background decoder. `use_hook` runs exactly once on mount; we
-    // spawn a tokio task that walks every spool PNG, decodes +
-    // resizes + base64-encodes, and writes results into `decoded` as
-    // they finish.
+    // Cancellation flag flipped to false when the GifEditorApp is
+    // dropped (i.e. the window closed). Spawned tasks check it
+    // before touching any signal — without this, the decoder /
+    // playback futures continue running after Dioxus has dropped
+    // the signal storage and the next .with_mut / .read panics with
+    // "value was dropped". Shared with `Timeline` (where the
+    // playback loop lives) via context.
+    let alive = use_hook(|| Arc::new(AtomicBool::new(true)));
+    use_drop({
+        let alive = alive.clone();
+        move || alive.store(false, Ordering::SeqCst)
+    });
+    use_context_provider(|| AliveFlag(alive.clone()));
+
+    // Background decoder. `use_hook` runs exactly once on mount.
     use_hook(|| {
         let mut decoded = decoded.to_owned();
         let paths_iter: Vec<(usize, PathBuf)> = frames_init
@@ -142,9 +160,16 @@ fn gif_editor_app() -> Element {
             .enumerate()
             .map(|(i, f)| (i, f.path.clone()))
             .collect();
+        let alive = alive.clone();
         spawn(async move {
             for (i, path) in paths_iter {
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
                 let res = tokio::task::spawn_blocking(move || build_thumb_uri(&path)).await;
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
                 match res {
                     Ok(Some(uri)) => {
                         decoded.with_mut(|d| {
@@ -492,19 +517,33 @@ fn Timeline(
     let out_idx = *trim_out.read();
     let playing_val = *playing.read();
 
+    // Cancellation flag — same one the editor's decoder uses. Guards
+    // every signal read in the playback loop so we don't panic on a
+    // `.read()` after the window has closed.
+    let alive = use_context::<AliveFlag>().0;
+
     let on_play_click = move |_| {
         let was_playing = *playing.read();
         playing.set(!was_playing);
         if !was_playing && total > 0 {
-            // Spawn a self-terminating playback loop. Each iteration
-            // sleeps for the current FPS-derived dt, then advances to
-            // the next non-deleted frame. Setting `playing` to false
-            // from the UI causes the loop to exit on the next check.
+            let alive = alive.clone();
+            // Self-terminating playback loop. Sleeps a frame, then
+            // checks `alive` (window not closed) AND `playing`
+            // (user didn't pause) before advancing.
             spawn(async move {
-                while *playing.read() {
+                loop {
+                    if !alive.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if !*playing.read() {
+                        break;
+                    }
                     let dt_ms =
                         ((1000 / (*fps.read()).max(1)).max(10)) as u64;
                     tokio::time::sleep(std::time::Duration::from_millis(dt_ms)).await;
+                    if !alive.load(Ordering::SeqCst) {
+                        return;
+                    }
                     if !*playing.read() {
                         break;
                     }

@@ -141,6 +141,8 @@ fn settings_app() -> Element {
                 gif_loop_count: gif_loop_count,
                 gif_max_seconds: gif_max_seconds,
                 gif_record_cursor: gif_record_cursor,
+                recording: recording,
+                captured: captured,
                 status: status,
             }
         }
@@ -495,6 +497,8 @@ fn FooterBar(
     gif_loop_count: Signal<u16>,
     gif_max_seconds: Signal<u32>,
     gif_record_cursor: Signal<bool>,
+    recording: Signal<Option<RecordTarget>>,
+    captured: Signal<Option<String>>,
     status: Signal<String>,
 ) -> Element {
     let status_text = status.read().clone();
@@ -528,6 +532,20 @@ fn FooterBar(
             if let Err(e) = std::fs::create_dir_all(&trimmed) {
                 status.set(format!("Output folder unusable: {e}"));
                 return;
+            }
+            // create_dir_all alone passes for UNC paths and ACL-
+            // restricted shares that reject actual writes. Drop a
+            // sentinel + delete it to verify the path is genuinely
+            // writable before we save it as the user's preference.
+            let probe = std::path::Path::new(&trimmed).join(".grabit-write-test");
+            match std::fs::write(&probe, b"") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => {
+                    status.set(format!("Output folder isn't writable: {e}"));
+                    return;
+                }
             }
             Some(trimmed)
         };
@@ -594,6 +612,11 @@ fn FooterBar(
         gif_loop_count.set(fresh.gif_loop_count);
         gif_max_seconds.set(fresh.gif_max_seconds);
         gif_record_cursor.set(fresh.gif_record_cursor);
+        // Drop any in-progress chord recording — without this the
+        // user clicking Reset mid-record sees a stale "Captured: …"
+        // display against the now-default chord.
+        recording.set(None);
+        captured.set(None);
         status.set("Reset — click Save to apply, Cancel to discard.".to_string());
     };
 
@@ -679,6 +702,11 @@ fn format_chord(key: &Key, mods: &Modifiers) -> Option<String> {
 fn key_token(k: &Key) -> Option<String> {
     Some(match k {
         Key::Character(s) => {
+            // Browsers emit Space as `Key::Character(" ")`. Recognise
+            // it explicitly so users can bind chords like Ctrl+Space.
+            if s == " " {
+                return Some("Space".into());
+            }
             let trimmed = s.trim();
             if trimmed.len() == 1 {
                 let c = trimmed.chars().next().unwrap();

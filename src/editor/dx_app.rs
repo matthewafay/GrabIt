@@ -641,21 +641,23 @@ fn Footer(
     let sel_label = (*selected.read())
         .map(|_| "selected".to_string())
         .unwrap_or_default();
-    let dims = format!(
-        "{} × {}",
-        document.read().base_width,
-        document.read().base_height
-    );
-    // Only show the saved-path block when (a) we've saved during
-    // this session and (b) the document isn't dirty (saving then
-    // editing means the path is stale). When dirty, fall back to the
-    // simple "Unsaved changes" indicator.
+    // One Ref guard for the dims so the Footer subscribes to base_*
+    // exactly once per render instead of twice.
+    let dims = {
+        let doc = document.read();
+        format!("{} × {}", doc.base_width, doc.base_height)
+    };
     let saved_path = if dirty_state { None } else { last_saved_path.read().clone() };
     let saved_filename = saved_path
         .as_ref()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned());
-    let mut copy_flash = use_signal(|| false);
+    // Generation counter for the "Copied!" flash. A naive bool would
+    // let an earlier 1.4s timer expire onto a flash a later click is
+    // currently showing — flicker. The counter lets each timer check
+    // it's still the current generation before clearing.
+    let mut copy_flash_gen = use_signal(|| 0u64);
+    let mut copy_flash_active = use_signal(|| false);
 
     let on_copy_path = move |_| {
         let Some(path) = last_saved_path.read().clone() else { return };
@@ -669,14 +671,22 @@ fn Footer(
         if let Err(e) = crate::export::copy_text_to_clipboard(&clean) {
             warn!("editor: copy path failed: {e}");
         } else {
-            copy_flash.set(true);
+            // Bump the generation; the spawned timer captures this
+            // fresh value and only clears the flash if it's still
+            // current at expiry. Earlier timers from rapid double-
+            // clicks become no-ops.
+            let my_gen = *copy_flash_gen.read() + 1;
+            copy_flash_gen.set(my_gen);
+            copy_flash_active.set(true);
             spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-                copy_flash.set(false);
+                if *copy_flash_gen.read() == my_gen {
+                    copy_flash_active.set(false);
+                }
             });
         }
     };
-    let flash_on = *copy_flash.read();
+    let flash_on = *copy_flash_active.read();
 
     rsx! {
         div { class: "footer",
@@ -895,7 +905,7 @@ fn Canvas(
                 // Annotation layer (committed nodes).
                 {render_annotations(&document.read())}
                 // Selection chrome (drawn over annotations).
-                {render_selection(&document.read(), *selected.read(), *editing_text.read(), document, history, dirty)}
+                {render_selection(&document.read(), *selected.read(), editing_text, document, history, dirty)}
                 // In-progress drag preview (drawn topmost).
                 {render_pending(&pending.read(), &style.read(), cur_tool)}
             }
@@ -2389,7 +2399,7 @@ fn render_capture_info(
 fn render_selection(
     doc: &Document,
     selected: Option<Uuid>,
-    editing_text: Option<Uuid>,
+    mut editing_text: Signal<Option<Uuid>>,
     mut document: Signal<Document>,
     history: Signal<History>,
     mut dirty: Signal<bool>,
@@ -2398,6 +2408,7 @@ fn render_selection(
     let Some(node) = doc.annotations.iter().find(|n| n.id() == id) else { return rsx! {} };
     let bbox = bounding_box(node);
     let Some([x, y, w, h]) = bbox else { return rsx! {} };
+    let editing_text_val = *editing_text.read();
 
     // If editing text and that's the selected node, render the text
     // editor in a foreignObject overlay instead of selection chrome.
@@ -2412,7 +2423,7 @@ fn render_selection(
     // - onmousedown stops propagation so canvas_pointerdown's
     //   "click anywhere clears editing_text" branch doesn't fire
     //   from clicks inside the textarea.
-    if editing_text == Some(id) {
+    if editing_text_val == Some(id) {
         if let AnnotationNode::Text { text, .. } = node {
             let initial = text.clone();
             // Snapshot the BEFORE state so onblur can build a single
@@ -2473,6 +2484,13 @@ fn render_selection(
                                     );
                                 }
                             }
+                            // Drop edit mode so the foreignObject
+                            // overlay clears when the textarea
+                            // loses focus (clicking the inspector,
+                            // a tool button, etc.). Without this
+                            // the editor stays open over the
+                            // rendered text.
+                            editing_text.set(None);
                         },
                     }
                 }
@@ -2667,72 +2685,25 @@ fn ToolStyleSection(tool: Signal<Tool>, style: Signal<ToolStyle>) -> Element {
     }
 }
 
-#[component]
-fn ColorPalette(value: Signal<[u8; 4]>) -> Element {
-    let cur = *value.read();
-    rsx! {
-        div { class: "palette",
-            for c in PALETTE.iter().copied() {
-                {
-                    let active = c == cur;
-                    let bg = rgba_to_css(c);
-                    let cls = if active { "swatch active" } else { "swatch" };
-                    rsx! {
-                        button {
-                            key: "{c[0]}-{c[1]}-{c[2]}",
-                            class: "{cls}",
-                            style: "background: {bg};",
-                            onclick: move |_| value.set(c),
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn color_to_hex(c: [u8; 4]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
+/// Parse a `#rrggbb` colour. Validates that the candidate digits are
+/// all ASCII hex first — otherwise a 6-byte string of two 3-byte
+/// UTF-8 chars would pass the `len() == 6` check but panic when the
+/// later `&s[0..2]` slice cuts a non-char-boundary. Belt-and-braces
+/// since this fn takes user input from a free-form `<input type=text>`.
 fn hex_to_color(hex: &str, alpha: u8) -> Option<[u8; 4]> {
     let s = hex.strip_prefix('#').unwrap_or(hex);
-    if s.len() != 6 { return None; }
+    let bytes = s.as_bytes();
+    if bytes.len() != 6 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some([r, g, b, alpha])
-}
-
-#[component]
-fn ColorPickerRow(label: String, value: Signal<[u8; 4]>) -> Element {
-    let v = *value.read();
-    let hex = color_to_hex(v);
-    rsx! {
-        div { class: "field",
-            label { "{label}" }
-            div { class: "row-pair",
-                input {
-                    r#type: "color",
-                    value: "{hex}",
-                    oninput: move |evt| {
-                        if let Some(c) = hex_to_color(&evt.value(), v[3]) {
-                            value.set(c);
-                        }
-                    },
-                }
-                input {
-                    r#type: "text",
-                    value: "{hex}",
-                    oninput: move |evt| {
-                        if let Some(c) = hex_to_color(&evt.value(), v[3]) {
-                            value.set(c);
-                        }
-                    },
-                }
-            }
-        }
-    }
 }
 
 #[component]
@@ -2748,11 +2719,22 @@ fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
     let thick = s.arrow_thickness;
     let color = s.arrow_color;
 
-    let palette_sig = make_field_signal(style, |st| st.arrow_color, |st, v| st.arrow_color = v);
-
     rsx! {
-        ColorPalette { value: palette_sig }
-        ColorPickerRow { label: "Color".to_string(), value: palette_sig }
+        ColorPaletteRow {
+            value: color,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.arrow_color = c);
+            }),
+        }
+        ColorRow {
+            label: "Color".to_string(),
+            value: color,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.arrow_color = c);
+            }),
+        }
         div { class: "field",
             label { "Thickness" }
             input {
@@ -2817,37 +2799,7 @@ fn ArrowStyle(style: Signal<ToolStyle>) -> Element {
             }
             "Drop shadow"
         }
-        // suppress unused-color warning when only swatches change it
-        { let _ = color; rsx! {} }
     }
-}
-
-/// Helper that builds a transient `Signal<T>` view onto a single
-/// field of `ToolStyle`. Read returns the current field value;
-/// mutations go through `style.with_mut`. Used to pass a single-field
-/// signal into reusable components like `ColorPalette` /
-/// `ColorPickerRow` without having to write per-field component
-/// variants.
-fn make_field_signal<T: Clone + 'static + PartialEq>(
-    mut style: Signal<ToolStyle>,
-    read: impl Fn(&ToolStyle) -> T + Copy + 'static,
-    write: impl Fn(&mut ToolStyle, T) + Copy + 'static,
-) -> Signal<T> {
-    // Materialize the current field into a fresh signal per render —
-    // and on every change, mirror it back into the bundled style.
-    // The use_effect below fires whenever the inner signal mutates,
-    // which is exactly when the user moved the swatch / picker.
-    let initial = read(&style.read());
-    let mut field = use_signal(|| initial.clone());
-    // Keep field signal aligned with whatever the parent says is current.
-    if *field.read() != initial {
-        field.set(initial);
-    }
-    use_effect(move || {
-        let v = field.read().clone();
-        style.with_mut(|st| write(st, v));
-    });
-    field
 }
 
 fn head_label(h: ArrowHeadStyle) -> &'static str {
@@ -2878,7 +2830,7 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
     let cur_list = s.text_list;
     let frosted = s.text_frosted;
     let shadow = s.text_shadow;
-    let palette_sig = make_field_signal(style, |st| st.text_color, |st, v| st.text_color = v);
+    let color = s.text_color;
 
     let set_align = move |a: TextAlign| {
         let mut s = style;
@@ -2890,8 +2842,21 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
     };
 
     rsx! {
-        ColorPalette { value: palette_sig }
-        ColorPickerRow { label: "Color".to_string(), value: palette_sig }
+        ColorPaletteRow {
+            value: color,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.text_color = c);
+            }),
+        }
+        ColorRow {
+            label: "Color".to_string(),
+            value: color,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.text_color = c);
+            }),
+        }
         div { class: "field",
             label { "Size (px)" }
             input {
@@ -2968,22 +2933,26 @@ fn TextStyle(style: Signal<ToolStyle>) -> Element {
 fn ShapeStyle(style: Signal<ToolStyle>) -> Element {
     let s = style.read().clone();
     let sw_val = s.shape_stroke_width;
-    let filled = s.shape_fill[3] != 0;
-    let stroke_sig = make_field_signal(style, |st| st.shape_stroke, |st, v| st.shape_stroke = v);
-    // Fill signal preserves the alpha bit when user picks a new RGB
-    // (toggling Filled drives alpha 0/220 separately).
-    let fill_sig = make_field_signal(
-        style,
-        |st| st.shape_fill,
-        |st, v| {
-            let alpha = st.shape_fill[3];
-            st.shape_fill = [v[0], v[1], v[2], alpha];
-        },
-    );
+    let stroke = s.shape_stroke;
+    let fill = s.shape_fill;
+    let filled = fill[3] != 0;
 
     rsx! {
-        ColorPalette { value: stroke_sig }
-        ColorPickerRow { label: "Stroke".to_string(), value: stroke_sig }
+        ColorPaletteRow {
+            value: stroke,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.shape_stroke = c);
+            }),
+        }
+        ColorRow {
+            label: "Stroke".to_string(),
+            value: stroke,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.shape_stroke = c);
+            }),
+        }
         div { class: "field",
             label { "Stroke width" }
             input {
@@ -3013,7 +2982,20 @@ fn ShapeStyle(style: Signal<ToolStyle>) -> Element {
             "Filled"
         }
         if filled {
-            ColorPickerRow { label: "Fill".to_string(), value: fill_sig }
+            // Toggling Filled drives alpha 0/220 separately — the
+            // fill colour preserves whatever RGB the user already
+            // picked across the toggle.
+            ColorRow {
+                label: "Fill".to_string(),
+                value: fill,
+                on_change: EventHandler::new(move |c: [u8; 4]| {
+                    let mut s = style;
+                    s.with_mut(|st| {
+                        let alpha = st.shape_fill[3];
+                        st.shape_fill = [c[0], c[1], c[2], alpha];
+                    });
+                }),
+            }
         }
     }
 }
@@ -3103,7 +3085,7 @@ fn MagnifyStyle(style: Signal<ToolStyle>) -> Element {
     let circ = s.magnify_circular;
     let bw = s.magnify_border_width;
     let z = s.magnify_zoom;
-    let border_sig = make_field_signal(style, |st| st.magnify_border, |st, v| st.magnify_border = v);
+    let border = s.magnify_border;
     rsx! {
         label { class: "toggle",
             input { r#type: "checkbox", checked: "{circ}",
@@ -3115,7 +3097,14 @@ fn MagnifyStyle(style: Signal<ToolStyle>) -> Element {
             }
             "Circular"
         }
-        ColorPickerRow { label: "Border".to_string(), value: border_sig }
+        ColorRow {
+            label: "Border".to_string(),
+            value: border,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.magnify_border = c);
+            }),
+        }
         div { class: "field",
             label { "Border width" }
             input { r#type: "number", min: "0", max: "20", step: "0.5", value: "{bw}",
@@ -3164,13 +3153,35 @@ fn BlurStyle(style: Signal<ToolStyle>) -> Element {
 
 #[component]
 fn CalloutStyle(style: Signal<ToolStyle>) -> Element {
-    let fill_sig = make_field_signal(style, |st| st.callout_fill, |st, v| st.callout_fill = v);
-    let stroke_sig = make_field_signal(style, |st| st.callout_stroke, |st, v| st.callout_stroke = v);
-    let text_sig = make_field_signal(style, |st| st.callout_text_color, |st, v| st.callout_text_color = v);
+    let s = style.read().clone();
+    let fill = s.callout_fill;
+    let stroke = s.callout_stroke;
+    let text = s.callout_text_color;
     rsx! {
-        ColorPickerRow { label: "Fill".to_string(), value: fill_sig }
-        ColorPickerRow { label: "Stroke".to_string(), value: stroke_sig }
-        ColorPickerRow { label: "Text".to_string(), value: text_sig }
+        ColorRow {
+            label: "Fill".to_string(),
+            value: fill,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.callout_fill = c);
+            }),
+        }
+        ColorRow {
+            label: "Stroke".to_string(),
+            value: stroke,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.callout_stroke = c);
+            }),
+        }
+        ColorRow {
+            label: "Text".to_string(),
+            value: text,
+            on_change: EventHandler::new(move |c: [u8; 4]| {
+                let mut s = style;
+                s.with_mut(|st| st.callout_text_color = c);
+            }),
+        }
     }
 }
 
