@@ -65,7 +65,7 @@ pub struct CursorLayer {
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureMetadata {
     pub captured_at: DateTime<Utc>,
     pub foreground_title: Option<String>,
@@ -84,7 +84,7 @@ pub struct Rect {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorInfo {
     pub rect: Rect,
     pub scale_factor: f32,

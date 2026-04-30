@@ -44,7 +44,7 @@ use uuid::Uuid;
 /// Text nodes will fail to deserialize (accepted migration cost).
 pub const DOCUMENT_SCHEMA_VERSION: u32 = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub schema_version: u32,
     pub id: Uuid,
@@ -69,7 +69,7 @@ pub struct Document {
     pub border: Option<Border>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SerializedCursor {
     pub png: Vec<u8>,
     pub width: u32,
@@ -132,7 +132,7 @@ impl CaptureInfoPosition {
 }
 
 /// Style bundle for the capture-info banner.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CaptureInfoStyle {
     /// Box fill (RGBA).
     pub fill: [u8; 4],
@@ -170,7 +170,7 @@ pub enum Edge {
 /// `left` / `right` booleans; the legacy `edge` field is kept for
 /// backward-compatible deserialisation of pre-1.3 documents that only
 /// allowed a single edge.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EdgeEffect {
     /// Legacy single-edge field. Still serialised for downgrade safety;
     /// on load, if none of the per-edge booleans are true, this value
@@ -240,7 +240,7 @@ impl EdgeEffect {
 /// `matte_width = 0` (default for pre-1.3 docs) is the classic single-band
 /// look. A non-zero matte turns the border into a classic photo frame —
 /// thin dark outer rim plus a lighter inner matte.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Border {
     pub color: [u8; 4],
     pub width: f32,
@@ -275,7 +275,7 @@ impl Default for Border {
 }
 
 /// Which built-in stamp (or a user-supplied PNG blob).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StampSource {
     /// References a stamp shipped in the binary. Name must match one of the
@@ -355,7 +355,7 @@ pub enum TextListStyle {
 /// Annotation scene-graph node. Variants are added as each annotation tool
 /// lands. All coordinates are in image-pixel space (relative to the top-left
 /// of `base_png`), not editor-canvas space — tools convert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnnotationNode {
     Arrow {

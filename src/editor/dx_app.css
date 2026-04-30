@@ -1,0 +1,491 @@
+/* Annotation editor — Dioxus port of the eframe surface in app.rs.
+   Layout: top bar + tool palette (left) + svg canvas (center) +
+   inspector (right) + footer. Same dark visual language as the rest
+   of the app. */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    background: #0a0c10;
+    color: #e6e8eb;
+    height: 100%;
+    overflow: hidden;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+}
+
+button {
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 10px;
+    transition: background 0.12s ease, border-color 0.12s ease,
+        color 0.12s ease, transform 0.05s ease;
+    font-family: inherit;
+    color: inherit;
+}
+button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+button:active:not(:disabled) {
+    transform: translateY(1px);
+}
+button.ghost {
+    background: transparent;
+    border-color: #2a3038;
+    color: #c4c8cf;
+}
+button.ghost:hover:not(:disabled) {
+    background: #1c2026;
+    border-color: #3a414c;
+    color: #fff;
+}
+button.primary {
+    background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+    color: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+button.primary:hover:not(:disabled) {
+    background: linear-gradient(180deg, #4f8ff9 0%, #2c6ef0 100%);
+}
+button.danger {
+    background: transparent;
+    color: #f87171;
+    border-color: #3a1a1a;
+}
+button.danger:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.08);
+    color: #fca5a5;
+}
+
+input[type="number"],
+input[type="text"] {
+    background: #14181f;
+    border: 1px solid #2a3038;
+    color: #e6e8eb;
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    width: 100%;
+    transition: border-color 0.12s ease;
+}
+input[type="number"]:focus,
+input[type="text"]:focus {
+    border-color: #2563eb;
+}
+input[type="color"] {
+    width: 28px;
+    height: 22px;
+    border: 1px solid #2a3038;
+    border-radius: 4px;
+    background: #14181f;
+    padding: 0;
+    cursor: pointer;
+}
+select {
+    background: #14181f;
+    border: 1px solid #2a3038;
+    color: #e6e8eb;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-family: inherit;
+}
+
+.toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 12px;
+    color: #c4c8cf;
+}
+.toggle input {
+    accent-color: #2563eb;
+}
+
+/* ─── Layout ─────────────────────────────────────────────────────── */
+
+.app {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    grid-template-columns: 60px 1fr 240px;
+    grid-template-areas:
+        "topbar topbar topbar"
+        "tools canvas inspector"
+        "footer footer footer";
+    height: 100vh;
+    background: #0e1116;
+}
+
+.topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    border-bottom: 1px solid #1f242c;
+    background: linear-gradient(180deg, #131820 0%, #0e1116 100%);
+}
+.topbar .title {
+    flex: 1;
+    min-width: 0;
+}
+.topbar .title h1 {
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.topbar .title .sub {
+    font-size: 11px;
+    color: #6c727a;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+.topbar .title .dirty {
+    color: #fbbf24;
+    margin-left: 4px;
+}
+.topbar .actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.topbar .divider {
+    width: 1px;
+    height: 22px;
+    background: #1f242c;
+    margin: 0 4px;
+}
+
+/* ─── Tools palette (left rail) ──────────────────────────────────── */
+
+.tools {
+    grid-area: tools;
+    background: #0a0c10;
+    border-right: 1px solid #1f242c;
+    padding: 8px 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: center;
+    overflow-y: auto;
+}
+.tools button {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border-radius: 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: #9aa0a8;
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    transition: background 0.12s ease, color 0.12s ease,
+        border-color 0.12s ease;
+}
+.tools button:hover {
+    background: #1c2026;
+    color: #c4c8cf;
+}
+.tools button.active {
+    background: rgba(37, 99, 235, 0.15);
+    color: #93c5fd;
+    border-color: #2563eb;
+}
+.tools button .label {
+    font-size: 9px;
+    margin-top: 2px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+/* ─── SVG canvas ─────────────────────────────────────────────────── */
+
+.canvas-wrap {
+    grid-area: canvas;
+    overflow: auto;
+    background: repeating-conic-gradient(
+            #0a0c10 0deg 90deg,
+            #0d1015 90deg 180deg
+        )
+        0 0 / 24px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+.canvas-wrap svg {
+    background: #ffffff;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+    cursor: crosshair;
+    max-width: 100%;
+    max-height: 100%;
+}
+.canvas-wrap.tool-select svg {
+    cursor: default;
+}
+.canvas-wrap.tool-text svg {
+    cursor: text;
+}
+
+/* SVG-internal styling for selection chrome. */
+.selection-stroke {
+    fill: none;
+    stroke: #3b82f6;
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+    pointer-events: none;
+}
+.handle {
+    fill: #ffffff;
+    stroke: #3b82f6;
+    stroke-width: 1.5;
+    cursor: nwse-resize;
+}
+.handle.n,
+.handle.s {
+    cursor: ns-resize;
+}
+.handle.e,
+.handle.w {
+    cursor: ew-resize;
+}
+.handle.ne,
+.handle.sw {
+    cursor: nesw-resize;
+}
+.annotation-hit {
+    fill: transparent;
+    stroke: transparent;
+    pointer-events: stroke;
+    stroke-width: 14;
+}
+
+/* Foreign-object text-edit overlay. */
+.text-editor {
+    width: 100%;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.6);
+    border: 1.5px solid #3b82f6;
+    border-radius: 2px;
+    padding: 4px;
+    color: inherit;
+    font-family: "JetBrains Mono", "Cascadia Mono", "Consolas", monospace;
+    resize: none;
+    outline: none;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+/* ─── Inspector (right rail) ─────────────────────────────────────── */
+
+.inspector {
+    grid-area: inspector;
+    background: #0a0c10;
+    border-left: 1px solid #1f242c;
+    padding: 12px 12px 18px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #2a3038 transparent;
+}
+.inspector::-webkit-scrollbar {
+    width: 8px;
+}
+.inspector::-webkit-scrollbar-thumb {
+    background: #2a3038;
+    border-radius: 4px;
+}
+.inspector h2 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #93c5fd;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #1f242c;
+}
+.inspector .field {
+    margin-bottom: 9px;
+}
+.inspector .field label {
+    display: block;
+    font-size: 11px;
+    color: #6c727a;
+    margin-bottom: 3px;
+}
+.inspector .row-pair {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.inspector .row-pair input[type="number"] {
+    flex: 1;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.inspector textarea {
+    width: 100%;
+    min-height: 64px;
+    background: #14181f;
+    border: 1px solid #2a3038;
+    color: #e6e8eb;
+    border-radius: 6px;
+    padding: 6px;
+    font-family: "JetBrains Mono", "Cascadia Mono", "Consolas", monospace;
+    font-size: 11px;
+    resize: vertical;
+    outline: none;
+}
+.inspector textarea:focus {
+    border-color: #2563eb;
+}
+.inspector .palette {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 3px;
+    margin-bottom: 8px;
+}
+.inspector .swatch {
+    width: 100%;
+    aspect-ratio: 1;
+    border: 1.5px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 0;
+    transition: transform 0.08s ease;
+}
+.inspector .swatch:hover {
+    transform: scale(1.12);
+}
+.inspector .swatch.active {
+    border-color: #fff;
+    box-shadow: 0 0 0 1.5px #2563eb;
+}
+.inspector section {
+    margin-bottom: 16px;
+}
+.inspector .section-divider {
+    height: 1px;
+    background: #1f242c;
+    margin: 14px -12px;
+}
+.inspector .stats {
+    font-size: 11px;
+    color: #6c727a;
+    font-variant-numeric: tabular-nums;
+}
+.inspector .stats div {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 3px;
+}
+.inspector .stats div span:last-child {
+    color: #c4c8cf;
+}
+.inspector .row-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 4px;
+}
+.inspector .row-3 button {
+    padding: 4px 6px;
+    font-size: 11px;
+}
+.inspector .row-3 button.active {
+    background: rgba(37, 99, 235, 0.18);
+    color: #93c5fd;
+    border-color: #2563eb;
+}
+
+/* ─── Footer ─────────────────────────────────────────────────────── */
+
+.footer {
+    grid-area: footer;
+    padding: 6px 14px;
+    border-top: 1px solid #1f242c;
+    background: #0a0c10;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: #6c727a;
+    font-size: 11px;
+}
+.footer .status.dirty {
+    color: #fbbf24;
+}
+.footer .status.ok {
+    color: #4ade80;
+}
+.footer .pill {
+    background: rgba(37, 99, 235, 0.15);
+    color: #93c5fd;
+    border: 1px solid rgba(37, 99, 235, 0.3);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* ─── Modal overlay (save-on-close, etc.) ────────────────────────── */
+
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 12, 16, 0.7);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+.modal {
+    background: #14181f;
+    border: 1px solid #2a3038;
+    border-radius: 10px;
+    padding: 18px 22px;
+    min-width: 360px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.modal h3 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: #fff;
+}
+.modal p {
+    font-size: 12px;
+    color: #c4c8cf;
+    margin-bottom: 14px;
+    line-height: 1.5;
+}
+.modal .row-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
