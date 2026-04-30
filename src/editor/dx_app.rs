@@ -292,6 +292,10 @@ fn editor_app() -> Element {
     let pending = use_signal(|| Option::<Pending>::None);
     let style = use_signal(|| ToolStyle::from_settings(&ctx.settings));
     let copy_on_save = use_signal(|| ctx.copy_on_save);
+    // Path of the most recent successful save. Drives the footer's
+    // "Saved → filename.png  [Copy path]" affordance, so a user who
+    // wants to paste the path into chat can do it in one click.
+    let last_saved_path = use_signal(|| Option::<PathBuf>::None);
     // True during text-edit foreignObject session; carries the id of
     // the text annotation being edited.
     let editing_text = use_signal(|| Option::<Uuid>::None);
@@ -305,7 +309,7 @@ fn editor_app() -> Element {
     let on_global_keydown = move |evt: KeyboardEvent| {
         global_keydown(
             evt, document, history, dirty, selected, editing_text,
-            ctx_for_keys.clone(), copy_on_save,
+            ctx_for_keys.clone(), copy_on_save, last_saved_path,
         )
     };
 
@@ -323,6 +327,7 @@ fn editor_app() -> Element {
                 dirty: dirty,
                 copy_on_save: copy_on_save,
                 close_modal: close_modal,
+                last_saved_path: last_saved_path,
             }
             ToolPalette {
                 tool: tool,
@@ -351,6 +356,7 @@ fn editor_app() -> Element {
                 tool: tool,
                 dirty: dirty,
                 selected: selected,
+                last_saved_path: last_saved_path,
             }
 
             if *close_modal.read() {
@@ -409,6 +415,7 @@ fn global_keydown(
     mut editing_text: Signal<Option<Uuid>>,
     ctx: EditorContext,
     copy_on_save: Signal<bool>,
+    mut last_saved_path: Signal<Option<PathBuf>>,
 ) {
     let key = evt.key();
     let mods = evt.modifiers();
@@ -456,6 +463,7 @@ fn global_keydown(
                             warn!("save failed: {e}");
                         } else {
                             dirty.set(false);
+                            last_saved_path.set(Some(ctx.png_path.clone()));
                         }
                     }
                     _ => {}
@@ -475,6 +483,7 @@ fn TopBar(
     dirty: Signal<bool>,
     copy_on_save: Signal<bool>,
     close_modal: Signal<bool>,
+    last_saved_path: Signal<Option<PathBuf>>,
 ) -> Element {
     let ctx = use_context::<EditorContext>();
     let png_name = ctx
@@ -495,12 +504,14 @@ fn TopBar(
 
     let on_save = {
         let ctx = ctx.clone();
+        let mut last_saved_path = last_saved_path;
         move |_| {
             let snapshot = document.read().clone();
             match save_document(&ctx, &snapshot, *copy_on_save.read()) {
                 Ok(()) => {
                     let mut d = dirty;
                     d.set(false);
+                    last_saved_path.set(Some(ctx.png_path.clone()));
                     info!("editor: saved");
                 }
                 Err(e) => warn!("save failed: {e}"),
@@ -623,11 +634,10 @@ fn Footer(
     tool: Signal<Tool>,
     dirty: Signal<bool>,
     selected: Signal<Option<Uuid>>,
+    last_saved_path: Signal<Option<PathBuf>>,
 ) -> Element {
     let tool_label = tool.read().label();
     let dirty_state = *dirty.read();
-    // `read()` returns a Ref guard; deref + clone the inner Option
-    // before calling combinators on it.
     let sel_label = (*selected.read())
         .map(|_| "selected".to_string())
         .unwrap_or_default();
@@ -636,6 +646,37 @@ fn Footer(
         document.read().base_width,
         document.read().base_height
     );
+    // Only show the saved-path block when (a) we've saved during
+    // this session and (b) the document isn't dirty (saving then
+    // editing means the path is stale). When dirty, fall back to the
+    // simple "Unsaved changes" indicator.
+    let saved_path = if dirty_state { None } else { last_saved_path.read().clone() };
+    let saved_filename = saved_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned());
+    let mut copy_flash = use_signal(|| false);
+
+    let on_copy_path = move |_| {
+        let Some(path) = last_saved_path.read().clone() else { return };
+        // Strip the kernel's `\\?\` UNC prefix so the pasted path
+        // looks like a normal Windows path. Same sanitization as
+        // History's Copy-path action does.
+        let abs = std::fs::canonicalize(&path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        let clean = abs.strip_prefix(r"\\?\").unwrap_or(&abs).to_string();
+        if let Err(e) = crate::export::copy_text_to_clipboard(&clean) {
+            warn!("editor: copy path failed: {e}");
+        } else {
+            copy_flash.set(true);
+            spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+                copy_flash.set(false);
+            });
+        }
+    };
+    let flash_on = *copy_flash.read();
 
     rsx! {
         div { class: "footer",
@@ -646,9 +687,24 @@ fn Footer(
                     span { "  •  {sel_label}" }
                 }
             }
-            div {
-                span { class: if dirty_state { "status dirty" } else { "status ok" },
-                    if dirty_state { "Unsaved changes" } else { "Saved" }
+            div { style: "display: flex; align-items: center; gap: 8px;",
+                if dirty_state {
+                    span { class: "status dirty", "Unsaved changes" }
+                } else if let Some(name) = saved_filename {
+                    span { class: "status ok", "Saved → " }
+                    span {
+                        style: "color: #93c5fd; font-family: 'JetBrains Mono', 'Cascadia Mono', 'Consolas', monospace;",
+                        "{name}"
+                    }
+                    button {
+                        class: "ghost",
+                        style: "padding: 2px 8px; font-size: 10px;",
+                        title: "Copy full path to clipboard",
+                        onclick: on_copy_path,
+                        if flash_on { "Copied!" } else { "Copy path" }
+                    }
+                } else {
+                    span { class: "status ok", "Saved" }
                 }
                 span { "  •  {dims}" }
             }
