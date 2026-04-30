@@ -71,9 +71,6 @@ pub enum Command {
     OpenOutputFolder,
     /// Open the capture history viewer (mini gallery of recent PNGs/GIFs).
     OpenHistory,
-    /// Toggle "Launch at startup" — flips the HKCU Run entry and persists
-    /// the choice to settings.
-    ToggleAutostart,
     /// Open settings window (stub in M0).
     OpenSettings,
     /// Quit the application.
@@ -199,13 +196,6 @@ pub fn dispatch(state: &mut AppState, cmd: Command) -> Result<()> {
             if let Err(e) = std::process::Command::new(exe).arg("--history").spawn() {
                 warn!("spawn history subprocess failed: {e}");
             }
-        }
-        Command::ToggleAutostart => {
-            state.settings.launch_at_startup = !state.settings.launch_at_startup;
-            if let Err(e) = crate::autostart::sync(&state.settings.launch_at_startup) {
-                warn!("autostart toggle failed: {e}");
-            }
-            state.settings.save(&state.paths).ok();
         }
         Command::OpenSettings => {
             // Settings GUI runs as a `grabit.exe --settings` subprocess so it

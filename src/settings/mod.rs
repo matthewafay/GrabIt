@@ -23,8 +23,6 @@ pub struct Settings {
     /// you pick won't reach other apps' own bindings for the same keys.
     /// Change it in Settings or edit `settings.json` directly.
     pub annotate_hotkey: HotkeyBinding,
-    /// Persisted state of the "Launch at startup" tray checkbox.
-    pub launch_at_startup: bool,
     /// Include the cursor in captures (as a separate layer).
     pub include_cursor: bool,
     /// Copy every capture to the Windows clipboard on completion.
@@ -62,7 +60,6 @@ impl Default for Settings {
         Self {
             hotkey: HotkeyBinding::default(),
             annotate_hotkey: HotkeyBinding { raw: "Ctrl+Shift+A".to_string() },
-            launch_at_startup: true,
             include_cursor: true,
             copy_to_clipboard: true,
             output_dir: None,

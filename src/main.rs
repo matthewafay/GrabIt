@@ -1,7 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
-mod autostart;
 mod capture;
 mod editor;
 mod export;
@@ -76,11 +75,6 @@ fn main() -> Result<()> {
     let settings = settings::Settings::load_or_default(&paths);
     settings.save(&paths).ok();
     apply_output_dir_override(&mut paths, &settings);
-
-    // On first run, honor the persisted autostart preference.
-    if let Err(e) = autostart::sync(&settings.launch_at_startup) {
-        warn!("autostart sync failed: {e}");
-    }
 
     // Presets + quick styles (M5). Seed a default preset on first run so
     // the tray "Presets" submenu isn't empty.
@@ -406,16 +400,13 @@ fn run_event_loop(mut state: app::AppState) -> Result<()> {
         // process boundaries.
         check_marker_files(&state.paths, &cmd_tx);
 
-        // Settings subprocess has saved — reload settings, re-sync autostart,
-        // and rebuild the hotkey registrar with the new global bindings.
+        // Settings subprocess has saved — reload settings + rebuild
+        // the hotkey registrar with the new global bindings.
         let settings_marker = state.paths.data_dir.join(".settings_refresh");
         if settings_marker.exists() {
             let _ = std::fs::remove_file(&settings_marker);
             state.settings = settings::Settings::load_or_default(&state.paths);
             apply_output_dir_override(&mut state.paths, &state.settings);
-            if let Err(e) = autostart::sync(&state.settings.launch_at_startup) {
-                warn!("autostart re-sync failed: {e}");
-            }
             let bindings = [
                 (state.settings.hotkey.clone(), app::Command::CaptureFullscreen),
                 (state.settings.annotate_hotkey.clone(), app::Command::CaptureAndAnnotate),

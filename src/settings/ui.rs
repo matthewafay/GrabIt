@@ -10,8 +10,8 @@
 //!   real keyboard listener via `onkeydown` on the chord button while
 //!   recording is active; Esc cancels, any other key + the live
 //!   modifier state commits a chord string in `parse_chord`'s format.
-//! - **Capture** — launch_at_startup, include_cursor, copy_to_clipboard,
-//!   output_dir (with Browse + Reset).
+//! - **Capture** — include_cursor, copy_to_clipboard, output_dir
+//!   (with Browse + Reset).
 //! - **Arrows** — the two arrow defaults.
 //! - **GIF** — fps / loop / max-seconds / gif_record_cursor.
 //!
@@ -76,7 +76,6 @@ fn settings_app() -> Element {
     let annotate_hotkey_buf = use_signal(|| initial.settings.annotate_hotkey.raw.clone());
     let gif_hotkey_buf = use_signal(|| initial.settings.gif_hotkey.raw.clone());
 
-    let launch_at_startup = use_signal(|| initial.settings.launch_at_startup);
     let include_cursor = use_signal(|| initial.settings.include_cursor);
     let copy_to_clipboard = use_signal(|| initial.settings.copy_to_clipboard);
     let output_dir_buf = use_signal(|| initial.settings.output_dir.clone().unwrap_or_default());
@@ -112,7 +111,6 @@ fn settings_app() -> Element {
                     captured: captured,
                 }
                 CaptureSection {
-                    launch_at_startup: launch_at_startup,
                     include_cursor: include_cursor,
                     copy_to_clipboard: copy_to_clipboard,
                     output_dir_buf: output_dir_buf,
@@ -134,7 +132,6 @@ fn settings_app() -> Element {
                 hotkey_buf: hotkey_buf,
                 annotate_hotkey_buf: annotate_hotkey_buf,
                 gif_hotkey_buf: gif_hotkey_buf,
-                launch_at_startup: launch_at_startup,
                 include_cursor: include_cursor,
                 copy_to_clipboard: copy_to_clipboard,
                 output_dir_buf: output_dir_buf,
@@ -280,7 +277,6 @@ fn HotkeyRow(
 
 #[component]
 fn CaptureSection(
-    launch_at_startup: Signal<bool>,
     include_cursor: Signal<bool>,
     copy_to_clipboard: Signal<bool>,
     output_dir_buf: Signal<String>,
@@ -289,10 +285,6 @@ fn CaptureSection(
     rsx! {
         section { class: "section",
             h2 { "Capture" }
-            ToggleRow {
-                label: "Launch at startup".to_string(),
-                value: launch_at_startup,
-            }
             ToggleRow {
                 label: "Include cursor in captures".to_string(),
                 value: include_cursor,
@@ -494,7 +486,6 @@ fn FooterBar(
     hotkey_buf: Signal<String>,
     annotate_hotkey_buf: Signal<String>,
     gif_hotkey_buf: Signal<String>,
-    launch_at_startup: Signal<bool>,
     include_cursor: Signal<bool>,
     copy_to_clipboard: Signal<bool>,
     output_dir_buf: Signal<String>,
@@ -545,7 +536,6 @@ fn FooterBar(
         s.hotkey.raw = hotkey_buf.read().clone();
         s.annotate_hotkey.raw = annotate_hotkey_buf.read().clone();
         s.gif_hotkey.raw = gif_hotkey_buf.read().clone();
-        s.launch_at_startup = *launch_at_startup.read();
         s.include_cursor = *include_cursor.read();
         s.copy_to_clipboard = *copy_to_clipboard.read();
         s.output_dir = output_dir;
@@ -595,7 +585,6 @@ fn FooterBar(
         hotkey_buf.set(fresh.hotkey.raw.clone());
         annotate_hotkey_buf.set(fresh.annotate_hotkey.raw.clone());
         gif_hotkey_buf.set(fresh.gif_hotkey.raw.clone());
-        launch_at_startup.set(fresh.launch_at_startup);
         include_cursor.set(fresh.include_cursor);
         copy_to_clipboard.set(fresh.copy_to_clipboard);
         output_dir_buf.set(String::new());

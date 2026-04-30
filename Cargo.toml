@@ -1,6 +1,6 @@
 [package]
 name = "grabit"
-version = "1.6.3"
+version = "1.6.4"
 edition = "2021"
 rust-version = "1.78"
 description = "Lightweight Windows screenshot and annotation tool"
@@ -64,7 +64,11 @@ tokio = { version = "1", features = ["time"] }
 
 tray-icon = "0.19"
 global-hotkey = "0.6"
-winreg = "0.52"
+# `winreg` was used for the HKCU Run-key autostart toggle. Removed in
+# 1.6.4 because writes to that key are a major heuristic trigger for
+# Defender's ML scanner — getting the binary flagged as
+# Wacatac.c!ml. Users now manage startup themselves via
+# Task Manager → Startup tab.
 
 # All editor / settings / history / gif-editor windows render through
 # Dioxus desktop now. eframe + egui + winit + ab_glyph are no longer

@@ -8,6 +8,21 @@ the system tray, launches with Windows.
 If GrabIt is useful to you, you can support development here:
 [☕ Buy me a coffee](https://buymeacoffee.com/matthewafay).
 
+## What's new in 1.6.4
+
+### Removed: HKCU Run-key autostart
+- Writes to `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+  were one of the loudest heuristic triggers getting the unsigned
+  binary flagged as `Wacatac.c!ml` by Defender. The autostart module
+  + `winreg` crate are gone.
+- Settings window no longer has a "Launch at startup" toggle.
+- See the **Launching at startup** section below for the recommended
+  manual setup (Task Manager → Startup tab, or a shortcut in the
+  Startup folder).
+- If you previously had the toggle enabled, your existing registry
+  entry is still there but is now just an unused row — Task Manager
+  → Startup tab → right-click → Disable cleans it up.
+
 ## What's new in 1.6
 
 ### Full UI port to Dioxus desktop
@@ -355,7 +370,6 @@ Tray → *Settings…* opens a GUI window grouped into three sections:
 
   Click a field and press the combo you want, then Confirm. Esc cancels.
 - **Capture**
-  - Launch at startup
   - Include cursor in captures
   - Copy every capture to clipboard
   - Output folder (default `%USERPROFILE%\Pictures\GrabIt`, with Browse / Reset)
@@ -374,8 +388,8 @@ Tray → *Settings…* opens a GUI window grouped into three sections:
     affecting your stills)
 
 Save writes `%APPDATA%\GrabIt\settings.json` and signals the tray to
-re-register hotkeys and re-sync autostart without restart. Any open editor
-also live-reloads its arrow/shadow flags.
+re-register hotkeys without restart. Any open editor also live-reloads
+its arrow/shadow flags.
 
 > Global hotkeys win over focused apps — whatever chord you bind is
 > intercepted everywhere. The defaults use two modifiers (`Ctrl+Shift`)
@@ -432,11 +446,26 @@ the same `.exe`) and rerun.
 ## Use
 
 Run `grabit.exe`. The logo appears in the system tray. Right-click for the
-menu. Toggle **Launch at startup** in the Settings window to add/remove the
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\GrabIt` entry.
+menu.
 
 Output folder: configurable in Settings (default `%USERPROFILE%\Pictures\GrabIt`).
 Settings / presets / styles / logs: `%APPDATA%\GrabIt\`.
+
+### Launching at startup
+
+GrabIt no longer manages its own startup entry — registry writes to
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` were one of the
+heuristic triggers getting the unsigned binary flagged as
+`Wacatac.c!ml`. To run on login, set it up yourself one of these ways:
+
+- **Task Manager → Startup tab → enable a manual entry**, or
+- **`Win+R` → `shell:startup` → drop a shortcut to `grabit.exe`** (the
+  Startup folder is read on login and runs every shortcut inside).
+
+If you previously toggled "Launch at startup" in an older GrabIt, the
+old `GrabIt` entry under that registry key still exists but is harmless
+— just an unused row pointing at the exe. Task Manager → Startup tab
+→ right-click the row → Disable removes it from the boot path.
 
 ## Architecture
 
@@ -448,8 +477,8 @@ src/
   app/                 AppState, command dispatch, paths
   tray/                tray icon + menu (capture / GIF / history / settings)
   hotkeys/             global-hotkey registration, chord parser, runtime rebind
-  autostart/           HKCU Run-key read/write
-  platform/            DPI, monitor enumeration, JetBrains Mono font registration
+  platform/            DPI, monitor enumeration, JetBrains Mono font
+                       registration, tao window-icon loader
   history.rs           thumbnail-grid history viewer (--history subprocess)
   capture/
     gdi.rs             GDI BitBlt (fullscreen / region)
@@ -499,8 +528,7 @@ triggered preset captures).
 - **Rust crates** (runtime): `windows`, `dioxus` (desktop, Wry +
   WebView2), `tray-icon`, `global-hotkey`, `image`, `gif`,
   `imageproc`, `fast_image_resize`, `rayon`, `tokio` (time only),
-  `base64`, `ab_glyph`, `winreg`, `toml`, `serde_json`,
-  `rmp-serde`, `serde`, `chrono`, `parking_lot`,
-  `crossbeam-channel`, `anyhow`, `thiserror`, `log` / `env_logger`,
-  `uuid`, `rfd`, `dirs`.
+  `base64`, `ab_glyph`, `toml`, `serde_json`, `rmp-serde`, `serde`,
+  `chrono`, `parking_lot`, `crossbeam-channel`, `anyhow`,
+  `thiserror`, `log` / `env_logger`, `uuid`, `rfd`, `dirs`.
 - **Rust crates** (build): `embed-resource`, `ico`, `image`.
