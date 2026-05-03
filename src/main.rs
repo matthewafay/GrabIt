@@ -19,11 +19,29 @@ use log::{error, info, warn};
 fn main() -> Result<()> {
     install_panic_hook();
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // Top-level help. Caught before the subprocess dispatch so `--help`,
+    // `-h`, or bare `help` always print usage instead of falling through to
+    // the tray app (which silently exits on a duplicate-instance launch and
+    // looked like a no-op when scripts probed it). Defer to the verb-level
+    // dispatcher when `--capture` is also present so `--capture help` still
+    // prints the full flag matrix.
+    let has_capture = args.iter().any(|a| a == "--capture");
+    if !has_capture
+        && args
+            .iter()
+            .skip(1)
+            .any(|a| matches!(a.as_str(), "--help" | "-h" | "help"))
+    {
+        print_top_level_help();
+        return Ok(());
+    }
+
     // Editor subprocess mode: `grabit.exe --editor <sidecar.grabit> [--png-out
     // <path.png>] [--clipboard]`. Each capture spawns a fresh editor process
     // because winit 0.30 refuses to recreate its event loop within a single
     // process, so per-capture threads don't work.
-    let args: Vec<String> = std::env::args().collect();
     if let Some(idx) = args.iter().position(|a| a == "--editor") {
         let grabit = args.get(idx + 1)
             .ok_or_else(|| anyhow::anyhow!("--editor requires a path"))?
@@ -116,6 +134,28 @@ fn apply_output_dir_override(paths: &mut app::paths::AppPaths, settings: &settin
     }
     info!("output_dir override: {}", candidate.display());
     paths.output_dir = candidate;
+}
+
+fn print_top_level_help() {
+    let msg = concat!(
+        "GrabIt v", env!("CARGO_PKG_VERSION"), " — Windows screenshot + GIF tool\n",
+        "\n",
+        "USAGE:\n",
+        "  grabit.exe                        Launch the system-tray app (default).\n",
+        "  grabit.exe --capture <verb> ...   Headless capture for scripts / Claude Code.\n",
+        "  grabit.exe --help                 This message.\n",
+        "\n",
+        "HEADLESS CAPTURE:\n",
+        "  grabit.exe --capture help         Full verb + flag reference.\n",
+        "  grabit.exe --capture screenshot   Single PNG.\n",
+        "  grabit.exe --capture gif          Fire-and-wait GIF recording.\n",
+        "  grabit.exe --capture list-windows Enumerate top-level windows as JSON.\n",
+        "\n",
+        "DOCS:\n",
+        "  https://github.com/matthewafay/GrabIt/blob/main/CLAUDE.md\n",
+        "  https://github.com/matthewafay/GrabIt/blob/main/docs/CAPTURE-CLI.md\n",
+    );
+    print!("{msg}");
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
