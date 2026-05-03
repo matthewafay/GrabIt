@@ -2,6 +2,7 @@
 
 mod app;
 mod capture;
+mod cli;
 mod editor;
 mod export;
 mod history;
@@ -42,6 +43,13 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--history") {
         return run_history_subprocess();
+    }
+    // Headless capture for Claude Code / scripts. Runs as a fresh
+    // subprocess that bypasses the single-instance guard so it can
+    // coexist with the resident tray app. See `cli::run` and
+    // CLAUDE.md for the surface.
+    if args.iter().any(|a| a == "--capture") {
+        return run_capture_subprocess(&args);
     }
 
     let _instance_guard = match app::single_instance::acquire() {
@@ -112,6 +120,18 @@ fn apply_output_dir_override(paths: &mut app::paths::AppPaths, settings: &settin
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+}
+
+fn run_capture_subprocess(args: &[String]) -> Result<()> {
+    let paths = app::paths::AppPaths::bootstrap().context("create app data directories")?;
+    init_logging(&paths.log_file());
+    // DPI awareness has to be set before any capture happens, otherwise
+    // GetWindowRect / BitBlt see virtualized coordinates on HiDPI displays
+    // and the output PNG is the wrong size or shifted.
+    platform::dpi::init_process_awareness();
+    platform::fonts::register_with_gdi();
+    info!("capture subprocess: {:?}", &args[1..]);
+    cli::run(args, &paths)
 }
 
 fn run_settings_subprocess() -> Result<()> {

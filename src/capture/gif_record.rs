@@ -159,6 +159,70 @@ pub fn run(_paths: &AppPaths, _settings: &Settings) -> Result<Option<PathBuf>> {
     Err(anyhow!("GIF recording is Windows-only"))
 }
 
+/// Headless recording for the `--capture gif` CLI: no region picker, no
+/// floating bar, fire-and-wait for `duration_secs` then return the spooled
+/// frame list. Caller (cli) feeds the result into `export::gif::encode_to_gif`.
+///
+/// Sibling of `run` rather than an extraction. The bar version's control
+/// flow (WM_TIMER, thread-local STATE, PostQuitMessage on max-seconds, Esc
+/// / Pause / Stop buttons) is genuinely different from a wall-clock loop;
+/// the only piece worth sharing is `imp::capture_frame`, which already is
+/// a free function. Sharing more would tangle two control models for ~15
+/// lines of duplication.
+///
+/// Deliberately does NOT register with `ACTIVE` — a headless CLI run must
+/// not make `is_recording()` true, otherwise the tray's own GIF hotkey
+/// would silently no-op while the CLI is running.
+#[cfg(windows)]
+pub fn run_headless(
+    paths: &AppPaths,
+    settings: &Settings,
+    rect: Rect,
+    duration_secs: u32,
+    fps_override: Option<u32>,
+    include_cursor: bool,
+) -> Result<Vec<crate::export::gif::FrameInput>> {
+    let recording_id = uuid::Uuid::new_v4();
+    let spool_dir = paths.gif_temp_dir().join(recording_id.to_string());
+    std::fs::create_dir_all(&spool_dir)
+        .with_context(|| format!("create gif spool dir {}", spool_dir.display()))?;
+
+    let fps = fps_override.unwrap_or(settings.gif_fps).clamp(5, 60);
+    let secs = duration_secs.max(1);
+
+    info!(
+        "gif headless: starting recording {recording_id} at {fps} fps for {secs}s in {}",
+        spool_dir.display()
+    );
+
+    let frames = imp::record_headless(rect, fps, secs, include_cursor, &spool_dir)?;
+
+    info!(
+        "gif headless: recording stopped — {} frames spooled in {}",
+        frames.len(),
+        spool_dir.display()
+    );
+    Ok(frames
+        .into_iter()
+        .map(|f| crate::export::gif::FrameInput {
+            png_path: spool_dir.join(&f.file),
+            delay_ms: f.delay_ms,
+        })
+        .collect())
+}
+
+#[cfg(not(windows))]
+pub fn run_headless(
+    _paths: &AppPaths,
+    _settings: &Settings,
+    _rect: Rect,
+    _duration_secs: u32,
+    _fps_override: Option<u32>,
+    _include_cursor: bool,
+) -> Result<Vec<crate::export::gif::FrameInput>> {
+    Err(anyhow!("GIF recording is Windows-only"))
+}
+
 fn foreground_title() -> Option<String> {
     #[cfg(windows)]
     unsafe {
@@ -570,6 +634,71 @@ mod imp {
             s.last_tick = Some(now);
         });
         let _ = hwnd;
+    }
+
+    /// Wall-clock recording loop for the headless CLI path. Captures one
+    /// frame per `1000 / fps` ms, spools it as `f{idx:05}.png`, and
+    /// records the inter-frame delay so the encoder reproduces real
+    /// timing. Bails the moment elapsed >= duration. No window, no
+    /// timer, no thread-local state.
+    pub(super) fn record_headless(
+        rect: Rect,
+        fps: u32,
+        duration_secs: u32,
+        include_cursor: bool,
+        spool_dir: &Path,
+    ) -> Result<Vec<SidecarFrame>> {
+        let interval = std::time::Duration::from_millis((1000 / fps.max(1)).max(1) as u64);
+        let max = std::time::Duration::from_secs(duration_secs as u64);
+        let start = Instant::now();
+        let mut frames: Vec<SidecarFrame> = Vec::new();
+        let mut last_tick: Option<Instant> = None;
+        let mut idx: usize = 0;
+
+        while start.elapsed() < max {
+            let tick_started = Instant::now();
+
+            let img = match capture_frame(rect, include_cursor) {
+                Ok(img) => img,
+                Err(e) => {
+                    warn!("gif headless: frame {idx} capture failed: {e}");
+                    let spent = tick_started.elapsed();
+                    if spent < interval {
+                        std::thread::sleep(interval - spent);
+                    }
+                    continue;
+                }
+            };
+            let path = spool_dir.join(format!("f{idx:05}.png"));
+            if let Err(e) = img.save_with_format(&path, image::ImageFormat::Png) {
+                warn!("gif headless: write frame {idx} failed: {e}");
+                let spent = tick_started.elapsed();
+                if spent < interval {
+                    std::thread::sleep(interval - spent);
+                }
+                continue;
+            }
+
+            let now = Instant::now();
+            let delay_ms = match last_tick {
+                None => (1000 / fps.max(1)).max(10),
+                Some(prev) => (now.duration_since(prev).as_millis() as u32).max(1),
+            };
+            frames.push(SidecarFrame {
+                file: format!("f{idx:05}.png"),
+                delay_ms,
+            });
+            last_tick = Some(now);
+            idx += 1;
+
+            let spent = tick_started.elapsed();
+            if spent < interval {
+                std::thread::sleep(interval - spent);
+            }
+        }
+
+        debug!("gif headless: spooled {} frames in {:?}", frames.len(), start.elapsed());
+        Ok(frames)
     }
 
     fn capture_frame(rect: Rect, include_cursor: bool) -> Result<RgbaImage> {

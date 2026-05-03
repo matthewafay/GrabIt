@@ -6,6 +6,7 @@ pub mod gif_record;
 pub mod object_pick;
 pub mod region;
 pub mod wgc;
+pub mod window_lookup;
 pub mod window_pick;
 
 use anyhow::{Context, Result};

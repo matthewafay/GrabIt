@@ -463,6 +463,31 @@ menu.
 Output folder: configurable in Settings (default `%USERPROFILE%\Pictures\GrabIt`).
 Settings / presets / styles / logs: `%APPDATA%\GrabIt\`.
 
+### Use from Claude Code (headless `--capture` CLI)
+
+GrabIt also exposes a scriptable `--capture` mode so Claude Code (and any
+other automation) can take screenshots and record GIFs without touching
+the GUI, then drop the files straight into a repo's docs.
+
+```powershell
+# Screenshot a window by process
+grabit.exe --capture screenshot --target window --process code.exe `
+    --out ./docs/screenshots/editor.png
+
+# Record a 5-second GIF
+grabit.exe --capture gif --target window --process code.exe `
+    --duration 5 --out ./docs/screenshots/demo.gif
+```
+
+The absolute output path is printed to stdout; diagnostics go to stderr;
+exit `0` on success / `1` on failure. The CLI runs as a one-shot
+subprocess that bypasses the single-instance mutex, so it coexists with
+the resident tray app.
+
+See [`CLAUDE.md`](./CLAUDE.md) for the discovery doc Claude reads
+automatically, or [`docs/CAPTURE-CLI.md`](./docs/CAPTURE-CLI.md) for the
+full flag matrix, schemas, and embedding workflow.
+
 ### Launching at startup
 
 GrabIt no longer manages its own startup entry — registry writes to
