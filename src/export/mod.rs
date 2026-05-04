@@ -40,16 +40,23 @@ pub fn save_png_to(result: &CaptureResult, png_path: &std::path::Path) -> Result
     Ok(png_path.to_path_buf())
 }
 
-/// Copy the (flattened) capture to the Windows clipboard as CF_DIB.
-pub fn copy_to_clipboard(result: &CaptureResult) -> Result<()> {
+/// Copy the (flattened) capture to the Windows clipboard. Sets `CF_DIB`
+/// for image targets and — when `path` is `Some` — `CF_UNICODETEXT` with
+/// the cleaned absolute path so terminal/CLI Ctrl+V pastes the file path
+/// (the workflow that lets `claude` consume a fresh capture without an
+/// extra step).
+pub fn copy_to_clipboard(result: &CaptureResult, path: Option<&std::path::Path>) -> Result<()> {
     let composite = flatten(result);
     #[cfg(windows)]
     {
-        clipboard_impl::put_dib(&composite)
+        match path.and_then(clean_path_for_text) {
+            Some(text) => clipboard_impl::put_dib_with_text(&composite, &text),
+            None => clipboard_impl::put_dib(&composite),
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = composite;
+        let _ = (composite, path);
         Ok(())
     }
 }
@@ -58,11 +65,14 @@ pub fn copy_to_clipboard(result: &CaptureResult) -> Result<()> {
 /// shape every "paste an image" target understands). GIFs and any other
 /// file type go on as `CF_HDROP` so apps like Slack / Discord / Outlook
 /// paste them as the actual file attachment, preserving animation. The
-/// file path is always also written as `CF_UNICODETEXT` so plain-text
-/// targets get something useful too.
+/// cleaned absolute path is always also written as `CF_UNICODETEXT` so
+/// plain-text targets — including `claude` and other terminal CLIs —
+/// receive a usable file path on Ctrl+V.
 #[cfg(windows)]
 pub fn copy_file_to_clipboard(path: &std::path::Path) -> Result<()> {
     use anyhow::Context;
+    let text = clean_path_for_text(path)
+        .ok_or_else(|| anyhow::anyhow!("clean path: {}", path.display()))?;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -71,16 +81,16 @@ pub fn copy_file_to_clipboard(path: &std::path::Path) -> Result<()> {
         let img = image::open(path)
             .with_context(|| format!("read {}", path.display()))?
             .to_rgba8();
-        clipboard_impl::put_dib(&img)
+        clipboard_impl::put_dib_with_text(&img, &text)
     } else {
         // GIF (or anything else) — copy as a file drop so animation
         // survives the round-trip into chat clients.
-        clipboard_impl::put_hdrop(path)
+        clipboard_impl::put_hdrop_with_text(path, &text)
     }
 }
 
 /// Copy `s` to the clipboard as `CF_UNICODETEXT`. Used for the
-/// "Copy path" action in the history window.
+/// "Copy path" action in the history window and the editor footer.
 #[cfg(windows)]
 pub fn copy_text_to_clipboard(s: &str) -> Result<()> {
     clipboard_impl::put_unicode_text(s)
@@ -94,6 +104,26 @@ pub fn copy_file_to_clipboard(_path: &std::path::Path) -> Result<()> {
 #[cfg(not(windows))]
 pub fn copy_text_to_clipboard(_s: &str) -> Result<()> {
     Ok(())
+}
+
+/// Canonicalize `path` and strip the kernel's `\\?\` UNC prefix so the
+/// resulting string is the friendly Windows path users see in Explorer.
+/// Returns `None` if canonicalization fails (e.g. the file no longer
+/// exists). The same sanitization the editor's "Copy path" footer
+/// button has used since 1.6.6.
+#[cfg(windows)]
+fn clean_path_for_text(path: &std::path::Path) -> Option<String> {
+    let abs = std::fs::canonicalize(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string());
+    if abs.is_empty() {
+        return None;
+    }
+    Some(
+        abs.strip_prefix(r"\\?\")
+            .unwrap_or(&abs)
+            .to_string(),
+    )
 }
 
 /// Alpha-composite the cursor layer onto a copy of the base image.
@@ -138,15 +168,107 @@ fn blend(dst: Rgba<u8>, src: Rgba<u8>) -> Rgba<u8> {
 mod clipboard_impl {
     use anyhow::{anyhow, Result};
     use image::RgbaImage;
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
     use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    use windows::Win32::System::Ole::CF_DIB;
+    use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+    use windows::Win32::UI::Shell::DROPFILES;
 
     pub fn put_dib(img: &RgbaImage) -> Result<()> {
+        let dib = build_dib_hmem(img)?;
+        commit(&[(CF_DIB.0 as u32, dib)])
+    }
+
+    /// `CF_DIB` for image-paste targets, plus `CF_UNICODETEXT` (the file
+    /// path) so terminal Ctrl+V also produces something useful. Both are
+    /// installed in a single OpenClipboard/EmptyClipboard session.
+    pub fn put_dib_with_text(img: &RgbaImage, text: &str) -> Result<()> {
+        let dib = build_dib_hmem(img)?;
+        let txt = match build_unicode_text_hmem(text) {
+            Ok(h) => h,
+            Err(e) => {
+                free(dib);
+                return Err(e);
+            }
+        };
+        commit(&[
+            (CF_DIB.0 as u32, dib),
+            (CF_UNICODETEXT.0 as u32, txt),
+        ])
+    }
+
+    /// Single-file `CF_HDROP` plus `CF_UNICODETEXT` (the same path as
+    /// text). Same multi-format reasoning as `put_dib_with_text`.
+    pub fn put_hdrop_with_text(path: &std::path::Path, text: &str) -> Result<()> {
+        let drop = build_hdrop_hmem(path)?;
+        let txt = match build_unicode_text_hmem(text) {
+            Ok(h) => h,
+            Err(e) => {
+                free(drop);
+                return Err(e);
+            }
+        };
+        commit(&[
+            (CF_HDROP.0 as u32, drop),
+            (CF_UNICODETEXT.0 as u32, txt),
+        ])
+    }
+
+    pub fn put_unicode_text(s: &str) -> Result<()> {
+        let txt = build_unicode_text_hmem(s)?;
+        commit(&[(CF_UNICODETEXT.0 as u32, txt)])
+    }
+
+    /// Open the clipboard, empty it, and `SetClipboardData` every entry
+    /// in order. Each `HGLOBAL` was allocated with `GMEM_MOVEABLE`;
+    /// ownership transfers to the clipboard on a successful Set call.
+    /// On failure before transfer we `GlobalFree` the still-owned hmems
+    /// to keep one-shot CLI invocations leak-free.
+    fn commit(entries: &[(u32, HGLOBAL)]) -> Result<()> {
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                for &(_, h) in entries {
+                    free(h);
+                }
+                return Err(anyhow!("OpenClipboard failed"));
+            }
+            let close_guard = scopeguard(|| {
+                let _ = CloseClipboard();
+            });
+
+            if EmptyClipboard().is_err() {
+                drop(close_guard);
+                for &(_, h) in entries {
+                    free(h);
+                }
+                return Err(anyhow!("EmptyClipboard failed"));
+            }
+
+            for (i, &(fmt, hmem)) in entries.iter().enumerate() {
+                let as_handle = HANDLE(hmem.0 as *mut _);
+                if SetClipboardData(fmt, as_handle).is_err() {
+                    drop(close_guard);
+                    // Earlier entries already transferred to the
+                    // clipboard; later ones are still ours to free.
+                    for &(_, h) in entries.iter().skip(i) {
+                        free(h);
+                    }
+                    return Err(anyhow!("SetClipboardData(format={fmt}) failed"));
+                }
+            }
+
+            drop(close_guard);
+        }
+        Ok(())
+    }
+
+    /// Build a top-down RGBA `RgbaImage` into a `GMEM_MOVEABLE` DIB
+    /// blob (`BITMAPINFOHEADER` + bottom-up BGRA pixels). Caller owns
+    /// the returned hmem until it's transferred to the clipboard.
+    fn build_dib_hmem(img: &RgbaImage) -> Result<HGLOBAL> {
         let (w, h) = img.dimensions();
         if w == 0 || h == 0 {
             return Err(anyhow!("clipboard image is empty"));
@@ -158,8 +280,6 @@ mod clipboard_impl {
         let total = header_size + pixel_bytes;
 
         unsafe {
-            // GMEM_MOVEABLE memory; ownership transfers to the clipboard on
-            // successful SetClipboardData.
             let hmem = GlobalAlloc(GMEM_MOVEABLE, total)
                 .map_err(|e| anyhow!("GlobalAlloc: {e}"))?;
             if hmem.0.is_null() {
@@ -168,6 +288,7 @@ mod clipboard_impl {
 
             let ptr = GlobalLock(hmem) as *mut u8;
             if ptr.is_null() {
+                free(hmem);
                 return Err(anyhow!("GlobalLock failed"));
             }
 
@@ -207,48 +328,20 @@ mod clipboard_impl {
             }
 
             let _ = GlobalUnlock(hmem);
-
-            if OpenClipboard(None).is_err() {
-                return Err(anyhow!("OpenClipboard failed"));
-            }
-            let close_guard = scopeguard(|| { let _ = CloseClipboard(); });
-
-            if EmptyClipboard().is_err() {
-                drop(close_guard);
-                return Err(anyhow!("EmptyClipboard failed"));
-            }
-
-            // Ownership of hmem transfers on success.
-            let as_handle = HANDLE(hmem.0 as *mut _);
-            if SetClipboardData(CF_DIB.0 as u32, as_handle).is_err() {
-                drop(close_guard);
-                return Err(anyhow!("SetClipboardData failed"));
-            }
-
-            drop(close_guard);
+            Ok(hmem)
         }
-        Ok(())
     }
 
-    /// Put a single file onto the clipboard as `CF_HDROP`. Layout is a
-    /// `DROPFILES` header followed by a double-null-terminated list of
-    /// wide-char paths. With `fWide = TRUE` the list is UTF-16; the
-    /// final empty string (just `\0`) marks the end of the file list.
-    pub fn put_hdrop(path: &std::path::Path) -> Result<()> {
-        use windows::Win32::System::Ole::CF_HDROP;
-        use windows::Win32::UI::Shell::DROPFILES;
-
-        // Absolute path — chat clients tend to reject relative paths.
+    /// Build a `CF_HDROP` `GMEM_MOVEABLE` payload — `DROPFILES` header
+    /// followed by a double-null-terminated UTF-16 list with a single
+    /// canonicalized path entry (the `\\?\` UNC prefix is stripped so
+    /// Slack / Discord / Outlook see a friendly path).
+    fn build_hdrop_hmem(path: &std::path::Path) -> Result<HGLOBAL> {
         let abs = std::fs::canonicalize(path)
             .map_err(|e| anyhow!("canonicalize {}: {e}", path.display()))?;
-        // Strip the `\\?\` UNC prefix so File Explorer / Slack / Discord
-        // see a friendly path. The kernel returns the verbatim form;
-        // most consumer apps choke on it.
         let abs_str = abs.to_string_lossy();
         let trimmed = abs_str.strip_prefix(r"\\?\").unwrap_or(&abs_str);
 
-        // UTF-16 wide string + a trailing single-null (file separator)
-        // + another null (end of list).
         let mut wide: Vec<u16> = trimmed.encode_utf16().collect();
         wide.push(0); // terminate this file path
         wide.push(0); // terminate the list
@@ -265,6 +358,7 @@ mod clipboard_impl {
             }
             let ptr = GlobalLock(hmem) as *mut u8;
             if ptr.is_null() {
+                free(hmem);
                 return Err(anyhow!("GlobalLock failed"));
             }
 
@@ -280,31 +374,12 @@ mod clipboard_impl {
             std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
 
             let _ = GlobalUnlock(hmem);
-
-            if OpenClipboard(None).is_err() {
-                return Err(anyhow!("OpenClipboard failed"));
-            }
-            let close_guard = scopeguard(|| {
-                let _ = CloseClipboard();
-            });
-            if EmptyClipboard().is_err() {
-                drop(close_guard);
-                return Err(anyhow!("EmptyClipboard failed"));
-            }
-            let as_handle = HANDLE(hmem.0 as *mut _);
-            if SetClipboardData(CF_HDROP.0 as u32, as_handle).is_err() {
-                drop(close_guard);
-                return Err(anyhow!("SetClipboardData(CF_HDROP) failed"));
-            }
-            drop(close_guard);
+            Ok(hmem)
         }
-        Ok(())
     }
 
-    /// Put a UTF-16 string onto the clipboard as `CF_UNICODETEXT`.
-    pub fn put_unicode_text(s: &str) -> Result<()> {
-        use windows::Win32::System::Ole::CF_UNICODETEXT;
-
+    /// Build a `CF_UNICODETEXT` `GMEM_MOVEABLE` payload (UTF-16 + NUL).
+    fn build_unicode_text_hmem(s: &str) -> Result<HGLOBAL> {
         let mut wide: Vec<u16> = s.encode_utf16().collect();
         wide.push(0); // null terminator
         let bytes = wide.len() * 2;
@@ -317,29 +392,19 @@ mod clipboard_impl {
             }
             let ptr = GlobalLock(hmem) as *mut u16;
             if ptr.is_null() {
+                free(hmem);
                 return Err(anyhow!("GlobalLock failed"));
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             let _ = GlobalUnlock(hmem);
-
-            if OpenClipboard(None).is_err() {
-                return Err(anyhow!("OpenClipboard failed"));
-            }
-            let close_guard = scopeguard(|| {
-                let _ = CloseClipboard();
-            });
-            if EmptyClipboard().is_err() {
-                drop(close_guard);
-                return Err(anyhow!("EmptyClipboard failed"));
-            }
-            let as_handle = HANDLE(hmem.0 as *mut _);
-            if SetClipboardData(CF_UNICODETEXT.0 as u32, as_handle).is_err() {
-                drop(close_guard);
-                return Err(anyhow!("SetClipboardData(CF_UNICODETEXT) failed"));
-            }
-            drop(close_guard);
+            Ok(hmem)
         }
-        Ok(())
+    }
+
+    fn free(h: HGLOBAL) {
+        unsafe {
+            let _ = GlobalFree(h);
+        }
     }
 
     // Minimal drop-guard helper so we close the clipboard even on early

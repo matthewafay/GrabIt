@@ -255,11 +255,15 @@ fn handle_hotkey_command(
             };
             match capture::perform(req) {
                 Ok(Some(result)) => {
-                    if let Err(e) = export::save_png(&result, paths) {
-                        warn!("fullscreen capture save failed: {e}");
-                    }
+                    let saved = match export::save_png(&result, paths) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            warn!("fullscreen capture save failed: {e}");
+                            None
+                        }
+                    };
                     if settings.copy_to_clipboard {
-                        if let Err(e) = export::copy_to_clipboard(&result) {
+                        if let Err(e) = export::copy_to_clipboard(&result, saved.as_deref()) {
                             warn!("fullscreen clipboard copy failed: {e}");
                         }
                     }

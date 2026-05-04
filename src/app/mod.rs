@@ -219,7 +219,7 @@ fn run_capture(state: &AppState, req: CaptureRequest) -> Result<()> {
     };
     let out_path = crate::export::save_png(&result, &state.paths)?;
     if state.settings.copy_to_clipboard {
-        if let Err(e) = crate::export::copy_to_clipboard(&result) {
+        if let Err(e) = crate::export::copy_to_clipboard(&result, Some(&out_path)) {
             warn!("clipboard copy failed: {e}");
         }
     }
@@ -274,7 +274,8 @@ fn run_preset_capture(state: &AppState, preset: &Preset) -> Result<()> {
     use crate::presets::PostAction;
     match preset.post_action {
         PostAction::CopyOnly => {
-            if let Err(e) = crate::export::copy_to_clipboard(&result) {
+            // CopyOnly skips disk — no path to attach as CF_UNICODETEXT.
+            if let Err(e) = crate::export::copy_to_clipboard(&result, None) {
                 warn!("preset clipboard copy failed: {e}");
             } else {
                 info!("preset {:?}: copied to clipboard (no disk save)", preset.name);
@@ -283,7 +284,7 @@ fn run_preset_capture(state: &AppState, preset: &Preset) -> Result<()> {
         PostAction::SaveOnly => {
             let out_path = save_with_preset(preset, &result, &state.paths)?;
             if state.settings.copy_to_clipboard {
-                if let Err(e) = crate::export::copy_to_clipboard(&result) {
+                if let Err(e) = crate::export::copy_to_clipboard(&result, Some(&out_path)) {
                     warn!("clipboard copy failed: {e}");
                 }
             }
