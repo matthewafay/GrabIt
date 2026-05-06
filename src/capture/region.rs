@@ -67,11 +67,12 @@ mod imp {
         COLORREF, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
-        CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, GetDC,
-        InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW,
-        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, FONT_CHARSET, FW_SEMIBOLD,
-        HBITMAP, HBRUSH, HDC, HGDIOBJ, LOGFONTW, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint,
+        FillRect, GetDC, GetStockObject, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
+        SetTextColor, TextOutW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        FONT_CHARSET, FW_SEMIBOLD, HBITMAP, HBRUSH, HDC, HGDIOBJ, LOGFONTW, NULL_BRUSH,
+        PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -417,57 +418,88 @@ mod imp {
         let _ = hwnd; // not needed past BeginPaint
         let full = RECT { left: 0, top: 0, right: virt_w, bottom: virt_h };
 
+        // Double-buffer the entire frame onto an offscreen bitmap so the
+        // user only ever sees a fully-composed selection. Without this, fast
+        // drags expose intermediate paint stages (dim fill → cut-out →
+        // outline) and the rectangle visibly flickers.
+        let back = CreateCompatibleDC(hdc);
+        let buf = CreateCompatibleBitmap(hdc, virt_w, virt_h);
+        let (target, back_state) = if !back.0.is_null() && !buf.0.is_null() {
+            let old = SelectObject(back, HGDIOBJ(buf.0));
+            (back, Some((back, buf, old)))
+        } else {
+            if !back.0.is_null() { let _ = DeleteDC(back); }
+            if !buf.0.is_null() { let _ = DeleteObject(HGDIOBJ(buf.0)); }
+            (hdc, None)
+        };
+
         if let Some((full_bmp, dim_bmp)) = frozen_handles {
             // Frozen mode: draw pre-captured bitmaps. Dimmed covers the whole
             // window; full-brightness draws over the selection rect only.
             // No color-key transparency — the overlay is opaque.
-            let mem = CreateCompatibleDC(hdc);
-            let old = SelectObject(mem, HGDIOBJ(dim_bmp.0));
-            let _ = BitBlt(hdc, 0, 0, virt_w, virt_h, mem, 0, 0, SRCCOPY);
+            let src = CreateCompatibleDC(target);
+            let prev = SelectObject(src, HGDIOBJ(dim_bmp.0));
+            let _ = BitBlt(target, 0, 0, virt_w, virt_h, src, 0, 0, SRCCOPY);
             if let Some(r) = selection {
                 let sw = (r.right - r.left).max(0);
                 let sh = (r.bottom - r.top).max(0);
                 if sw > 0 && sh > 0 {
-                    SelectObject(mem, HGDIOBJ(full_bmp.0));
-                    let _ = BitBlt(hdc, r.left, r.top, sw, sh, mem, r.left, r.top, SRCCOPY);
+                    SelectObject(src, HGDIOBJ(full_bmp.0));
+                    let _ = BitBlt(target, r.left, r.top, sw, sh, src, r.left, r.top, SRCCOPY);
                 }
             }
-            SelectObject(mem, old);
-            let _ = DeleteDC(mem);
+            SelectObject(src, prev);
+            let _ = DeleteDC(src);
         } else {
             // Live mode: dark fill everywhere; color-keyed magenta inside
             // the selection becomes transparent so the live desktop shows.
             let dim = CreateSolidBrush(rgb(30, 30, 30));
-            FillRect(hdc, &full, dim);
+            FillRect(target, &full, dim);
             let _ = DeleteObject(HGDIOBJ(dim.0));
             if let Some(r) = selection {
                 let cut = CreateSolidBrush(rgb(KEY_R, KEY_G, KEY_B));
-                FillRect(hdc, &r, cut);
+                FillRect(target, &r, cut);
                 let _ = DeleteObject(HGDIOBJ(cut.0));
             }
         }
 
         // Selection outline + size label, shared between both modes.
+        // Rectangle() fills with the DC's current brush; the default is
+        // WHITE_BRUSH which would clobber our magenta cut-out (live) or
+        // the full-bright bitmap (frozen). Use NULL_BRUSH so only the
+        // border is drawn.
+        let null_brush = GetStockObject(NULL_BRUSH);
         if let Some(r) = selection {
             let pen = CreatePen(PS_SOLID, 2, rgb(0, 180, 255));
-            let old = SelectObject(hdc, HGDIOBJ(pen.0));
-            let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-            SelectObject(hdc, old);
+            let old_pen = SelectObject(target, HGDIOBJ(pen.0));
+            let old_brush = SelectObject(target, null_brush);
+            let _ = Rectangle(target, r.left, r.top, r.right, r.bottom);
+            SelectObject(target, old_brush);
+            SelectObject(target, old_pen);
             let _ = DeleteObject(HGDIOBJ(pen.0));
 
             let w = (r.right - r.left).max(0);
             let h = (r.bottom - r.top).max(0);
             let text = format!("{} x {}", w, h);
-            draw_label(hdc, r.right + 6, r.bottom + 6, &text);
+            draw_label(target, r.right + 6, r.bottom + 6, &text);
         } else if let Some(r) = hover_rect {
             // Window hover highlight is only meaningful in live mode (we
             // don't enable allow_windows when painting a frozen overlay).
             let pen = CreatePen(PS_SOLID, 3, rgb(0, 200, 120));
-            let old = SelectObject(hdc, HGDIOBJ(pen.0));
-            let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-            SelectObject(hdc, old);
+            let old_pen = SelectObject(target, HGDIOBJ(pen.0));
+            let old_brush = SelectObject(target, null_brush);
+            let _ = Rectangle(target, r.left, r.top, r.right, r.bottom);
+            SelectObject(target, old_brush);
+            SelectObject(target, old_pen);
             let _ = DeleteObject(HGDIOBJ(pen.0));
-            draw_label(hdc, r.left + 6, r.top + 6, "Click to capture window");
+            draw_label(target, r.left + 6, r.top + 6, "Click to capture window");
+        }
+
+        if let Some((mem, bmp, old)) = back_state {
+            let _ = BitBlt(hdc, 0, 0, virt_w, virt_h, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
         }
     }
 
